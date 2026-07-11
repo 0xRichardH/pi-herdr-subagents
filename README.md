@@ -1,6 +1,6 @@
-# pi-interactive-subagents
+# pi-herdr-subagents
 
-Async subagents for [pi](https://github.com/badlogic/pi-mono) — spawn, orchestrate, and manage sub-agent sessions in multiplexer panes. **Fully non-blocking** — the main agent keeps working while subagents run in the background.
+Async subagents for [pi](https://github.com/badlogic/pi-mono) running exclusively in [herdr](https://herdr.dev). Spawn, orchestrate, and manage sub-agent sessions in dedicated herdr tabs or panes. **Fully non-blocking** — the main agent keeps working while subagents run in the background.
 
 https://github.com/user-attachments/assets/30adb156-cfb4-4c47-84ca-dd4aa80cba9f
 
@@ -25,33 +25,22 @@ subagent({ name: "Scout: DB", agent: "scout", task: "Map database schema" });
 
 ## Install
 
-```bash
-pi install git:github.com/HazAT/pi-interactive-subagents
-```
-
-Supported multiplexers:
-
-- [cmux](https://github.com/manaflow-ai/cmux)
-- [tmux](https://github.com/tmux/tmux)
-- [zellij](https://zellij.dev)
-- [WezTerm](https://wezfurlong.org/wezterm/) (terminal emulator with built-in multiplexing)
-- [herdr](https://herdr.dev)
-
-Start pi inside one of them:
+Install the package explicitly from this repository (replace the URL if you use a fork):
 
 ```bash
-cmux pi
-# or
-tmux new -A -s pi 'pi'
-# or
-zellij --session pi   # then run: pi
-# or
-# just run pi inside WezTerm — no wrapper needed
-# or
-herdr                 # then run: pi
+pi install git:github.com/0xRichardH/pi-herdr-subagents
 ```
 
-Optional: set `PI_SUBAGENT_MUX=cmux|tmux|zellij|wezterm|herdr` to force a specific backend.
+This project does not install or load `HazAT/pi-interactive-subagents` automatically.
+
+Start herdr, then run pi inside it:
+
+```bash
+herdr
+pi
+```
+
+herdr is the only supported terminal environment. The extension requires `HERDR_ENV=1` and the `herdr` CLI to be available.
 
 If your shell startup is slow and subagent commands sometimes get dropped before the prompt is ready, set `PI_SUBAGENT_SHELL_READY_DELAY_MS` to a higher value (defaults to `500`):
 
@@ -59,7 +48,7 @@ If your shell startup is slow and subagent commands sometimes get dropped before
 export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500
 ```
 
-Subagent panes are created without stealing keyboard focus (cmux, tmux, herdr). Launch commands target child surfaces by explicit ID, so focus and command delivery are independent. Note: the `interactive` option controls parent status notifications, not terminal focus.
+Subagent tabs and panes are created without stealing keyboard focus. Launch commands target child panes by explicit ID, so focus and command delivery are independent. Note: the `interactive` option controls parent status notifications, not terminal focus.
 
 ## What's Included
 
@@ -69,7 +58,7 @@ Subagent panes are created without stealing keyboard focus (cmux, tmux, herdr). 
 
 | Tool                 | Description                                                                                 |
 | -------------------- | ------------------------------------------------------------------------------------------- |
-| `subagent`           | Spawn a sub-agent in a dedicated multiplexer pane (async — returns immediately)             |
+| `subagent`           | Spawn a sub-agent in a dedicated herdr pane (async — returns immediately)             |
 | `subagent_interrupt` | Interrupt a running Pi-backed subagent's current turn                                       |
 | `subagents_list`     | List available agent definitions                                                            |
 | `subagent_resume`    | Resume a previous sub-agent session (async)                                                 |
@@ -470,27 +459,14 @@ Every sub-agent session displays a compact tools widget showing available and de
 ## Requirements
 
 - [pi](https://github.com/badlogic/pi-mono) — the coding agent
-- One supported multiplexer:
-  - [cmux](https://github.com/manaflow-ai/cmux)
-  - [tmux](https://github.com/tmux/tmux)
-  - [zellij](https://zellij.dev)
-  - [WezTerm](https://wezfurlong.org/wezterm/)
+- [herdr](https://herdr.dev) — the required terminal workspace
 
 ```bash
-cmux pi
-# or
-tmux new -A -s pi 'pi'
-# or
-zellij --session pi   # then run: pi
-# or
-# just run pi inside WezTerm
+herdr
+pi
 ```
 
-Optional backend override:
-
-```bash
-export PI_SUBAGENT_MUX=cmux   # or tmux, zellij, wezterm
-```
+Other multiplexers and terminal backends are not supported.
 
 ---
 

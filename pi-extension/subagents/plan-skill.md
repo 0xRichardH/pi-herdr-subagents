@@ -5,7 +5,7 @@ description: >
   which clarifies WHAT to build and figures out HOW, with the ability to
   spawn its own scouts/researchers mid-session. Use when asked to "plan",
   "brainstorm", "I want to build X", or "let's design". Requires the
-  subagents extension and a supported multiplexer (cmux/tmux/zellij).
+  subagents extension running inside herdr.
 ---
 
 # Plan

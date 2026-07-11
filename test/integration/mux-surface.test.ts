@@ -6,7 +6,7 @@
  * No LLM calls — fast and free.
  *
  * Run inside a supported multiplexer:
- *   cmux bash -c 'npm run test:integration'
+ *   herdr  # then run: npm run test:integration
  *   tmux new 'npm run test:integration'
  *   zellij --session pi  # then run: npm run test:integration
  */
@@ -26,12 +26,12 @@ import {
   getSurfacePane,
   waitForFocusedSurface,
   untrackSurface,
-  sendCommand,
-  sendLongCommand,
-  readScreen,
-  readScreenAsync,
-  closeSurface,
-  sendEscape,
+  runInPane,
+  runScriptInPane,
+  readPane,
+  readPaneAsync,
+  closePane,
+  interruptPane,
   sleep,
   uniqueId,
   trackTempFile,
@@ -45,7 +45,7 @@ const FOCUS_TEST_SHELL_READY_DELAY_MS = Number(process.env.PI_SUBAGENT_SHELL_REA
 
 if (backends.length === 0) {
   console.log("⚠️  No mux backend available — skipping mux-surface integration tests");
-  console.log("   Run inside cmux or tmux to enable these tests.");
+  console.log("   Run inside herdr to enable these tests.");
 }
 
 for (const backend of backends) {
@@ -84,7 +84,7 @@ for (const backend of backends) {
       await sleep(FOCUS_TEST_SHELL_READY_DELAY_MS);
       assert.equal(getFocusedSurface(backend), anchor);
 
-      if (backend === "cmux") {
+      if (false) {
         const paneA = getSurfacePane(backend, childA);
         const paneB = getSurfacePane(backend, childB);
         assert.ok(paneA, `Expected pane ref for ${childA}`);
@@ -94,8 +94,8 @@ for (const backend of backends) {
 
       const markerA = uniqueId();
       const markerB = uniqueId();
-      sendCommand(childA, `echo "FOCUS_A_${markerA}"`);
-      sendCommand(childB, `echo "FOCUS_B_${markerB}"`);
+      runInPane(childA, `echo "FOCUS_A_${markerA}"`);
+      runInPane(childB, `echo "FOCUS_B_${markerB}"`);
 
       await Promise.all([
         waitForScreen(childA, new RegExp(`FOCUS_A_${markerA}`), 20_000, 50),
@@ -109,16 +109,16 @@ for (const backend of backends) {
       await sleep(1000);
 
       const marker = uniqueId();
-      sendCommand(surface, `echo "MARKER_${marker}"`);
+      runInPane(surface, `echo "MARKER_${marker}"`);
       await sleep(1500);
 
-      const screen = readScreen(surface, 50);
+      const screen = readPane(surface, 50);
       assert.ok(
         screen.includes(`MARKER_${marker}`),
         `Expected screen to contain MARKER_${marker}. Got:\n${screen}`,
       );
 
-      closeSurface(surface);
+      closePane(surface);
       untrackSurface(env, surface);
     });
 
@@ -128,10 +128,10 @@ for (const backend of backends) {
 
       const marker = uniqueId();
       // Single-quoted string — $ and " are literal inside single quotes
-      sendCommand(surface, `echo 'SPEC_${marker}_$HOME_"quotes"_done'`);
+      runInPane(surface, `echo 'SPEC_${marker}_$HOME_"quotes"_done'`);
       await sleep(1500);
 
-      const screen = readScreen(surface, 50);
+      const screen = readPane(surface, 50);
       assert.ok(
         screen.includes(`SPEC_${marker}`),
         `Expected special-char output. Got:\n${screen}`,
@@ -151,10 +151,10 @@ for (const backend of backends) {
       const longValue = "X".repeat(500);
       const command = `echo "LONG_${marker}_${longValue}_END"`;
 
-      sendLongCommand(surface, command);
+      runScriptInPane(surface, command);
       await sleep(2000);
 
-      const screen = readScreen(surface, 50);
+      const screen = readPane(surface, 50);
       assert.ok(
         screen.includes(`LONG_${marker}`),
         `Expected long command output. Got:\n${screen.slice(0, 300)}...`,
@@ -170,10 +170,10 @@ for (const backend of backends) {
       await sleep(1000);
 
       const marker = uniqueId();
-      sendCommand(surface, `echo "ASYNC_${marker}"`);
+      runInPane(surface, `echo "ASYNC_${marker}"`);
       await sleep(1500);
 
-      const screen = await readScreenAsync(surface, 50);
+      const screen = await readPaneAsync(surface, 50);
       assert.ok(
         screen.includes(`ASYNC_${marker}`),
         `Async read should find marker. Got:\n${screen}`,
@@ -187,12 +187,12 @@ for (const backend of backends) {
 
       const m1 = uniqueId();
       const m2 = uniqueId();
-      sendCommand(s1, `echo "S1_${m1}"`);
-      sendCommand(s2, `echo "S2_${m2}"`);
+      runInPane(s1, `echo "S1_${m1}"`);
+      runInPane(s2, `echo "S2_${m2}"`);
       await sleep(1500);
 
-      const screen1 = readScreen(s1, 50);
-      const screen2 = readScreen(s2, 50);
+      const screen1 = readPane(s1, 50);
+      const screen2 = readPane(s2, 50);
 
       assert.ok(screen1.includes(`S1_${m1}`), `Surface 1 missing marker. Got:\n${screen1}`);
       assert.ok(screen2.includes(`S2_${m2}`), `Surface 2 missing marker. Got:\n${screen2}`);
@@ -205,7 +205,7 @@ for (const backend of backends) {
       const marker = uniqueId();
       const filePath = `/tmp/pi-mux-test-${marker}.txt`;
 
-      sendCommand(surface, `echo "FILE_${marker}" > ${filePath} && echo "WRITTEN_${marker}"`);
+      runInPane(surface, `echo "FILE_${marker}" > ${filePath} && echo "WRITTEN_${marker}"`);
 
       await waitForScreen(surface, new RegExp(`WRITTEN_${marker}`), 10_000, 50);
       const content = await waitForFile(filePath, 10_000, new RegExp(`FILE_${marker}`));
@@ -237,10 +237,10 @@ for (const backend of backends) {
         "});";
       const command = `node -e ${JSON.stringify(nodeProgram)}`;
 
-      sendLongCommand(surface, command);
+      runScriptInPane(surface, command);
       await waitForScreen(surface, /ESC_READY/, 15_000, 50);
 
-      sendEscape(surface);
+      interruptPane(surface);
 
       const content = await waitForFile(byteFile, 15_000, /^27$/);
       assert.equal(content.trim(), "27");

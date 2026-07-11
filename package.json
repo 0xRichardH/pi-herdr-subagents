@@ -1,15 +1,15 @@
 {
-  "name": "pi-interactive-subagents",
+  "name": "pi-herdr-subagents",
   "version": "3.7.2",
-  "description": "Interactive subagents for pi - spawn, orchestrate, and manage sub-agent sessions in cmux/tmux/zellij terminals",
+  "description": "Interactive subagents for pi running in herdr",
   "keywords": [
     "pi-package"
   ],
   "license": "MIT",
-  "author": "HazAT",
+  "author": "0xRichardH",
   "repository": {
     "type": "git",
-    "url": "https://github.com/HazAT/pi-interactive-subagents"
+    "url": "https://github.com/0xRichardH/pi-herdr-subagents"
   },
   "type": "module",
   "scripts": {
@@ -17,8 +17,8 @@
     "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts"
   },
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*",
-    "@mariozechner/pi-tui": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
     "@sinclair/typebox": "*"
   },
   "pi": {
@@ -27,8 +27,8 @@
     ]
   },
   "devDependencies": {
-    "@mariozechner/pi-coding-agent": "^0.65.0",
-    "@mariozechner/pi-tui": "^0.65.0",
-    "@sinclair/typebox": "^0.34.49"
+    "@earendil-works/pi-coding-agent": "^0.80.6",
+    "@earendil-works/pi-tui": "^0.80.6",
+    "@sinclair/typebox": "^0.34.51"
   }
 }

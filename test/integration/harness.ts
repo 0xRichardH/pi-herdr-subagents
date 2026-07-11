@@ -1,8 +1,8 @@
 /**
- * Integration test harness for pi-interactive-subagents.
+ * Integration test harness for pi-herdr-subagents.
  *
  * Provides utilities to:
- * - Detect available mux backends (cmux, tmux, zellij)
+ * - Detect whether herdr is available
  * - Create isolated test environments with test agent definitions
  * - Start real pi sessions in mux surfaces
  * - Poll for file creation and screen output
@@ -23,32 +23,31 @@ import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import {
-  getMuxBackend,
-  createSurface,
-  createSurfaceSplit,
-  sendCommand,
-  sendLongCommand,
-  readScreen,
-  readScreenAsync,
-  closeSurface,
-  sendEscape,
-  shellEscape,
-  parseCmuxFocusedSnapshotFromJson,
-  parseCmuxPaneRefForSurfaceFromJson,
-  type MuxBackend,
-} from "../../pi-extension/subagents/cmux.ts";
+  isTerminalAvailable,
+  createSubagentPane,
+  splitCurrentPane,
+  runInPane,
+  runScriptInPane,
+  readPane,
+  readPaneAsync,
+  closePane,
+  interruptPane,
+  shellQuote,
+} from "../../pi-extension/subagents/terminal.ts";
+
+type MuxBackend = "herdr";
 
 // Re-export mux primitives for tests
 export {
-  createSurface,
-  createSurfaceSplit,
-  sendCommand,
-  sendLongCommand,
-  readScreen,
-  readScreenAsync,
-  closeSurface,
-  sendEscape,
-  shellEscape,
+  createSubagentPane,
+  splitCurrentPane,
+  runInPane,
+  runScriptInPane,
+  readPane,
+  readPaneAsync,
+  closePane,
+  interruptPane,
+  shellQuote,
 };
 export type { MuxBackend };
 
@@ -74,111 +73,43 @@ const EXTENSION_SOURCE = join(PROJECT_ROOT, "pi-extension", "subagents", "index.
 // ── Configuration ──
 
 /** Model used for integration tests. Override with PI_TEST_MODEL env var. */
-export const TEST_MODEL = process.env.PI_TEST_MODEL ?? "anthropic/claude-haiku-4-5";
+export const TEST_MODEL = process.env.PI_TEST_MODEL ?? "openrouter/free";
 
 /** Per-test timeout in ms. Override with PI_TEST_TIMEOUT env var. */
 export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
 
 // ── Backend detection ──
 
-/**
- * Detect which mux backends are actually available in the current environment.
- * Temporarily sets PI_SUBAGENT_MUX to probe each backend.
- */
+/** Detect whether the required herdr backend is available. */
 export function getAvailableBackends(): MuxBackend[] {
-  const backends: MuxBackend[] = [];
-  const orig = process.env.PI_SUBAGENT_MUX;
-
-  for (const backend of ["cmux", "tmux", "zellij", "wezterm", "herdr"] as MuxBackend[]) {
-    process.env.PI_SUBAGENT_MUX = backend;
-    try {
-      if (getMuxBackend() === backend) backends.push(backend);
-    } catch {}
-  }
-
-  if (orig === undefined) delete process.env.PI_SUBAGENT_MUX;
-  else process.env.PI_SUBAGENT_MUX = orig;
-
-  return backends;
+  return isTerminalAvailable() ? ["herdr"] : [];
 }
 
-export function setBackend(backend: MuxBackend): string | undefined {
-  const prev = process.env.PI_SUBAGENT_MUX;
-  process.env.PI_SUBAGENT_MUX = backend;
-  return prev;
+export function setBackend(_backend: MuxBackend): undefined {
+  return undefined;
 }
 
-export function restoreBackend(prev: string | undefined): void {
-  if (prev === undefined) delete process.env.PI_SUBAGENT_MUX;
-  else process.env.PI_SUBAGENT_MUX = prev;
+export function restoreBackend(_prev: string | undefined): void {}
+
+export function focusSurface(_backend: MuxBackend, surface: string): void {
+  // Focus the tab containing the pane — herdr has no direct "focus pane X"
+  // CLI, but focusing the tab brings it to the foreground.
+  const info = execFileSync("herdr", ["pane", "get", surface], { encoding: "utf8" });
+  const tabId = JSON.parse(info)?.result?.pane?.tab_id;
+  if (tabId) execFileSync("herdr", ["tab", "focus", tabId], { encoding: "utf8" });
 }
 
-export function focusSurface(backend: MuxBackend, surface: string): void {
-  if (backend === "cmux") {
-    const pane = getSurfacePane(backend, surface);
-    if (pane) execFileSync("cmux", ["focus-pane", "--pane", pane], { encoding: "utf8" });
-    execFileSync("cmux", ["focus-panel", "--panel", surface], { encoding: "utf8" });
-    return;
+export function getFocusedSurface(_backend: MuxBackend): string | null {
+  try {
+    const info = execFileSync("herdr", ["pane", "current"], { encoding: "utf8" });
+    return JSON.parse(info)?.result?.pane?.pane_id ?? null;
+  } catch {
+    return null;
   }
-
-  if (backend === "tmux") {
-    execFileSync("tmux", ["select-pane", "-t", surface], { encoding: "utf8" });
-    return;
-  }
-
-  if (backend === "herdr") {
-    // Focus the tab containing the pane — herdr has no direct "focus pane X"
-    // CLI, but focusing the tab brings it to the foreground.
-    const info = execFileSync("herdr", ["pane", "get", surface], { encoding: "utf8" });
-    const tabId = JSON.parse(info)?.result?.pane?.tab_id;
-    if (tabId) execFileSync("herdr", ["tab", "focus", tabId], { encoding: "utf8" });
-    return;
-  }
-
-  throw new Error(`Focus helpers are not implemented for ${backend}`);
 }
 
-export function getFocusedSurface(backend: MuxBackend): string | null {
-  if (backend === "cmux") {
-    const info = execFileSync("cmux", ["identify", "--json"], { encoding: "utf8" });
-    return parseCmuxFocusedSnapshotFromJson(info)?.surfaceRef ?? null;
-  }
-
-  if (backend === "tmux") {
-    try {
-      const panes = execFileSync("tmux", ["list-panes", "-F", "#{pane_id} #{pane_active}"], {
-        encoding: "utf8",
-      });
-      const activeLine = panes.split("\n").find((line) => line.endsWith(" 1"));
-      return activeLine?.split(" ")[0] ?? null;
-    } catch {
-      return null;
-    }
-  }
-
-  if (backend === "herdr") {
-    try {
-      const info = execFileSync("herdr", ["pane", "current"], { encoding: "utf8" });
-      return JSON.parse(info)?.result?.pane?.pane_id ?? null;
-    } catch {
-      return null;
-    }
-  }
-
-  throw new Error(`Focus helpers are not implemented for ${backend}`);
-}
-
-export function getSurfacePane(backend: MuxBackend, surface: string): string | null {
-  if (backend === "cmux") {
-    const info = execFileSync("cmux", ["identify", "--surface", surface], { encoding: "utf8" });
-    return parseCmuxPaneRefForSurfaceFromJson(info, surface);
-  }
-
-  if (backend === "tmux") return surface;
-
-  if (backend === "herdr") return surface;
-
-  throw new Error(`Pane lookup is not implemented for ${backend}`);
+export function getSurfacePane(_backend: MuxBackend, surface: string): string | null {
+  return surface;
 }
 
 export async function waitForFocusedSurface(
@@ -238,7 +169,7 @@ export function createTestEnv(backend: MuxBackend): TestEnv {
 export function cleanupTestEnv(env: TestEnv): void {
   for (const surface of env.surfaces) {
     try {
-      closeSurface(surface);
+      closePane(surface);
     } catch {}
   }
   for (const file of env.tempFiles) {
@@ -255,7 +186,7 @@ export function cleanupTestEnv(env: TestEnv): void {
  * Create a surface and register it for automatic cleanup.
  */
 export function createTrackedSurface(env: TestEnv, name: string): string {
-  const surface = createSurface(name);
+  const surface = createSubagentPane(name);
   env.surfaces.push(surface);
   return surface;
 }
@@ -266,7 +197,7 @@ export function createTrackedSurfaceSplit(
   direction: "left" | "right" | "up" | "down",
   fromSurface?: string,
 ): string {
-  const surface = createSurfaceSplit(name, direction, fromSurface);
+  const surface = splitCurrentPane(name, direction, fromSurface);
   env.surfaces.push(surface);
   return surface;
 }
@@ -301,18 +232,18 @@ export function startPi(
   // current branch's source directly. Without this, the tests silently run
   // against whatever version is checked out under `~/.pi/agent/git/...`.
   const cmd = [
-    `cd ${shellEscape(testDir)} &&`,
+    `cd ${shellQuote(testDir)} &&`,
     `pi`,
     `-ne`,
-    `-e ${shellEscape(EXTENSION_SOURCE)}`,
-    `--model ${shellEscape(model)}`,
+    `-e ${shellQuote(EXTENSION_SOURCE)}`,
+    `--model ${shellQuote(model)}`,
     extra,
-    shellEscape(task),
+    shellQuote(task),
   ]
     .filter(Boolean)
     .join(" ");
 
-  sendLongCommand(surface, `${cmd}; echo '__TEST_DONE_'$?'__'`, {
+  runScriptInPane(surface, `${cmd}; echo '__TEST_DONE_'$?'__'`, {
     scriptPath: join(testDir, `test-launch-${Date.now()}.sh`),
   });
 }
@@ -332,7 +263,7 @@ export async function waitForScreen(
   const start = Date.now();
   while (Date.now() - start < timeout) {
     try {
-      const screen = await readScreenAsync(surface, lines);
+      const screen = await readPaneAsync(surface, lines);
       if (pattern.test(screen)) return screen;
     } catch {}
     await sleep(2000);
@@ -340,7 +271,7 @@ export async function waitForScreen(
 
   let finalScreen = "";
   try {
-    finalScreen = readScreen(surface, lines);
+    finalScreen = readPane(surface, lines);
   } catch {}
   throw new Error(
     `Timeout (${timeout}ms) waiting for pattern ${pattern}.\nLast screen:\n${finalScreen.slice(-1000)}`,

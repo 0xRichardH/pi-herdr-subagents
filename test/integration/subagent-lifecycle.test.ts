@@ -9,11 +9,11 @@
  * Duration: ~30-90s per test.
  *
  * Run inside a supported multiplexer:
- *   cmux bash -c 'npm run test:integration'
+ *   herdr  # then run: npm run test:integration
  *   tmux new 'npm run test:integration'
  *
  * Configuration:
- *   PI_TEST_MODEL     — model for all pi sessions (default: anthropic/claude-haiku-4-5)
+ *   PI_TEST_MODEL     — model for all pi sessions (default: openrouter/free)
  *   PI_TEST_TIMEOUT   — per-test timeout in ms (default: 120000)
  */
 import { describe, it, before, after } from "node:test";
@@ -32,7 +32,7 @@ import {
   sleep,
   uniqueId,
   trackTempFile,
-  readScreen,
+  readPane,
   PI_TIMEOUT,
   type TestEnv,
 } from "./harness.ts";
@@ -41,7 +41,7 @@ const backends = getAvailableBackends();
 
 if (backends.length === 0) {
   console.log("⚠️  No mux backend available — skipping subagent lifecycle integration tests");
-  console.log("   Run inside cmux or tmux to enable these tests.");
+  console.log("   Run inside herdr to enable these tests.");
 }
 
 for (const backend of backends) {
@@ -139,7 +139,7 @@ for (const backend of backends) {
       assert.equal(existsSync(markerFile), false, "Completion marker should not exist before the long sleep");
       await sleep(65_000);
       assert.equal(existsSync(markerFile), false, "Completion marker should not exist before the watchdog assertion");
-      const watchdogScreen = readScreen(surface, 300);
+      const watchdogScreen = readPane(surface, 300);
       assert.doesNotMatch(watchdogScreen, /Subagent status[\s\S]*stalled|stalled[\s\S]*Subagent status/i);
 
       const content = await waitForFile(markerFile, PI_TIMEOUT, /STATUS_/);

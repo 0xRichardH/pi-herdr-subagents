@@ -1,7 +1,7 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { keyHint } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { keyHint } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
-import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -15,19 +15,19 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import {
-  isMuxAvailable,
-  muxSetupHint,
-  createSurface,
-  sendLongCommand,
-  pollForExit,
-  closeSurface,
-  getMuxBackend,
-  sendEscape,
-  shellEscape,
+  isTerminalAvailable,
+  terminalSetupHint,
+  createSubagentPane,
+  runScriptInPane,
+  closePane,
+  interruptPane,
+  shellQuote,
   renameCurrentTab,
-  renameWorkspace,
-  readScreen,
-} from "./cmux.ts";
+  renameCurrentWorkspace,
+  readPane,
+  readPaneAsync,
+} from "./terminal.ts";
+import { waitForCompletion } from "./completion.ts";
 
 import {
   findLastAssistantMessage,
@@ -59,7 +59,7 @@ const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
 
 // Survive /reload: clear timers and abort poll loops from the previous module load.
 // /reload re-imports this file, giving fresh module-level state, but closures from
-// the old module keep running. See https://github.com/HazAT/pi-interactive-subagents/issues/5
+// the old module keep running. These global symbols preserve reload compatibility.
 const WIDGET_INTERVAL_KEY = Symbol.for("pi-subagents/widget-interval");
 const STATUS_INTERVAL_KEY = Symbol.for("pi-subagents/status-interval");
 const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
@@ -398,10 +398,10 @@ function muxUnavailableResult() {
     content: [
       {
         type: "text" as const,
-        text: `Subagents require a supported terminal multiplexer. ${muxSetupHint()}`,
+        text: `Subagents require herdr. ${terminalSetupHint()}`,
       },
     ],
-    details: { error: "mux not available" },
+    details: { error: "herdr not available" },
   };
 }
 
@@ -775,16 +775,15 @@ function resolveInterruptTarget(params: { id?: string; name?: string }):
 
 function requestSubagentInterrupt(
   running: RunningSubagent,
-  sendEscapeKey: (surface: string) => void = sendEscape,
+  interruptPaneKey: (surface: string) => void = interruptPane,
 ): { ok: true } | { error: string } {
   try {
-    sendEscapeKey(running.surface);
+    interruptPaneKey(running.surface);
     return { ok: true };
   } catch (error: any) {
-    const backend = getMuxBackend() ?? "unknown";
     return {
       error:
-        `Failed to send Escape to subagent "${running.name}" via ${backend}: ` +
+        `Failed to send Escape to subagent "${running.name}" via herdr: ` +
         `${error?.message ?? String(error)}`,
     };
   }
@@ -792,7 +791,7 @@ function requestSubagentInterrupt(
 
 function handleSubagentInterrupt(
   params: { id?: string; name?: string },
-  sendEscapeKey: (surface: string) => void = sendEscape,
+  interruptPaneKey: (surface: string) => void = interruptPane,
 ) {
   const resolved = resolveInterruptTarget(params);
   if ("error" in resolved) {
@@ -817,7 +816,7 @@ function handleSubagentInterrupt(
   const now = Date.now();
   observeRunningSubagent(running, now);
 
-  const interruption = requestSubagentInterrupt(running, sendEscapeKey);
+  const interruption = requestSubagentInterrupt(running, interruptPaneKey);
   if ("error" in interruption) {
     return {
       content: [{ type: "text" as const, text: interruption.error }],
@@ -969,7 +968,7 @@ async function launchSubagent(
   // Use pre-created surface (parallel mode) or create a new one.
   // For new surfaces, pause briefly so the shell is ready before sending the command.
   const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSurface(params.name);
+  const surface = options?.surface ?? createSubagentPane(params.name);
   if (!surfacePreCreated) {
     await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
   }
@@ -1012,32 +1011,32 @@ async function launchSubagent(
     const pluginDir = join(SUBAGENTS_DIR, "plugin");
 
     const cmdParts: string[] = [];
-    cmdParts.push(`PI_CLAUDE_SENTINEL=${shellEscape(sentinelFile)}`);
+    cmdParts.push(`PI_CLAUDE_SENTINEL=${shellQuote(sentinelFile)}`);
     cmdParts.push("claude");
     cmdParts.push("--dangerously-skip-permissions");
 
     if (existsSync(pluginDir)) {
-      cmdParts.push("--plugin-dir", shellEscape(pluginDir));
+      cmdParts.push("--plugin-dir", shellQuote(pluginDir));
     }
 
     if (effectiveModel) {
-      cmdParts.push("--model", shellEscape(effectiveModel));
+      cmdParts.push("--model", shellQuote(effectiveModel));
     }
 
     const sp = params.systemPrompt ?? agentDefs.body;
     if (sp) {
-      cmdParts.push("--append-system-prompt", shellEscape(sp));
+      cmdParts.push("--append-system-prompt", shellQuote(sp));
     }
 
     if (params.resumeSessionId) {
-      cmdParts.push("--resume", shellEscape(params.resumeSessionId));
+      cmdParts.push("--resume", shellQuote(params.resumeSessionId));
     }
 
     // Always pass the task as the prompt — even for resumed sessions,
     // the caller's task is the follow-up instruction.
-    cmdParts.push(shellEscape(params.task));
+    cmdParts.push(shellQuote(params.task));
 
-    const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
+    const cdPrefix = effectiveCwd ? `cd ${shellQuote(effectiveCwd)} && ` : "";
     const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
 
     const launchScriptName = `${(params.name || "subagent")
@@ -1048,7 +1047,7 @@ async function launchSubagent(
       .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
     const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
 
-    sendLongCommand(surface, command, {
+    runScriptInPane(surface, command, {
       scriptPath: launchScriptFile,
       scriptPreamble: [
         `# Claude Code subagent launch script for ${params.name}`,
@@ -1083,14 +1082,14 @@ async function launchSubagent(
 
   // Build pi command
   const parts: string[] = ["pi"];
-  parts.push("--session", shellEscape(subagentSessionFile));
+  parts.push("--session", shellQuote(subagentSessionFile));
 
   const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
-  parts.push("-e", shellEscape(subagentDonePath));
+  parts.push("-e", shellQuote(subagentDonePath));
 
   if (effectiveModel) {
     const model = effectiveThinking ? `${effectiveModel}:${effectiveThinking}` : effectiveModel;
-    parts.push("--model", shellEscape(model));
+    parts.push("--model", shellQuote(model));
   }
 
   // Pass agent body as system prompt via file to avoid shell escaping issues
@@ -1108,12 +1107,12 @@ async function launchSubagent(
     const syspromptPath = join(artifactDir, `context/${spSafeName || "subagent"}-sysprompt-${spTimestamp}.md`);
     mkdirSync(dirname(syspromptPath), { recursive: true });
     writeFileSync(syspromptPath, identity, "utf8");
-    parts.push(flag, shellEscape(syspromptPath));
+    parts.push(flag, shellQuote(syspromptPath));
   }
 
   const toolAllowlist = buildSubagentToolAllowlist(effectiveTools);
   if (toolAllowlist) {
-    parts.push("--tools", shellEscape(toolAllowlist));
+    parts.push("--tools", shellQuote(toolAllowlist));
   }
 
   // Build env prefix: denied tools + subagent identity + config dir propagation
@@ -1122,25 +1121,25 @@ async function launchSubagent(
   // If the target cwd has its own .pi/agent/, use that as the config root.
   // Otherwise propagate the current/global agent dir.
   if (localAgentDir && existsSync(localAgentDir)) {
-    envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(localAgentDir)}`);
+    envParts.push(`PI_CODING_AGENT_DIR=${shellQuote(localAgentDir)}`);
   } else if (process.env.PI_CODING_AGENT_DIR) {
-    envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(process.env.PI_CODING_AGENT_DIR)}`);
+    envParts.push(`PI_CODING_AGENT_DIR=${shellQuote(process.env.PI_CODING_AGENT_DIR)}`);
   }
 
   if (denySet.size > 0) {
-    envParts.push(`PI_DENY_TOOLS=${shellEscape([...denySet].join(","))}`);
+    envParts.push(`PI_DENY_TOOLS=${shellQuote([...denySet].join(","))}`);
   }
-  envParts.push(`PI_SUBAGENT_NAME=${shellEscape(params.name)}`);
+  envParts.push(`PI_SUBAGENT_NAME=${shellQuote(params.name)}`);
   if (params.agent) {
-    envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
+    envParts.push(`PI_SUBAGENT_AGENT=${shellQuote(params.agent)}`);
   }
   if (agentDefs?.autoExit) {
     envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
   }
-  envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
-  envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
-  envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
-  envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
+  envParts.push(`PI_SUBAGENT_SESSION=${shellQuote(subagentSessionFile)}`);
+  envParts.push(`PI_SUBAGENT_ID=${shellQuote(id)}`);
+  envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
+  envParts.push(`PI_SUBAGENT_SURFACE=${shellQuote(surface)}`);
   const envPrefix = envParts.join(" ") + " ";
 
   // Pass task and skill prompts to the sub-agent.
@@ -1170,12 +1169,12 @@ async function launchSubagent(
     taskDelivery: launchBehavior.taskDelivery,
     taskArg,
   })) {
-    parts.push(shellEscape(promptArg));
+    parts.push(shellQuote(promptArg));
   }
 
   // Resolve cwd — param overrides agent default, supports absolute and relative paths.
   // This was already computed above so session placement, PI_CODING_AGENT_DIR, and cd agree.
-  const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
+  const cdPrefix = effectiveCwd ? `cd ${shellQuote(effectiveCwd)} && ` : "";
 
   const piCommand = cdPrefix + envPrefix + parts.join(" ");
   const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
@@ -1186,7 +1185,7 @@ async function launchSubagent(
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
-  sendLongCommand(surface, command, {
+  runScriptInPane(surface, command, {
     scriptPath: launchScriptFile,
     scriptPreamble: [
       `# Subagent launch script for ${params.name}`,
@@ -1250,10 +1249,11 @@ async function watchSubagent(
   const { name, task, surface, startTime, sessionFile } = running;
 
   try {
-    const result = await pollForExit(surface, AbortSignal.any([signal, getModuleAbortSignal()]), {
-      interval: 1000,
+    const result = await waitForCompletion(AbortSignal.any([signal, getModuleAbortSignal()]), {
+      intervalMs: 1000,
       sessionFile,
       sentinelFile: running.sentinelFile,
+      readTerminalTail: () => readPaneAsync(surface, 5),
       onTick() {
         observeRunningSubagent(running);
       },
@@ -1272,7 +1272,7 @@ async function watchSubagent(
       }
 
       if (!summary) {
-        summary = readScreen(surface, 200)
+        summary = readPane(surface, 200)
           .replace(/__SUBAGENT_DONE_\d+__/, "")
           .trimEnd();
       }
@@ -1291,7 +1291,7 @@ async function watchSubagent(
         try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
       }
 
-      closeSurface(surface);
+      closePane(surface);
       runningSubagents.delete(running.id);
 
       return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
@@ -1316,7 +1316,7 @@ async function watchSubagent(
           : "Sub-agent exited without output";
     }
 
-    closeSurface(surface);
+    closePane(surface);
     runningSubagents.delete(running.id);
 
     return {
@@ -1331,7 +1331,7 @@ async function watchSubagent(
     };
   } catch (err: any) {
     try {
-      closeSurface(surface);
+      closePane(surface);
     } catch {}
     runningSubagents.delete(running.id);
 
@@ -1430,7 +1430,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Validate prerequisites
-        if (!isMuxAvailable()) {
+        if (!isTerminalAvailable()) {
           return muxUnavailableResult();
         }
 
@@ -1777,7 +1777,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const startTime = Date.now();
         const id = Math.random().toString(16).slice(2, 10);
 
-        if (!isMuxAvailable()) {
+        if (!isTerminalAvailable()) {
           return muxUnavailableResult();
         }
 
@@ -1793,15 +1793,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Record entry count before resuming so we can extract new messages
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
-        const surface = createSurface(name);
+        const surface = createSubagentPane(name);
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
         // Build pi resume command
-        const parts = ["pi", "--session", shellEscape(params.sessionPath)];
+        const parts = ["pi", "--session", shellQuote(params.sessionPath)];
 
         // Load subagent-done extension so the agent can self-terminate if needed
         const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
-        parts.push("-e", shellEscape(subagentDonePath));
+        parts.push("-e", shellQuote(subagentDonePath));
 
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
@@ -1823,18 +1823,18 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           );
           mkdirSync(dirname(resumeMsgFile), { recursive: true });
           writeFileSync(resumeMsgFile, params.message, "utf8");
-          parts.push(shellEscape(`@${resumeMsgFile}`));
+          parts.push(shellQuote(`@${resumeMsgFile}`));
         }
 
         // Build env prefix — propagate PI_CODING_AGENT_DIR for config isolation
         const resumeEnvParts: string[] = [];
         if (process.env.PI_CODING_AGENT_DIR) {
-          resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(process.env.PI_CODING_AGENT_DIR)}`);
+          resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellQuote(process.env.PI_CODING_AGENT_DIR)}`);
         }
-        resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellEscape(name)}`);
-        resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellEscape(params.sessionPath)}`);
-        resumeEnvParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
-        resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
+        resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellQuote(name)}`);
+        resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellQuote(params.sessionPath)}`);
+        resumeEnvParts.push(`PI_SUBAGENT_ID=${shellQuote(id)}`);
+        resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
         if (autoExit) {
           resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
         }
@@ -1851,7 +1851,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             .replace(/-+/g, "-")
             .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
         );
-        sendLongCommand(surface, command, {
+        runScriptInPane(surface, command, {
           scriptPath: launchScriptFile,
           scriptPreamble: [
             `# Subagent resume script for ${name}`,
@@ -2159,10 +2159,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       }
 
       // Rename workspace and tab to show this is a planning session
-      if (isMuxAvailable()) {
+      if (isTerminalAvailable()) {
         try {
           const label = task.length > 40 ? task.slice(0, 40) + "..." : task;
-          renameWorkspace(`🎯 ${label}`);
+          renameCurrentWorkspace(`🎯 ${label}`);
           renameCurrentTab(`🎯 Plan: ${label}`);
         } catch {
           // non-critical -- do not block the plan
