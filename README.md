@@ -87,7 +87,7 @@ Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global**
 
 ```
 1. Agent calls subagent()          → returns immediately ("started")
-2. Sub-agent runs in mux pane      → widget shows live status
+2. Sub-agent runs in herdr pane    → widget shows live status
 3. User keeps chatting             → main session fully interactive
 4. Sub-agent finishes              → result steered back as a normal completion/failure
 5. Main agent processes result     → continues with new context

@@ -4,7 +4,7 @@
  * Provides utilities to:
  * - Detect whether herdr is available
  * - Create isolated test environments with test agent definitions
- * - Start real pi sessions in mux surfaces
+ * - Start real pi sessions in herdr panes
  * - Poll for file creation and screen output
  * - Clean up surfaces and temp files after tests
  */
@@ -25,7 +25,6 @@ import { tmpdir } from "node:os";
 import {
   isTerminalAvailable,
   createSubagentPane,
-  splitCurrentPane,
   runInPane,
   runScriptInPane,
   readPane,
@@ -40,7 +39,6 @@ type MuxBackend = "herdr";
 // Re-export mux primitives for tests
 export {
   createSubagentPane,
-  splitCurrentPane,
   runInPane,
   runScriptInPane,
   readPane,
@@ -191,17 +189,6 @@ export function createTrackedSurface(env: TestEnv, name: string): string {
   return surface;
 }
 
-export function createTrackedSurfaceSplit(
-  env: TestEnv,
-  name: string,
-  direction: "left" | "right" | "up" | "down",
-  fromSurface?: string,
-): string {
-  const surface = splitCurrentPane(name, direction, fromSurface);
-  env.surfaces.push(surface);
-  return surface;
-}
-
 /**
  * Remove a surface from tracking (after manual close).
  */
@@ -212,7 +199,7 @@ export function untrackSurface(env: TestEnv, surface: string): void {
 // ── Pi session management ──
 
 /**
- * Start a pi session in a mux surface with the subagents extension loaded.
+ * Start a pi session in a herdr pane with the subagents extension loaded.
  * Returns immediately — the pi process runs asynchronously in the surface.
  *
  * The command ends with a sentinel so we can detect when pi exits:

@@ -1,16 +1,13 @@
 /**
  * Integration tests for the full subagent lifecycle.
  *
- * These tests spawn REAL pi sessions with REAL LLM calls (haiku by default).
- * Each test creates a mux surface, runs pi with a task that uses the subagent
- * tool, and verifies the outcome via marker files and screen output.
+ * These tests spawn real pi sessions with real LLM calls.
+ * Each test creates a herdr pane, runs pi with a task that uses the subagent
+ * tool, and verifies the outcome through marker files and terminal output.
  *
- * Costs: ~$0.01-0.05 per test run (haiku).
- * Duration: ~30-90s per test.
+ * Duration: ~30-120s per test, depending on the selected model.
  *
- * Run inside a supported multiplexer:
- *   herdr  # then run: npm run test:integration
- *   tmux new 'npm run test:integration'
+ * Run `npm run test:integration` from inside herdr.
  *
  * Configuration:
  *   PI_TEST_MODEL     — model for all pi sessions (default: openrouter/free)
@@ -40,7 +37,7 @@ import {
 const backends = getAvailableBackends();
 
 if (backends.length === 0) {
-  console.log("⚠️  No mux backend available — skipping subagent lifecycle integration tests");
+  console.log("⚠️  herdr is unavailable — skipping subagent lifecycle integration tests");
   console.log("   Run inside herdr to enable these tests.");
 }
 

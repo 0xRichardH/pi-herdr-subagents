@@ -137,16 +137,15 @@ export function createHerdrSurface(name: string): string {
 
 export function createHerdrSurfaceSplit(
   name: string,
-  direction: "left" | "right" | "up" | "down",
+  direction: "right" | "down",
 ): string {
   const parentPaneId = getHerdrParentPaneId();
-  const dir = direction === "left" || direction === "right" ? "right" : "down";
   const output = herdrExec([
     "pane",
     "split",
     parentPaneId,
     "--direction",
-    dir,
+    direction,
     "--no-focus",
     "--cwd",
     process.cwd(),
@@ -161,9 +160,8 @@ export function createHerdrSurfaceSplit(
 }
 
 export function readHerdrScreen(surface: string, lines = 50): string {
-  // `visible` is the current viewport — reliable for freshly-created panes
-  // where `recent` scrollback may not be populated yet. Matches what tmux
-  // capture-pane and zellij dump-screen return.
+  // `visible` is reliable for freshly created panes where herdr's `recent`
+  // scrollback may not be populated yet.
   return herdrExec(["pane", "read", surface, "--source", "visible", "--lines", String(lines)]);
 }
 
