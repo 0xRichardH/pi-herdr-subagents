@@ -15,7 +15,7 @@ import {
 } from "./herdr.ts";
 
 export type PaneId = string;
-export type SplitDirection = "left" | "right" | "up" | "down";
+export type SplitDirection = "right" | "down";
 
 const SETUP_HINT = "Start pi inside herdr (`herdr`, then run `pi`).";
 
