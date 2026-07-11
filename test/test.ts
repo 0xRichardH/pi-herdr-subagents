@@ -1,6 +1,6 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -42,7 +42,7 @@ import {
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
 } from "../pi-extension/subagents/subagent-done.ts";
-import { interpretExitSidecar } from "../pi-extension/subagents/completion.ts";
+import { interpretExitSidecar, waitForCompletion } from "../pi-extension/subagents/completion.ts";
 
 // --- Helpers ---
 
@@ -1282,7 +1282,7 @@ describe("subagent-done.ts", () => {
   });
 });
 
-describe("completion.ts interpretExitSidecar", () => {
+describe("completion.ts", () => {
 
   it("decodes ping payloads", () => {
     assert.deepEqual(
@@ -1328,7 +1328,83 @@ describe("completion.ts interpretExitSidecar", () => {
     assert.deepEqual(interpretExitSidecar({}), { reason: "done", exitCode: 0 });
     assert.deepEqual(interpretExitSidecar(null), { reason: "done", exitCode: 0 });
   });
+
+  it("consumes a sidecar and removes it", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "completion-sidecar-"));
+    const sessionFile = join(dir, "session.jsonl");
+    const exitFile = `${sessionFile}.exit`;
+    writeFileSync(exitFile, JSON.stringify({ type: "ping", name: "Scout", message: "ready" }));
+    try {
+      const result = await waitForCompletion(new AbortController().signal, {
+        intervalMs: 1,
+        sessionFile,
+        readTerminalTail: async () => "",
+      });
+      assert.deepEqual(result, {
+        reason: "ping",
+        exitCode: 0,
+        ping: { name: "Scout", message: "ready" },
+      });
+      assert.equal(existsSync(exitFile), false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("returns the terminal sentinel exit code", async () => {
+    const result = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => "output\n__SUBAGENT_DONE_17__\n",
+    });
+    assert.deepEqual(result, { reason: "sentinel", exitCode: 17 });
+  });
+
+  it("returns when an external sentinel file appears", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "completion-sentinel-"));
+    const sentinelFile = join(dir, "done");
+    writeFileSync(sentinelFile, "complete");
+    try {
+      const result = await waitForCompletion(new AbortController().signal, {
+        intervalMs: 1,
+        sentinelFile,
+        readTerminalTail: async () => "",
+      });
+      assert.deepEqual(result, { reason: "sentinel", exitCode: 0 });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("retries transient terminal read failures and reports ticks", async () => {
+    let reads = 0;
+    let ticks = 0;
+    const result = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => {
+        reads += 1;
+        if (reads === 1) throw new Error("pane temporarily unavailable");
+        return "__SUBAGENT_DONE_0__";
+      },
+      onTick: () => {
+        ticks += 1;
+      },
+    });
+    assert.deepEqual(result, { reason: "sentinel", exitCode: 0 });
+    assert.equal(reads, 2);
+    assert.equal(ticks, 1);
+  });
+
+  it("rejects promptly when aborted", async () => {
+    const controller = new AbortController();
+    const completion = waitForCompletion(controller.signal, {
+      intervalMs: 10_000,
+      readTerminalTail: async () => "",
+    });
+    controller.abort();
+    await assert.rejects(completion, /Aborted while waiting for subagent to finish/);
+  });
 });
+
 describe("commands", () => {
   it("/iterate always emits a full-context fork tool call", () => {
     const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();

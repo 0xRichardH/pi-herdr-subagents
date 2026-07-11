@@ -111,7 +111,7 @@ During the session, the planner can spawn:
 - **`scout`** — when a design decision depends on existing code it hasn't read
 - **`researcher`** — when a decision depends on external facts (library tradeoffs, best practices, API behaviors)
 
-These are internal to the planning session. You'll see them in the multiplexer but don't need to intervene.
+These are internal to the planning session. You'll see them in herdr but don't need to intervene.
 
 ### Optional: extra scout after planning
 
