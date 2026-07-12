@@ -17,7 +17,6 @@ import {
   seedSubagentSessionFile,
 } from "../pi-extension/subagents/session.ts";
 
-import { shellQuote } from "../pi-extension/subagents/terminal.ts";
 import { isHerdrAvailable, __herdrTest__ } from "../pi-extension/subagents/herdr.ts";
 import {
   advanceStatusState,
@@ -41,6 +40,7 @@ import {
   shouldMarkUserTookOver,
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
+  buildCompletionSidecar,
 } from "../pi-extension/subagents/subagent-done.ts";
 import { interpretExitSidecar, waitForCompletion } from "../pi-extension/subagents/completion.ts";
 
@@ -1280,6 +1280,24 @@ describe("subagent-done.ts", () => {
       assert.equal(findLatestAssistantError([]), null);
     });
   });
+
+  describe("buildCompletionSidecar", () => {
+    it("emits done immediately for a normal auto-exit completion", () => {
+      assert.deepEqual(buildCompletionSidecar([
+        { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] },
+      ]), { type: "done" });
+    });
+
+    it("preserves provider errors in the immediate completion sidecar", () => {
+      assert.deepEqual(buildCompletionSidecar([
+        { role: "assistant", stopReason: "error", errorMessage: "provider failed" },
+      ]), {
+        type: "error",
+        errorMessage: "provider failed",
+        stopReason: "error",
+      });
+    });
+  });
 });
 
 describe("completion.ts", () => {
@@ -2062,6 +2080,104 @@ describe("subagent startup delay", () => {
   });
 });
 describe("subagents widget rendering", () => {
+  it("shows interrupted agents as open, freezes runtime, and uses an amber border", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const interruptedAt = 20_000;
+    const state = forceStatusAfterInterrupt(
+      createStatusState({ source: "pi", startTimeMs: 5_000 }),
+      interruptedAt,
+    );
+
+    const originalNow = Date.now;
+    Date.now = () => 30_000;
+    try {
+      const lines = testApi.renderSubagentWidgetLines([{
+        id: "a1",
+        name: "Worker",
+        task: "",
+        surface: "s1",
+        startTime: 5_000,
+        sessionFile: "sess1",
+        statusState: state,
+        interactive: false,
+      }], 64);
+
+      assert.match(lines[0], /1 open/);
+      assert.ok(lines[0].includes("\x1b[38;2;214;158;46m"));
+      assert.match(lines[1], /00:15\s+Worker/);
+      assert.match(lines[1], /interrupted 10s/);
+      assert.doesNotMatch(lines.join("\n"), /running|active/);
+    } finally {
+      Date.now = originalNow;
+    }
+  });
+
+  it("freezes runtime when the subagent reports done", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const doneAt = 20_000;
+    const done = observeStatus(
+      createStatusState({ source: "pi", startTimeMs: 5_000 }),
+      {
+        snapshot: "present",
+        updatedAt: doneAt,
+        sequence: 1,
+        phase: "done",
+        latestEvent: "subagent_done",
+      },
+      doneAt,
+    );
+
+    const originalNow = Date.now;
+    Date.now = () => 30_000;
+    try {
+      const lines = testApi.renderSubagentWidgetLines([{
+        id: "a1",
+        name: "Reviewer",
+        task: "",
+        surface: "s1",
+        startTime: 5_000,
+        sessionFile: "sess1",
+        statusState: done,
+        interactive: false,
+      }], 64);
+
+      assert.match(lines[0], /1 open/);
+      assert.match(lines[1], /00:15\s+Reviewer/);
+      assert.match(lines[1], /waiting · done/);
+      assert.doesNotMatch(lines[1], /00:25/);
+    } finally {
+      Date.now = originalNow;
+    }
+  });
+
+  it("keeps a blue border and summarizes mixed active and open agents", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const now = 30_000;
+    const active = observeStatus(
+      createStatusState({ source: "pi", startTimeMs: 5_000 }),
+      { snapshot: "present", updatedAt: 29_000, sequence: 1, phase: "active", active: true },
+      29_000,
+    );
+    const interrupted = forceStatusAfterInterrupt(
+      createStatusState({ source: "pi", startTimeMs: 10_000 }),
+      20_000,
+    );
+
+    const originalNow = Date.now;
+    Date.now = () => now;
+    try {
+      const lines = testApi.renderSubagentWidgetLines([
+        { id: "a1", name: "Active", task: "", surface: "s1", startTime: 5_000, sessionFile: "s1", statusState: active, interactive: false },
+        { id: "a2", name: "Open", task: "", surface: "s2", startTime: 10_000, sessionFile: "s2", statusState: interrupted, interactive: false },
+      ], 72);
+
+      assert.match(lines[0], /1 active · 1 open/);
+      assert.ok(lines[0].includes("\x1b[38;2;77;163;255m"));
+    } finally {
+      Date.now = originalNow;
+    }
+  });
+
   it("keeps every rendered line within a very narrow width", () => {
     const testApi = (subagentsModule as any).__test__;
     assert.ok(testApi, "expected subagents test helpers to be exported");

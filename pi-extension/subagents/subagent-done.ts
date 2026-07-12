@@ -68,6 +68,13 @@ export function findLatestAssistantError(
   return null;
 }
 
+export function buildCompletionSidecar(messages: any[] | undefined):
+  | { type: "done" }
+  | { type: "error"; errorMessage: string; stopReason: "error" } {
+  const errorInfo = findLatestAssistantError(messages);
+  return errorInfo ? { type: "error", ...errorInfo } : { type: "done" };
+}
+
 export function parseDeniedTools(rawValue: string | undefined): string[] {
   return (rawValue ?? "")
     .split(",")
@@ -181,21 +188,16 @@ export default function (pi: ExtensionAPI) {
       // can report a clear failure with the underlying error message.
       // Without this the parent would only see exit code 0 and a stale
       // assistant message, mistaking the crash for a successful completion.
-      const errorInfo = findLatestAssistantError(messages);
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      if (errorInfo && sessionFile) {
+      if (sessionFile) {
         try {
           writeFileSync(
             `${sessionFile}.exit`,
-            JSON.stringify({
-              type: "error",
-              errorMessage: errorInfo.errorMessage,
-              stopReason: errorInfo.stopReason,
-            }),
+            JSON.stringify(buildCompletionSidecar(messages)),
           );
         } catch {
-          // Best effort — even without the sidecar, watcher's session-file
-          // fallback can still recover the errorMessage.
+          // Best effort — the watcher can still detect the terminal sentinel
+          // after shutdown if the completion sidecar cannot be written.
         }
       }
 

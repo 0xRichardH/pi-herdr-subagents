@@ -427,6 +427,7 @@ function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
   }
   if (snapshot.kind === "waiting") {
     const duration = snapshot.waitingDurationText ? ` ${snapshot.waitingDurationText}` : "";
+    if (snapshot.activityLabel === "interrupted") return ` interrupted${duration} `;
     const detail = snapshot.statusLabel ? ` · ${snapshot.statusLabel}` : "";
     return ` waiting${duration}${detail} `;
   }
@@ -529,23 +530,24 @@ let widgetInterval: ReturnType<typeof setInterval> | null = null;
 /** Interval timer for status transition checks. */
 let statusInterval: ReturnType<typeof setInterval> | null = null;
 
-function formatElapsedMMSS(startTime: number): string {
-  const seconds = Math.floor((Date.now() - startTime) / 1000);
+function formatElapsedMMSS(startTime: number, endTime = Date.now()): string {
+  const seconds = Math.floor((endTime - startTime) / 1000);
   const m = Math.floor(seconds / 60);
   const s = seconds % 60;
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
 }
 
-const ACCENT = "\x1b[38;2;77;163;255m";
+const ACTIVE_ACCENT = "\x1b[38;2;77;163;255m";
+const OPEN_ACCENT = "\x1b[38;2;214;158;46m";
 const RST = "\x1b[0m";
 
 /**
  * Build a bordered content line: │left          right│
  * Left content is truncated if needed, right is preserved, padded to fill width.
  */
-function borderLine(left: string, right: string, width: number): string {
+function borderLine(left: string, right: string, width: number, accent = ACTIVE_ACCENT): string {
   if (width <= 0) return "";
-  if (width === 1) return `${ACCENT}│${RST}`;
+  if (width === 1) return `${accent}│${RST}`;
 
   // width = total visible chars for the whole line including │ and │
   const contentWidth = Math.max(0, width - 2); // space inside the two │ chars
@@ -556,23 +558,23 @@ function borderLine(left: string, right: string, width: number): string {
   if (rightVis >= contentWidth) {
     const truncRight = truncateToWidth(right, contentWidth);
     const rightPad = Math.max(0, contentWidth - visibleWidth(truncRight));
-    return `${ACCENT}│${RST}${truncRight}${" ".repeat(rightPad)}${ACCENT}│${RST}`;
+    return `${accent}│${RST}${truncRight}${" ".repeat(rightPad)}${accent}│${RST}`;
   }
 
   const maxLeft = Math.max(0, contentWidth - rightVis);
   const truncLeft = truncateToWidth(left, maxLeft);
   const leftVis = visibleWidth(truncLeft);
   const pad = Math.max(0, contentWidth - leftVis - rightVis);
-  return `${ACCENT}│${RST}${truncLeft}${" ".repeat(pad)}${right}${ACCENT}│${RST}`;
+  return `${accent}│${RST}${truncLeft}${" ".repeat(pad)}${right}${accent}│${RST}`;
 }
 
 /**
  * Build the bordered top line: ╭─ Title ──── info ─╮
  * All chars are accounted for within `width`.
  */
-function borderTop(title: string, info: string, width: number): string {
+function borderTop(title: string, info: string, width: number, accent = ACTIVE_ACCENT): string {
   if (width <= 0) return "";
-  if (width === 1) return `${ACCENT}╭${RST}`;
+  if (width === 1) return `${accent}╭${RST}`;
 
   // ╭─ Title ───...─── info ─╮
   // overhead: ╭─ (2) + space around title (2) + space around info (2) + ─╮ (2) = but we simplify
@@ -582,42 +584,53 @@ function borderTop(title: string, info: string, width: number): string {
   const fillLen = Math.max(0, inner - titlePart.length - infoPart.length);
   const fill = "─".repeat(fillLen);
   const content = `${titlePart}${fill}${infoPart}`.slice(0, inner).padEnd(inner, "─");
-  return `${ACCENT}╭${content}╮${RST}`;
+  return `${accent}╭${content}╮${RST}`;
 }
 
 /**
  * Build the bordered bottom line: ╰──────────────────╯
  */
-function borderBottom(width: number): string {
+function borderBottom(width: number, accent = ACTIVE_ACCENT): string {
   if (width <= 0) return "";
-  if (width === 1) return `${ACCENT}╰${RST}`;
+  if (width === 1) return `${accent}╰${RST}`;
 
   const inner = Math.max(0, width - 2);
-  return `${ACCENT}╰${"─".repeat(inner)}╯${RST}`;
+  return `${accent}╰${"─".repeat(inner)}╯${RST}`;
 }
 
 function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): string[] {
-  const count = agents.length;
-  const title = "Subagents";
-  const info = `${count} running`;
+  const now = Date.now();
+  const rendered = agents.map((agent) => ({ agent, snapshot: classifyStatus(agent.statusState, now) }));
+  const activeCount = rendered.filter(({ snapshot }) =>
+    snapshot.kind === "active" || snapshot.kind === "starting" || snapshot.kind === "running"
+  ).length;
+  const openCount = agents.length - activeCount;
+  const info = activeCount > 0
+    ? openCount > 0 ? `${activeCount} active · ${openCount} open` : `${activeCount} active`
+    : `${openCount} open`;
+  const accent = activeCount > 0 ? ACTIVE_ACCENT : OPEN_ACCENT;
 
-  const lines: string[] = [borderTop(title, info, width)];
+  const lines: string[] = [borderTop("Subagents", info, width, accent)];
 
-  for (const agent of agents) {
-    const elapsed = formatElapsedMMSS(agent.startTime);
+  for (const { agent, snapshot } of rendered) {
+    const stoppedAt = snapshot.activityLabel === "interrupted"
+      ? agent.statusState.localOverrideAtMs
+      : agent.statusState.phase === "done"
+        ? agent.statusState.lastActivityAtMs
+        : null;
+    const elapsed = formatElapsedMMSS(agent.startTime, stoppedAt ?? now);
     const agentTag = agent.agent ? ` (${agent.agent})` : "";
     const left = ` ${elapsed}  ${agent.name}${agentTag} `;
-    const snapshot = classifyStatus(agent.statusState, Date.now());
     const right = statusConfig.enabled
       ? formatWidgetRightLabel(snapshot)
       : agent.cli === "claude"
         ? " running… "
         : " starting… ";
 
-    lines.push(borderLine(left, right, width));
+    lines.push(borderLine(left, right, width, accent));
   }
 
-  lines.push(borderBottom(width));
+  lines.push(borderBottom(width, accent));
   return lines;
 }
 
@@ -1293,6 +1306,7 @@ async function watchSubagent(
 
       closePane(surface);
       runningSubagents.delete(running.id);
+      updateWidget();
 
       return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
     }
@@ -1318,6 +1332,7 @@ async function watchSubagent(
 
     closePane(surface);
     runningSubagents.delete(running.id);
+    updateWidget();
 
     return {
       name,
@@ -1334,6 +1349,7 @@ async function watchSubagent(
       closePane(surface);
     } catch {}
     runningSubagents.delete(running.id);
+    updateWidget();
 
     if (signal.aborted) {
       return {
