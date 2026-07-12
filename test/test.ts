@@ -6,6 +6,12 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
+import {
+  cleanupSubagentsForShutdown,
+  selectCompletionApi,
+  shouldDeliverSubagentCompletion,
+  shouldPreserveSubagentsOnShutdown,
+} from "../pi-extension/subagents/index.ts";
 
 import {
   getLeafId,
@@ -1476,6 +1482,43 @@ describe("tool registration", () => {
     const autoExitSchema = resumeTool.parameters.properties.autoExit;
     assert.equal(autoExitSchema.type, "boolean");
     assert.match(autoExitSchema.description, /Defaults to true/);
+  });
+});
+
+describe("subagent parent lifecycle", () => {
+  it("preserves active subagents during extension reload", () => {
+    const abortController = new AbortController();
+    const agents = new Map([["child", { abortController }]]);
+
+    cleanupSubagentsForShutdown("reload", agents);
+
+    assert.equal(shouldPreserveSubagentsOnShutdown("reload"), true);
+    assert.equal(abortController.signal.aborted, false);
+    assert.equal(shouldDeliverSubagentCompletion(agents.get("child")!), true);
+    assert.equal(agents.size, 1);
+  });
+
+  it("aborts and clears active subagents during final shutdown", () => {
+    for (const reason of ["quit", "new", "resume", "fork", undefined]) {
+      const abortController = new AbortController();
+      const running = { abortController };
+      const agents = new Map([["child", running]]);
+
+      cleanupSubagentsForShutdown(reason, agents);
+
+      assert.equal(shouldPreserveSubagentsOnShutdown(reason), false);
+      assert.equal(abortController.signal.aborted, true);
+      assert.equal(shouldDeliverSubagentCompletion(running), false);
+      assert.equal(agents.size, 0);
+    }
+  });
+
+  it("delivers completion through the reloaded extension API", () => {
+    const previous = { id: "previous" };
+    const current = { id: "current" };
+
+    assert.equal(selectCompletionApi(previous, current), current);
+    assert.equal(selectCompletionApi(previous, undefined), previous);
   });
 });
 
