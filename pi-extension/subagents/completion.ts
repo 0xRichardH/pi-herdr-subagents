@@ -13,6 +13,7 @@ export interface CompletionResult {
 export interface CompletionOptions {
   intervalMs: number;
   readTerminalTail: () => Promise<string>;
+  isPanePresent?: () => Promise<boolean>;
   sessionFile?: string;
   sentinelFile?: string;
   onTick?: (elapsedSeconds: number) => void;
@@ -45,7 +46,13 @@ export function interpretExitSidecar(data: unknown): CompletionResult {
     return { reason: "error", exitCode: 1, errorMessage };
   }
 
-  return { reason: "done", exitCode: 0 };
+  if (payload?.type === "done") return { reason: "done", exitCode: 0 };
+
+  return {
+    reason: "error",
+    exitCode: 1,
+    errorMessage: "Invalid subagent completion sidecar: unsupported payload type.",
+  };
 }
 
 function consumeExitSidecar(sessionFile: string | undefined): CompletionResult | null {
@@ -106,6 +113,29 @@ export async function waitForCompletion(
       if (exitCode !== null) return { reason: "sentinel", exitCode };
     } catch {
       // Pane reads can fail transiently while herdr updates or closes a pane.
+      // Presence checks must also be non-fatal: only an explicit false means missing.
+      let panePresent = true;
+      if (options.isPanePresent) {
+        try {
+          panePresent = await options.isPanePresent();
+        } catch {
+          panePresent = true;
+        }
+      }
+      if (!panePresent) {
+        // Recheck completion artifacts after observing disappearance to close
+        // the race with a child writing its sidecar while the pane exits.
+        const racedSidecar = consumeExitSidecar(options.sessionFile);
+        if (racedSidecar) return racedSidecar;
+        if (options.sentinelFile && existsSync(options.sentinelFile)) {
+          return { reason: "sentinel", exitCode: 0 };
+        }
+        return {
+          reason: "error",
+          exitCode: 1,
+          errorMessage: "Subagent pane disappeared before completion evidence was recorded.",
+        };
+      }
     }
 
     options.onTick?.(Math.floor((Date.now() - startedAt) / 1000));

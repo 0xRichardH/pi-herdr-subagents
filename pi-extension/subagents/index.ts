@@ -26,6 +26,7 @@ import {
   renameCurrentWorkspace,
   readPane,
   readPaneAsync,
+  isPanePresent,
 } from "./terminal.ts";
 import { waitForCompletion } from "./completion.ts";
 
@@ -35,16 +36,11 @@ import {
   seedSubagentSessionFile,
 } from "./session.ts";
 import {
-  type StatusSnapshot,
   type SubagentStatusState,
-  advanceStatusState,
   capStatusLines,
-  classifyStatus,
-  createStatusState,
-  forceStatusAfterInterrupt,
+  formatElapsedDuration,
   formatStatusAggregate,
-  formatTransitionLine,
-  observeStatus,
+  normalizeStatusName,
   loadStatusConfig,
 } from "./status.ts";
 import {
@@ -53,6 +49,21 @@ import {
   type ActivityReadResult,
   type SubagentActivityState,
 } from "./activity.ts";
+import {
+  createLifecycle,
+  formatLifecycleTransitionLine,
+  lifecycleTransition,
+  markCompleted,
+  markCompletionDetected,
+  markDelivery,
+  markFailed,
+  markInterruptRequested,
+  markProcessRunning,
+  observeActivity,
+  projectLifecycle,
+  type LifecycleProjection,
+  type SubagentLifecycle,
+} from "./lifecycle.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -410,26 +421,6 @@ function getArtifactDir(sessionDir: string, sessionId: string): string {
 
 const statusConfig = loadStatusConfig();
 
-function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
-  if (snapshot.kind === "starting") return " starting… ";
-  if (snapshot.kind === "running") return ` running ${snapshot.elapsedText} `;
-  if (snapshot.kind === "active") {
-    const label = snapshot.activityLabel ?? snapshot.activeScope;
-    const duration = snapshot.activeDurationText ? ` ${snapshot.activeDurationText}` : "";
-    return label ? ` active · ${label}${duration} ` : " active ";
-  }
-  if (snapshot.kind === "waiting") {
-    const duration = snapshot.waitingDurationText ? ` ${snapshot.waitingDurationText}` : "";
-    if (snapshot.activityLabel === "interrupted") return ` interrupted${duration} `;
-    const detail = snapshot.statusLabel ? ` · ${snapshot.statusLabel}` : "";
-    return ` waiting${duration}${detail} `;
-  }
-
-  const detail = snapshot.statusLabel ? ` · ${snapshot.statusLabel}` : "";
-  const duration = snapshot.snapshotProblemText ? ` ${snapshot.snapshotProblemText}` : "";
-  return ` stalled${detail}${duration} `;
-}
-
 function resolveResultPresentation(
   result: Pick<
     SubagentResult,
@@ -497,11 +488,16 @@ interface RunningSubagent {
     error?: string;
   };
   abortController?: AbortController;
-  /** False after terminal parent shutdown; watcher results must not be delivered. */
-  completionDeliveryEnabled?: boolean;
   cli?: string;
   sentinelFile?: string;
-  statusState: SubagentStatusState;
+  /**
+   * Optional legacy status snapshot retained only for hydrating pre-lifecycle
+   * runtime entries after /reload. Live observation uses `lifecycle` only.
+   */
+  statusState?: SubagentStatusState;
+  lifecycle: SubagentLifecycle;
+  /** Last projected kind used to detect stalled/recovered transitions. */
+  lastProjectedKind?: LifecycleProjection["kind"];
   /**
    * When true, status transitions (stalled/recovered) do not wake the parent
    * session via a steer message. The widget still updates locally. Used for
@@ -533,21 +529,25 @@ export function shouldPreserveSubagentsOnShutdown(reason: unknown): boolean {
 
 export function cleanupSubagentsForShutdown(
   reason: unknown,
-  agents: Map<string, Pick<RunningSubagent, "abortController" | "completionDeliveryEnabled">>,
+  agents: Map<string, Pick<RunningSubagent, "abortController" | "lifecycle">>,
 ): void {
   if (shouldPreserveSubagentsOnShutdown(reason)) return;
 
   for (const agent of agents.values()) {
-    agent.completionDeliveryEnabled = false;
+    if (agent.lifecycle) {
+      agent.lifecycle = markDelivery(agent.lifecycle, "suppressed");
+    }
     agent.abortController?.abort();
   }
   agents.clear();
 }
 
 export function shouldDeliverSubagentCompletion(
-  running: Pick<RunningSubagent, "completionDeliveryEnabled">,
+  running: Pick<RunningSubagent, "lifecycle">,
 ): boolean {
-  return running.completionDeliveryEnabled !== false;
+  // Authoritative gate: only pending deliveries may be sent.
+  // Missing lifecycle (pre-migration fixtures) defaults to pending/true.
+  return (running.lifecycle?.delivery ?? "pending") === "pending";
 }
 
 export function selectCompletionApi<T>(previous: T, current: T | undefined): T {
@@ -630,11 +630,40 @@ function borderBottom(width: number, accent = ACTIVE_ACCENT): string {
   return `${accent}╰${"─".repeat(inner)}╯${RST}`;
 }
 
+function formatLifecycleWidgetLabel(
+  projection: ReturnType<typeof projectLifecycle>,
+  now: number,
+): string {
+  const duration = projection.stateDurationSince == null
+    ? ""
+    : ` ${formatElapsedDuration(now - projection.stateDurationSince)}`;
+  if (projection.kind === "active") return projection.label
+    ? ` active · ${projection.label}${duration} `
+    : ` active${duration} `;
+  if (projection.kind === "running") return " running… ";
+  if (projection.kind === "waiting") return ` waiting${duration} `;
+  if (projection.kind === "interrupted") return ` interrupted${duration} `;
+  if (projection.kind === "stalled") return ` stalled${duration} `;
+  // completed/failed exist as lifecycle projections for delivery bookkeeping,
+  // but the row is removed immediately after result delivery — so the only
+  // visible terminal handoff label is finalizing.
+  if (
+    projection.kind === "finalizing" ||
+    projection.kind === "completed" ||
+    projection.kind === "failed"
+  ) {
+    return " finalizing… ";
+  }
+  return " starting… ";
+}
+
 function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): string[] {
   const now = Date.now();
-  const rendered = agents.map((agent) => ({ agent, snapshot: classifyStatus(agent.statusState, now) }));
-  const activeCount = rendered.filter(({ snapshot }) =>
-    snapshot.kind === "active" || snapshot.kind === "starting" || snapshot.kind === "running"
+  const rendered = agents.map((agent) => ({ agent, projection: projectLifecycle(ensureLifecycle(agent), now) }));
+  const activeCount = rendered.filter(({ projection }) =>
+    projection.kind === "active" ||
+    projection.kind === "starting" ||
+    projection.kind === "running"
   ).length;
   const openCount = agents.length - activeCount;
   const info = activeCount > 0
@@ -644,17 +673,12 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
 
   const lines: string[] = [borderTop("Subagents", info, width, accent)];
 
-  for (const { agent, snapshot } of rendered) {
-    const stoppedAt = snapshot.activityLabel === "interrupted"
-      ? agent.statusState.localOverrideAtMs
-      : agent.statusState.phase === "done"
-        ? agent.statusState.lastActivityAtMs
-        : null;
-    const elapsed = formatElapsedMMSS(agent.startTime, stoppedAt ?? now);
+  for (const { agent, projection } of rendered) {
+    const elapsed = formatElapsedMMSS(agent.startTime, projection.runtimeEndedAt ?? now);
     const agentTag = agent.agent ? ` (${agent.agent})` : "";
     const left = ` ${elapsed}  ${agent.name}${agentTag} `;
     const right = statusConfig.enabled
-      ? formatWidgetRightLabel(snapshot)
+      ? formatLifecycleWidgetLabel(projection, now)
       : agent.cli === "claude"
         ? " running… "
         : " starting… ";
@@ -752,15 +776,51 @@ function buildPiPromptArgs(params: {
   ];
 }
 
-function activityLabel(activity: SubagentActivityState): string | undefined {
-  if (activity.phase !== "active") return undefined;
-  if (activity.activeScope === "tool") return activity.toolName ?? "tool";
-  if (activity.activeScope === "provider") return "provider";
-  if (activity.activeScope === "streaming") return "streaming";
-  return activity.activeScope;
+function ensureLifecycle(running: RunningSubagent): SubagentLifecycle {
+  if (running.lifecycle) return running.lifecycle;
+  let lifecycle = createLifecycle(running.startTime);
+  // Claude agents have no activity snapshots; treat confirmed launch as running.
+  if (running.cli === "claude") {
+    lifecycle = markProcessRunning(lifecycle, running.startTime);
+    running.lifecycle = lifecycle;
+    return lifecycle;
+  }
+  const state = running.statusState;
+  if (state?.activityLabel === "interrupted" && state.localOverrideAtMs != null) {
+    lifecycle = markInterruptRequested(lifecycle, state.localOverrideAtMs);
+  } else if (state?.phase === "done") {
+    lifecycle = markCompletionDetected(lifecycle, { reason: "done", exitCode: 0 }, state.lastActivityAtMs ?? running.startTime);
+  } else if (state?.phase === "active" || state?.phase === "waiting" || state?.phase === "starting") {
+    lifecycle = observeActivity(lifecycle, {
+      ok: true,
+      activity: {
+        version: 1,
+        runningChildId: running.id,
+        createdAt: running.startTime,
+        updatedAt: state.lastActivityAtMs ?? running.startTime,
+        sequence: state.lastActivitySequence ?? 0,
+        latestEvent: state.latestEvent === "agent_end" ? "agent_end" : "agent_start",
+        phase: state.phase,
+        agentActive: state.phase === "active",
+        turnActive: state.phase === "active",
+        providerActive: false,
+        toolActive: state.activeScope === "tool",
+        ...(state.activeScope ? { activeScope: state.activeScope as any } : {}),
+        ...(state.activeSinceMs != null ? { activeSince: state.activeSinceMs } : {}),
+        ...(state.waitingSinceMs != null ? { waitingSince: state.waitingSinceMs } : {}),
+        ...(state.activityLabel && state.activeScope === "tool" ? { toolName: state.activityLabel } : {}),
+      },
+    }, state.lastActivityAtMs ?? running.startTime);
+  } else if (state?.source === "claude" || running.startTime) {
+    // Pre-lifecycle Pi agents without a known phase still get a running process.
+    lifecycle = markProcessRunning(lifecycle, running.startTime);
+  }
+  running.lifecycle = lifecycle;
+  return lifecycle;
 }
 
 function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now()) {
+  ensureLifecycle(running);
   if (running.cli === "claude") return;
 
   const activityFile = running.activityFile;
@@ -772,27 +832,8 @@ function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now(
     ? { ok: true }
     : { ok: false, reason: read.reason, error: read.error };
 
-  if (read.ok) {
-    running.activity = read.activity;
-    running.statusState = observeStatus(running.statusState, {
-      snapshot: "present",
-      updatedAt: read.activity.updatedAt,
-      sequence: read.activity.sequence,
-      phase: read.activity.phase,
-      active: read.activity.phase === "active",
-      activeScope: read.activity.activeScope,
-      activeSince: read.activity.activeSince,
-      waitingSince: read.activity.waitingSince,
-      latestEvent: read.activity.latestEvent,
-      activityLabel: activityLabel(read.activity),
-    }, observedAt);
-    return;
-  }
-
-  running.statusState = observeStatus(running.statusState, {
-    snapshot: read.reason,
-    snapshotError: read.error,
-  }, observedAt);
+  if (read.ok) running.activity = read.activity;
+  running.lifecycle = observeActivity(ensureLifecycle(running), read, observedAt);
 }
 
 function resolveInterruptTarget(params: { id?: string; name?: string }):
@@ -870,7 +911,7 @@ function handleSubagentInterrupt(
     };
   }
 
-  running.statusState = forceStatusAfterInterrupt(running.statusState, now);
+  running.lifecycle = markInterruptRequested(ensureLifecycle(running), now);
   updateWidget();
 
   return {
@@ -897,19 +938,30 @@ function startStatusRefresh(pi: ExtensionAPI) {
     let shouldRefreshWidget = false;
 
     for (const running of runningSubagents.values()) {
+      // Dual-writes lifecycle + statusState for reload hydration; steers use lifecycle only.
       observeRunningSubagent(running, now);
-      const { nextState, snapshot, transition } = advanceStatusState(running.statusState, now);
-      if (nextState.currentKind !== running.statusState.currentKind) {
+      const projection = projectLifecycle(ensureLifecycle(running), now);
+      const transition = lifecycleTransition(running.lastProjectedKind, projection.kind);
+      if (running.lastProjectedKind !== projection.kind) {
         shouldRefreshWidget = true;
       }
-      running.statusState = nextState;
+      running.lastProjectedKind = projection.kind;
 
       // Interactive subagents (long-running, user-driven) intentionally don't
       // wake the parent session on stalled/recovered transitions — the user is
       // working in the subagent's pane, and a steer message here would burn an
       // orchestrator turn on a no-op "still waiting" ping. Widget still updates.
       if (transition && !running.interactive) {
-        transitionLines.push(formatTransitionLine(running.name, snapshot, transition));
+        transitionLines.push(
+          formatLifecycleTransitionLine(
+            normalizeStatusName(running.name),
+            projection,
+            transition,
+            now,
+            running.startTime,
+            formatElapsedDuration,
+          ),
+        );
       }
     }
 
@@ -948,7 +1000,6 @@ export const __test__ = {
   resolveEffectiveInteractive,
   buildSubagentToolAllowlist,
   buildPiPromptArgs,
-  formatWidgetRightLabel,
   observeRunningSubagent,
   resolveDenyTools,
   resolveInterruptTarget,
@@ -1114,10 +1165,7 @@ async function launchSubagent(
       cli: "claude",
       sentinelFile,
       interactive: effectiveInteractive,
-      statusState: createStatusState({
-        source: "claude",
-        startTimeMs: startTime,
-      }),
+      lifecycle: markProcessRunning(createLifecycle(startTime), Date.now()),
     };
 
     runningSubagents.set(id, running);
@@ -1252,10 +1300,7 @@ async function launchSubagent(
     launchScriptFile,
     activityFile,
     interactive: effectiveInteractive,
-    statusState: createStatusState({
-      source: "pi",
-      startTimeMs: startTime,
-    }),
+    lifecycle: createLifecycle(startTime),
   };
 
   runningSubagents.set(id, running);
@@ -1300,12 +1345,16 @@ async function watchSubagent(
       sessionFile,
       sentinelFile: running.sentinelFile,
       readTerminalTail: () => readPaneAsync(surface, 5),
+      isPanePresent: () => isPanePresent(surface),
       onTick() {
         observeRunningSubagent(running);
       },
     });
 
-    const elapsed = Math.floor((Date.now() - startTime) / 1000);
+    const detectedAt = Date.now();
+    running.lifecycle = markCompletionDetected(running.lifecycle, result, detectedAt);
+    updateWidget();
+    const elapsed = Math.floor((detectedAt - startTime) / 1000);
 
     if (running.cli === "claude") {
       // Claude Code result extraction
@@ -1338,8 +1387,9 @@ async function watchSubagent(
       }
 
       closePane(surface);
-      runningSubagents.delete(running.id);
-      updateWidget();
+      running.lifecycle = result.exitCode === 0
+        ? markCompleted(running.lifecycle, Date.now())
+        : markFailed(running.lifecycle, result.errorMessage ?? summary, Date.now(), result.exitCode);
 
       return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
     }
@@ -1364,8 +1414,9 @@ async function watchSubagent(
     }
 
     closePane(surface);
-    runningSubagents.delete(running.id);
-    updateWidget();
+    running.lifecycle = result.exitCode === 0
+      ? markCompleted(running.lifecycle, Date.now())
+      : markFailed(running.lifecycle, result.errorMessage ?? summary, Date.now(), result.exitCode);
 
     return {
       name,
@@ -1381,7 +1432,12 @@ async function watchSubagent(
     try {
       closePane(surface);
     } catch {}
-    runningSubagents.delete(running.id);
+    running.lifecycle = markFailed(
+      running.lifecycle,
+      signal.aborted ? "Subagent cancelled." : err?.message ?? String(err),
+      Date.now(),
+      1,
+    );
     updateWidget();
 
     if (signal.aborted) {
@@ -1438,7 +1494,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   // Tools denied via PI_DENY_TOOLS env var (set by parent agent based on frontmatter)
   const deniedTools = new Set(
-    (process.env.PI_DENY_TOOLS ?? "")
+    (process.env.PI_SUBAGENT_ID ? process.env.PI_DENY_TOOLS ?? "" : "")
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean),
@@ -1514,8 +1570,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Fire-and-forget: start watching in background
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
-            if (!shouldDeliverSubagentCompletion(running)) return;
-            updateWidget(); // reflect removal from Map immediately
+            if (!shouldDeliverSubagentCompletion(running)) {
+              running.lifecycle = markDelivery(running.lifecycle, "suppressed");
+              runningSubagents.delete(running.id);
+              updateWidget();
+              return;
+            }
+            running.lifecycle = markDelivery(running.lifecycle, "delivered");
+            runningSubagents.delete(running.id);
+            updateWidget();
             const completionApi = selectCompletionApi(pi, runtime.pi);
 
             if (result.ping) {
@@ -1560,7 +1623,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             );
           })
           .catch((err) => {
-            if (!shouldDeliverSubagentCompletion(running)) return;
+            if (!shouldDeliverSubagentCompletion(running)) {
+              running.lifecycle = markDelivery(running.lifecycle, "suppressed");
+              runningSubagents.delete(running.id);
+              updateWidget();
+              return;
+            }
+            running.lifecycle = markDelivery(running.lifecycle, "delivered");
+            runningSubagents.delete(running.id);
             updateWidget();
             selectCompletionApi(pi, runtime.pi).sendMessage(
               {
@@ -1929,10 +1999,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           launchScriptFile,
           activityFile,
           interactive,
-          statusState: createStatusState({
-            source: "pi",
-            startTimeMs: startTime,
-          }),
+          lifecycle: createLifecycle(startTime),
         };
         runningSubagents.set(id, running);
         startWidgetRefresh();
@@ -1944,7 +2011,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
-            if (!shouldDeliverSubagentCompletion(running)) return;
+            if (!shouldDeliverSubagentCompletion(running)) {
+              running.lifecycle = markDelivery(running.lifecycle, "suppressed");
+              runningSubagents.delete(running.id);
+              updateWidget();
+              return;
+            }
+            running.lifecycle = markDelivery(running.lifecycle, "delivered");
+            runningSubagents.delete(running.id);
             updateWidget();
             const completionApi = selectCompletionApi(pi, runtime.pi);
 
@@ -1996,7 +2070,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             );
           })
           .catch((err) => {
-            if (!shouldDeliverSubagentCompletion(running)) return;
+            if (!shouldDeliverSubagentCompletion(running)) {
+              running.lifecycle = markDelivery(running.lifecycle, "suppressed");
+              runningSubagents.delete(running.id);
+              updateWidget();
+              return;
+            }
+            running.lifecycle = markDelivery(running.lifecycle, "delivered");
+            runningSubagents.delete(running.id);
             updateWidget();
             selectCompletionApi(pi, runtime.pi).sendMessage(
               {

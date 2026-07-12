@@ -8,6 +8,7 @@ import {
   isHerdrAvailable,
   readHerdrScreen,
   readHerdrScreenAsync,
+  isHerdrPanePresent,
   renameHerdrTab,
   renameHerdrWorkspace,
   sendHerdrCommand,
@@ -98,6 +99,11 @@ export function readPane(paneId: PaneId, lines = 50): string {
 export async function readPaneAsync(paneId: PaneId, lines = 50): Promise<string> {
   assertTerminalAvailable();
   return readHerdrScreenAsync(paneId, lines);
+}
+
+export async function isPanePresent(paneId: PaneId): Promise<boolean> {
+  assertTerminalAvailable();
+  return isHerdrPanePresent(paneId);
 }
 
 export function closePane(paneId: PaneId): void {

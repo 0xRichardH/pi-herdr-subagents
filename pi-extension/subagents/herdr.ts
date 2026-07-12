@@ -169,6 +169,24 @@ export async function readHerdrScreenAsync(surface: string, lines = 50): Promise
   return herdrExecAsync(["pane", "read", surface, "--source", "visible", "--lines", String(lines)]);
 }
 
+/**
+ * Check whether a herdr pane is still present.
+ * Returns `true` when presence is unknown (list/parse failures) so callers
+ * never treat infrastructure glitches as pane disappearance.
+ * Returns `false` only when the list is successfully parsed and the pane is absent.
+ */
+export async function isHerdrPanePresent(surface: string): Promise<boolean> {
+  try {
+    const output = await herdrExecAsync(["pane", "list"]);
+    const parsed = parseHerdrJson(output) as { result?: { panes?: Array<{ pane_id?: unknown }> } } | null;
+    const panes = parsed?.result?.panes;
+    if (!Array.isArray(panes)) return true;
+    return panes.some((pane) => pane?.pane_id === surface);
+  } catch {
+    return true;
+  }
+}
+
 export function sendHerdrCommand(surface: string, command: string): void {
   // pane run sends the text and Enter in a single socket request, avoiding
   // a race where Enter could arrive before the text is fully processed.

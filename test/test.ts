@@ -49,6 +49,16 @@ import {
   buildCompletionSidecar,
 } from "../pi-extension/subagents/subagent-done.ts";
 import { interpretExitSidecar, waitForCompletion } from "../pi-extension/subagents/completion.ts";
+import {
+  createLifecycle,
+  lifecycleTransition,
+  markCompleted,
+  markCompletionDetected,
+  markFailed,
+  markInterruptRequested,
+  observeActivity as observeLifecycleActivity,
+  projectLifecycle,
+} from "../pi-extension/subagents/lifecycle.ts";
 
 // --- Helpers ---
 
@@ -1306,6 +1316,75 @@ describe("subagent-done.ts", () => {
   });
 });
 
+describe("lifecycle.ts", () => {
+  const activity = (overrides: Record<string, unknown> = {}) => ({
+    version: 1 as const,
+    runningChildId: "child",
+    createdAt: 1_000,
+    updatedAt: 2_000,
+    sequence: 1,
+    latestEvent: "agent_start" as const,
+    phase: "active" as const,
+    agentActive: true,
+    turnActive: true,
+    providerActive: false,
+    toolActive: false,
+    activeScope: "agent" as const,
+    activeSince: 2_000,
+    ...overrides,
+  });
+
+  it("interrupts only the turn and keeps process runtime open", () => {
+    const running = observeLifecycleActivity(createLifecycle(1_000), { ok: true, activity: activity() }, 2_000);
+    const interrupted = markInterruptRequested(running, 3_000);
+    const projection = projectLifecycle(interrupted, 8_000);
+    assert.equal(interrupted.process.kind, "running");
+    assert.equal(interrupted.turn.kind, "interrupted");
+    assert.equal(projection.runtimeEndedAt, undefined);
+  });
+
+  it("rejects stale activity after interrupt and accepts a newer sequence", () => {
+    const running = observeLifecycleActivity(createLifecycle(1_000), { ok: true, activity: activity() }, 2_000);
+    const interrupted = markInterruptRequested(running, 3_000);
+    const stale = observeLifecycleActivity(interrupted, { ok: true, activity: activity({ updatedAt: 3_000 }) }, 3_100);
+    assert.equal(stale.turn.kind, "interrupted");
+    const resumed = observeLifecycleActivity(stale, {
+      ok: true,
+      activity: activity({ updatedAt: 3_000, sequence: 2, activeSince: 3_000 }),
+    }, 3_100);
+    assert.equal(resumed.turn.kind, "active");
+  });
+
+  it("makes finalizing and terminal process states irreversible", () => {
+    const running = observeLifecycleActivity(createLifecycle(1_000), { ok: true, activity: activity() }, 2_000);
+    const finalizing = markCompletionDetected(running, { reason: "done", exitCode: 0 }, 4_000);
+    const ignored = observeLifecycleActivity(finalizing, {
+      ok: true,
+      activity: activity({ updatedAt: 5_000, sequence: 9 }),
+    }, 5_000);
+    assert.equal(ignored.process.kind, "finalizing");
+    assert.deepEqual(projectLifecycle(ignored, 9_000), { kind: "finalizing", runtimeEndedAt: 4_000 });
+    const completed = markCompleted(ignored, 6_000);
+    assert.equal(markFailed(completed, "late failure", 7_000).process.kind, "completed");
+  });
+
+  it("projects confirmed running without turn detail as running, not starting", () => {
+    const started = createLifecycle(1_000);
+    const running = {
+      ...started,
+      process: { kind: "running" as const, startedAt: 1_000, confirmedAt: 1_500 },
+    };
+    assert.deepEqual(projectLifecycle(running, 3_000), { kind: "running" });
+  });
+
+  it("detects stalled and recovered transitions from lifecycle projections", () => {
+    assert.equal(lifecycleTransition("active", "stalled"), "stalled");
+    assert.equal(lifecycleTransition("stalled", "waiting"), "recovered");
+    assert.equal(lifecycleTransition("stalled", "active"), "recovered");
+    assert.equal(lifecycleTransition("waiting", "active"), null);
+  });
+});
+
 describe("completion.ts", () => {
 
   it("decodes ping payloads", () => {
@@ -1348,9 +1427,13 @@ describe("completion.ts", () => {
     assert.match(result.errorMessage ?? "", /no errorMessage/);
   });
 
-  it("treats unknown payload shapes as done", () => {
-    assert.deepEqual(interpretExitSidecar({}), { reason: "done", exitCode: 0 });
-    assert.deepEqual(interpretExitSidecar(null), { reason: "done", exitCode: 0 });
+  it("rejects unknown completion sidecar payloads", () => {
+    for (const payload of [{}, null]) {
+      const result = interpretExitSidecar(payload);
+      assert.equal(result.reason, "error");
+      assert.equal(result.exitCode, 1);
+      assert.match(result.errorMessage ?? "", /Invalid subagent completion sidecar/);
+    }
   });
 
   it("consumes a sidecar and removes it", async () => {
@@ -1416,6 +1499,49 @@ describe("completion.ts", () => {
     assert.deepEqual(result, { reason: "sentinel", exitCode: 0 });
     assert.equal(reads, 2);
     assert.equal(ticks, 1);
+  });
+
+  it("returns a failure when the pane explicitly disappears", async () => {
+    const result = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => { throw new Error("pane read failed"); },
+      isPanePresent: async () => false,
+    });
+    assert.deepEqual(result, {
+      reason: "error",
+      exitCode: 1,
+      errorMessage: "Subagent pane disappeared before completion evidence was recorded.",
+    });
+  });
+
+  it("keeps an ambiguous pane read failure retryable while the pane exists", async () => {
+    let reads = 0;
+    const result = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => {
+        reads += 1;
+        if (reads === 1) throw new Error("socket unavailable");
+        return "__SUBAGENT_DONE_0__";
+      },
+      isPanePresent: async () => true,
+    });
+    assert.equal(result.exitCode, 0);
+    assert.equal(reads, 2);
+  });
+
+  it("treats presence-check throws as unknown and keeps polling", async () => {
+    let reads = 0;
+    const result = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => {
+        reads += 1;
+        if (reads === 1) throw new Error("pane read failed");
+        return "__SUBAGENT_DONE_0__";
+      },
+      isPanePresent: async () => { throw new Error("herdr list failed"); },
+    });
+    assert.equal(result.exitCode, 0);
+    assert.equal(reads, 2);
   });
 
   it("rejects promptly when aborted", async () => {
@@ -1506,7 +1632,10 @@ describe("tool registration", () => {
 describe("subagent parent lifecycle", () => {
   it("preserves active subagents during extension reload", () => {
     const abortController = new AbortController();
-    const agents = new Map([["child", { abortController }]]);
+    const agents = new Map([["child", {
+      abortController,
+      lifecycle: createLifecycle(1_000),
+    }]]);
 
     cleanupSubagentsForShutdown("reload", agents);
 
@@ -1519,16 +1648,37 @@ describe("subagent parent lifecycle", () => {
   it("aborts and clears active subagents during final shutdown", () => {
     for (const reason of ["quit", "new", "resume", "fork", undefined]) {
       const abortController = new AbortController();
-      const running = { abortController };
+      const running = { abortController, lifecycle: createLifecycle(1_000) };
       const agents = new Map([["child", running]]);
 
       cleanupSubagentsForShutdown(reason, agents);
 
       assert.equal(shouldPreserveSubagentsOnShutdown(reason), false);
       assert.equal(abortController.signal.aborted, true);
+      // Delivery is suppressed before the map is cleared so a racing watcher
+      // that still holds a reference cannot deliver after shutdown.
+      assert.equal(running.lifecycle.delivery, "suppressed");
       assert.equal(shouldDeliverSubagentCompletion(running), false);
       assert.equal(agents.size, 0);
     }
+  });
+
+  it("treats lifecycle.delivery as the authoritative completion gate", () => {
+    const pending = { lifecycle: createLifecycle(1_000) };
+    assert.equal(shouldDeliverSubagentCompletion(pending), true);
+
+    const delivered = {
+      lifecycle: { ...createLifecycle(1_000), delivery: "delivered" as const },
+    };
+    assert.equal(shouldDeliverSubagentCompletion(delivered), false);
+
+    const suppressed = {
+      lifecycle: { ...createLifecycle(1_000), delivery: "suppressed" as const },
+    };
+    assert.equal(shouldDeliverSubagentCompletion(suppressed), false);
+
+    // Pre-lifecycle fixtures without a lifecycle field still default to pending.
+    assert.equal(shouldDeliverSubagentCompletion({} as any), true);
   });
 
   it("delivers completion through the reloaded extension API", () => {
@@ -1722,7 +1872,7 @@ describe("subagent interruption", () => {
       startTime: 0,
       sessionFile: "worker.jsonl",
       interactive: false,
-      statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
+      lifecycle: createLifecycle(0),
       ...overrides,
     };
   }
@@ -1780,30 +1930,39 @@ describe("subagent interruption", () => {
     const runningMap = testApi.runningSubagents as Map<string, any>;
     runningMap.clear();
 
-    const activeState = observeStatus(
-      createStatusState({ source: "pi", startTimeMs: 0 }),
+    const activeLifecycle = observeLifecycleActivity(
+      createLifecycle(0),
       {
-        snapshot: "present",
-        updatedAt: 5_000,
-        sequence: 1,
-        phase: "active",
-        active: true,
-        activeScope: "tool",
-        activeSince: 5_000,
-        activityLabel: "bash",
+        ok: true,
+        activity: {
+          version: 1,
+          runningChildId: "a1",
+          createdAt: 0,
+          updatedAt: 5_000,
+          sequence: 1,
+          latestEvent: "tool_execution_start",
+          phase: "active",
+          agentActive: true,
+          turnActive: true,
+          providerActive: false,
+          toolActive: true,
+          activeScope: "tool",
+          activeSince: 5_000,
+          toolName: "bash",
+        },
       },
       5_000,
     );
 
     try {
-      runningMap.set("a1", makeRunning({ statusState: activeState }));
+      runningMap.set("a1", makeRunning({ lifecycle: activeLifecycle }));
 
       const result = withMockedNow(20_000, () => testApi.handleSubagentInterrupt({ name: "Worker" }, () => {
         throw new Error("mux write failed");
       }));
 
       assert.match(result.content[0].text, /Failed to send Escape/);
-      assert.equal(classifyStatus(runningMap.get("a1").statusState, 20_000).kind, "active");
+      assert.equal(projectLifecycle(runningMap.get("a1").lifecycle, 20_000).kind, "active");
     } finally {
       runningMap.clear();
     }
@@ -1859,23 +2018,19 @@ describe("subagent interruption", () => {
       writeFileSync(activityFile, `${JSON.stringify(activity)}\n`);
 
       try {
-        runningMap.set("a1", makeRunning({
-          activityFile,
-          statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
-        }));
+        runningMap.set("a1", makeRunning({ activityFile }));
 
         withMockedNow(20_000, () => testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
           sentSurface = surface;
         }));
 
         assert.equal(sentSurface, "pane-1");
-        const state = runningMap.get("a1").statusState;
-        const snapshot = classifyStatus(state, 20_000);
-        assert.equal(snapshot.kind, "waiting");
-        assert.equal(snapshot.activityLabel, "interrupted");
-        assert.equal(state.lastActivityAtMs, 20_000);
-        assert.equal(state.lastActivitySequence, 7);
-        assert.equal(state.localOverrideSequence, 7);
+        const lifecycle = runningMap.get("a1").lifecycle;
+        const projection = projectLifecycle(lifecycle, 20_000);
+        assert.equal(projection.kind, "interrupted");
+        assert.equal(lifecycle.turn.kind, "interrupted");
+        assert.equal(lifecycle.lastActivitySequence, 7);
+        assert.equal(lifecycle.turn.previousActivitySequence, 7);
       } finally {
         runningMap.clear();
       }
@@ -1888,23 +2043,32 @@ describe("subagent interruption", () => {
     let sentSurface = "";
     runningMap.clear();
 
-    const activeState = observeStatus(
-      createStatusState({ source: "pi", startTimeMs: 0 }),
+    const activeLifecycle = observeLifecycleActivity(
+      createLifecycle(0),
       {
-        snapshot: "present",
-        updatedAt: 5_000,
-        sequence: 1,
-        phase: "active",
-        active: true,
-        activeScope: "tool",
-        activeSince: 5_000,
-        activityLabel: "bash",
+        ok: true,
+        activity: {
+          version: 1,
+          runningChildId: "a1",
+          createdAt: 0,
+          updatedAt: 5_000,
+          sequence: 1,
+          latestEvent: "tool_execution_start",
+          phase: "active",
+          agentActive: true,
+          turnActive: true,
+          providerActive: false,
+          toolActive: true,
+          activeScope: "tool",
+          activeSince: 5_000,
+          toolName: "bash",
+        },
       },
       5_000,
     );
 
     try {
-      runningMap.set("a1", makeRunning({ statusState: activeState }));
+      runningMap.set("a1", makeRunning({ lifecycle: activeLifecycle }));
 
       const result = withMockedNow(20_000, () => testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
         sentSurface = surface;
@@ -1913,9 +2077,8 @@ describe("subagent interruption", () => {
       assert.equal(sentSurface, "pane-1");
       assert.equal(result.content[0].text, 'Interrupt requested for subagent "Worker".');
       assert.deepEqual(result.details, { id: "a1", name: "Worker", status: "interrupt_requested" });
-      const snapshot = classifyStatus(runningMap.get("a1").statusState, 20_000);
-      assert.equal(snapshot.kind, "waiting");
-      assert.equal(snapshot.activityLabel, "interrupted");
+      const projection = projectLifecycle(runningMap.get("a1").lifecycle, 20_000);
+      assert.equal(projection.kind, "interrupted");
       assert.equal(runningMap.has("a1"), true);
     } finally {
       runningMap.clear();
@@ -2123,11 +2286,36 @@ describe("subagent startup delay", () => {
   });
 });
 describe("subagents widget rendering", () => {
-  it("shows interrupted agents as open, freezes runtime, and uses an amber border", () => {
+  it("projects Claude agents as running and counts them as active", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const originalNow = Date.now;
+    Date.now = () => 30_000;
+    try {
+      const lines = testApi.renderSubagentWidgetLines([{
+        id: "c1",
+        name: "Claude",
+        task: "",
+        surface: "s1",
+        startTime: 5_000,
+        sessionFile: "sess1",
+        cli: "claude",
+        lifecycle: { ...createLifecycle(5_000), process: { kind: "running", startedAt: 5_000, confirmedAt: 5_000 } },
+        interactive: false,
+      }], 64);
+
+      assert.match(lines[0], /1 active/);
+      assert.ok(lines[0].includes("\x1b[38;2;77;163;255m"));
+      assert.match(lines[1], /running/);
+    } finally {
+      Date.now = originalNow;
+    }
+  });
+
+  it("shows interrupted agents as open while process runtime continues", () => {
     const testApi = (subagentsModule as any).__test__;
     const interruptedAt = 20_000;
-    const state = forceStatusAfterInterrupt(
-      createStatusState({ source: "pi", startTimeMs: 5_000 }),
+    const lifecycle = markInterruptRequested(
+      { ...createLifecycle(5_000), process: { kind: "running", startedAt: 5_000, confirmedAt: 5_000 } },
       interruptedAt,
     );
 
@@ -2141,13 +2329,13 @@ describe("subagents widget rendering", () => {
         surface: "s1",
         startTime: 5_000,
         sessionFile: "sess1",
-        statusState: state,
+        lifecycle,
         interactive: false,
       }], 64);
 
       assert.match(lines[0], /1 open/);
       assert.ok(lines[0].includes("\x1b[38;2;214;158;46m"));
-      assert.match(lines[1], /00:15\s+Worker/);
+      assert.match(lines[1], /00:25\s+Worker/);
       assert.match(lines[1], /interrupted 10s/);
       assert.doesNotMatch(lines.join("\n"), /running|active/);
     } finally {
@@ -2158,17 +2346,7 @@ describe("subagents widget rendering", () => {
   it("freezes runtime when the subagent reports done", () => {
     const testApi = (subagentsModule as any).__test__;
     const doneAt = 20_000;
-    const done = observeStatus(
-      createStatusState({ source: "pi", startTimeMs: 5_000 }),
-      {
-        snapshot: "present",
-        updatedAt: doneAt,
-        sequence: 1,
-        phase: "done",
-        latestEvent: "subagent_done",
-      },
-      doneAt,
-    );
+    const lifecycle = markCompletionDetected(createLifecycle(5_000), { reason: "done", exitCode: 0 }, doneAt);
 
     const originalNow = Date.now;
     Date.now = () => 30_000;
@@ -2180,13 +2358,13 @@ describe("subagents widget rendering", () => {
         surface: "s1",
         startTime: 5_000,
         sessionFile: "sess1",
-        statusState: done,
+        lifecycle,
         interactive: false,
       }], 64);
 
       assert.match(lines[0], /1 open/);
       assert.match(lines[1], /00:15\s+Reviewer/);
-      assert.match(lines[1], /waiting · done/);
+      assert.match(lines[1], /finalizing…/);
       assert.doesNotMatch(lines[1], /00:25/);
     } finally {
       Date.now = originalNow;
@@ -2196,13 +2374,30 @@ describe("subagents widget rendering", () => {
   it("keeps a blue border and summarizes mixed active and open agents", () => {
     const testApi = (subagentsModule as any).__test__;
     const now = 30_000;
-    const active = observeStatus(
-      createStatusState({ source: "pi", startTimeMs: 5_000 }),
-      { snapshot: "present", updatedAt: 29_000, sequence: 1, phase: "active", active: true },
+    const active = observeLifecycleActivity(
+      createLifecycle(5_000),
+      {
+        ok: true,
+        activity: {
+          version: 1,
+          runningChildId: "a1",
+          createdAt: 5_000,
+          updatedAt: 29_000,
+          sequence: 1,
+          latestEvent: "agent_start",
+          phase: "active",
+          agentActive: true,
+          turnActive: true,
+          providerActive: false,
+          toolActive: false,
+          activeScope: "agent",
+          activeSince: 29_000,
+        },
+      },
       29_000,
     );
-    const interrupted = forceStatusAfterInterrupt(
-      createStatusState({ source: "pi", startTimeMs: 10_000 }),
+    const interrupted = markInterruptRequested(
+      { ...createLifecycle(10_000), process: { kind: "running", startedAt: 10_000, confirmedAt: 10_000 } },
       20_000,
     );
 
@@ -2210,8 +2405,8 @@ describe("subagents widget rendering", () => {
     Date.now = () => now;
     try {
       const lines = testApi.renderSubagentWidgetLines([
-        { id: "a1", name: "Active", task: "", surface: "s1", startTime: 5_000, sessionFile: "s1", statusState: active, interactive: false },
-        { id: "a2", name: "Open", task: "", surface: "s2", startTime: 10_000, sessionFile: "s2", statusState: interrupted, interactive: false },
+        { id: "a1", name: "Active", task: "", surface: "s1", startTime: 5_000, sessionFile: "s1", lifecycle: active, interactive: false },
+        { id: "a2", name: "Open", task: "", surface: "s2", startTime: 10_000, sessionFile: "s2", lifecycle: interrupted, interactive: false },
       ], 72);
 
       assert.match(lines[0], /1 active · 1 open/);
@@ -2237,7 +2432,7 @@ describe("subagents widget rendering", () => {
           surface: "s1",
           startTime: 1_000_000 - 13_000,
           sessionFile: "sess1",
-          statusState: createStatusState({ source: "pi", startTimeMs: 1_000_000 - 13_000 }),
+          lifecycle: createLifecycle(1_000_000 - 13_000),
         },
         {
           id: "a2",
@@ -2246,7 +2441,7 @@ describe("subagents widget rendering", () => {
           surface: "s2",
           startTime: 1_000_000 - 21_000,
           sessionFile: "sess2",
-          statusState: createStatusState({ source: "pi", startTimeMs: 1_000_000 - 21_000 }),
+          lifecycle: createLifecycle(1_000_000 - 21_000),
         },
         {
           id: "a3",
@@ -2255,7 +2450,7 @@ describe("subagents widget rendering", () => {
           surface: "s3",
           startTime: 1_000_000 - 27_000,
           sessionFile: "sess3",
-          statusState: createStatusState({ source: "pi", startTimeMs: 1_000_000 - 27_000 }),
+          lifecycle: createLifecycle(1_000_000 - 27_000),
         },
       ], 16);
 
@@ -2293,7 +2488,7 @@ describe("subagents widget rendering", () => {
           surface: "s1",
           startTime,
           sessionFile: "sess1",
-          statusState: createStatusState({ source: "pi", startTimeMs: startTime }),
+          lifecycle: createLifecycle(startTime),
         },
       ], width);
 
