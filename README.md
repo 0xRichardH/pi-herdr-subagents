@@ -4,10 +4,10 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono) running exclusivel
 
 ## How It Works
 
-Call `subagent()` and it **returns immediately**. The sub-agent runs in its own terminal pane. A live widget above the input shows all running agents with their current state — `starting`, `active`, `waiting`, `stalled`, or `running`. When a sub-agent finishes, its result is **steered back** into the main session as an async notification — triggering a new turn so the agent can process it.
+Call `subagent()` and it **returns immediately**. The sub-agent runs in its own terminal pane. A live widget above the input shows all tracked agents with their projected state — for example `starting`, `active`, `waiting`, `interrupted`, `stalled`, `running`, or `finalizing`. The header summarizes **active** (processing) vs **open** (not processing). When every tracked subagent is open, the border switches to amber. When a sub-agent finishes, its result is **steered back** into the main session as an async notification — triggering a new turn so the agent can process it.
 
 ```
-╭─ Subagents ──────────────────────────── 2 running ─╮
+╭─ Subagents ──────────────────── 1 active · 1 open ─╮
 │ 00:23  Scout: Auth (scout)        active · bash 7m │
 │ 00:45  Scout: DB (scout)                waiting 2m │
 ╰────────────────────────────────────────────────────╯
@@ -93,31 +93,47 @@ Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global**
 5. Main agent processes result     → continues with new context
 ```
 
-Multiple subagents run concurrently — each steers its result back independently as it finishes. The live widget above the input tracks all running agents:
+Multiple subagents run concurrently — each steers its result back independently as it finishes. The live widget above the input tracks every agent still in flight:
 
 ```
-╭─ Subagents ───────────────────────────────── 3 running ─╮
+╭─ Subagents ──────────────────── 1 active · 2 open ─╮
 │ 01:23  Scout: Auth (scout)            active · write 7m │
 │ 00:45  Researcher (researcher)               stalled 4m │
 │ 00:12  Scout: DB (scout)                      starting… │
 ╰─────────────────────────────────────────────────────────╯
 ```
 
-Completion messages render with a colored background and are expandable with `Ctrl+O` to show the full summary and session file path.
+Completion messages render with a colored background and are expandable with `Ctrl+O` to show the full summary and session file path. Completed rows are removed from the widget as soon as their result is delivered or suppressed.
 
 ### In-progress status updates
 
-The widget tracks each Pi-backed sub-agent from a child-written runtime snapshot and labels it with a coarse state:
+The widget projects each sub-agent from a **process + turn lifecycle**:
 
-- `starting` — launched, but no valid child snapshot has been observed yet
-- `active` — the child is doing observed runtime work: agent turn, provider request, streaming, or tool execution
-- `waiting` — the child finished a turn and is intentionally open for more input or another stage
-- `stalled` — the parent has gone too long without a valid current child snapshot and can no longer trust the run is healthy
-- `running` — fallback for backends without child snapshots (e.g. Claude)
+- **Herdr pane inspection** is the coarse authority for whether the child process is present and whether Herdr reports it as idle, working, blocked, or done.
+- **Child activity snapshots** enrich the label with Pi-only detail (tool name, streaming, etc.) when available.
+- Session JSONL is still used for transcript, resume, lineage, and result extraction — not for liveness.
 
-These labels are no longer derived from session-file growth. Session JSONL is still used for transcript, resume, lineage, and result extraction, but Pi-backed liveness now comes from a small activity snapshot written by the child extension. A fixed internal watchdog marks a run as `stalled` when valid snapshots never appear, stop being readable, or stop matching the current child; valid long-running `active` or `waiting` states do not become `stalled` just because time passes. When a run enters `stalled` or recovers from it, the parent agent receives a steer message so it can react. All other status transitions stay in the widget only.
+Projected labels include:
 
-**Interactive subagents stay silent.** Long-running user-driven subagents (e.g. `planner`, or any `/iterate` fork) do not wake the parent session on `stalled`/`recovered` transitions — the user is working directly in the subagent's pane, and a steer message there would just burn an orchestrator turn on a no-op "still waiting" ping. The widget still updates normally, and child snapshots are still recorded/classified regardless of the `interactive` setting. By default, agents with `auto-exit: true` are treated as autonomous and get stall pings; agents without it are treated as interactive and stay quiet. Override per-agent with `interactive: true|false` in frontmatter, or per-spawn with `interactive: true|false` on the tool call.
+- `starting` — launched; pane/activity confirmation is still settling
+- `active` — processing work (agent turn, provider request, streaming, or tool execution)
+- `blocked` — Herdr reports the child as blocked
+- `waiting` — turn finished; the process is intentionally open for more input or another stage
+- `interrupted` — the current turn was cancelled (Escape / `subagent_interrupt`); the process stays open and is **not** treated as active processing
+- `stalled` — pane inspection is unhealthy long enough that the parent can no longer trust the run
+- `running` — fallback when only coarse process presence is known (e.g. non-Pi backends)
+- `finalizing` — completion was observed and delivery is in progress; the process elapsed timer freezes here
+
+The widget header counts **active** vs **open**:
+
+- **active** — `active`, `starting`, `running`, or `blocked`
+- **open** — everything else still tracked (`waiting`, `interrupted`, `stalled`, `finalizing`, …)
+
+When `activeCount === 0` (every tracked row is open), the border uses an amber accent. Process elapsed time (`MM:SS` on the left) freezes when the process reaches finalizing/completed/failed. Interrupt does **not** freeze that process clock; the interrupted state shows its own duration on the right while the process remains open.
+
+A fixed internal watchdog marks a run as `stalled` when pane inspection fails or the pane disappears without a completion sidecar; valid long-running `active` or `waiting` states do not become `stalled` just because time passes. When a run enters `stalled` or recovers from it, the parent agent receives a steer message so it can react. All other status transitions stay in the widget only.
+
+**Interactive subagents stay silent.** Long-running user-driven subagents (e.g. `planner`, or any `/iterate` fork) do not wake the parent session on `stalled`/`recovered` transitions — the user is working directly in the subagent's pane, and a steer message there would just burn an orchestrator turn on a no-op "still waiting" ping. The widget still updates normally, and activity snapshots are still recorded/classified regardless of the `interactive` setting. By default, agents with `auto-exit: true` are treated as autonomous and get stall pings; agents without it are treated as interactive and stay quiet. Override per-agent with `interactive: true|false` in frontmatter, or per-spawn with `interactive: true|false` on the tool call.
 
 #### Configuration
 
@@ -182,7 +198,7 @@ subagent_interrupt({ id: "abcd1234" });
 subagent_interrupt({ name: "Scout" });
 ```
 
-This sends Escape to the child pane, cancelling the in-progress model turn. The subagent session stays alive — the pane, session file, and background polling all remain intact. After the interrupt, the widget immediately moves the child back to `waiting`, and stale pre-interrupt snapshots are ignored. If the child starts work later, newer snapshots return it to `active`; completion, failure, and `caller_ping` still flow through normally.
+This sends Escape to the child pane, cancelling the in-progress model turn. The subagent session stays alive — the pane, session file, and background polling all remain intact. After the interrupt, the widget immediately labels the child as `interrupted` (counted as **open**, not active processing). Stale pre-interrupt activity snapshots are ignored so a lagging Herdr/`active` reading cannot overwrite the interrupt. The process elapsed timer keeps running because the pane is still open; only the interrupted-state duration freezes relative to the interrupt request. If the child starts work later, newer observations return it to `active`; completion, failure, and `caller_ping` still flow through normally.
 
 This is a turn-level interrupt, not a method for forcibly terminating a subagent session.
 
