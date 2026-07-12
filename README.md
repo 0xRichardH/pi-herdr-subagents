@@ -33,6 +33,8 @@ pi install git:github.com/0xRichardH/pi-herdr-subagents
 
 This project does not install or load `HazAT/pi-interactive-subagents` automatically.
 
+For maintainers publishing a release to npm, see [RELEASING.md](RELEASING.md).
+
 Start herdr, then run pi inside it:
 
 ```bash

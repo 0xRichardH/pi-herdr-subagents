@@ -1,6 +1,6 @@
 {
   "name": "pi-herdr-subagents",
-  "version": "3.7.2",
+  "version": "0.1.0",
   "description": "Interactive subagents for pi running in herdr",
   "keywords": [
     "pi-package"
@@ -29,6 +29,6 @@
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.80.6",
     "@earendil-works/pi-tui": "^0.80.6",
-    "@sinclair/typebox": "^0.34.51"
+    "@sinclair/typebox": "^0.34.52"
   }
 }
