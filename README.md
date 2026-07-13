@@ -21,6 +21,23 @@ subagent({ name: "Scout: DB", agent: "scout", task: "Map database schema" });
 // Both return immediately, results steer back independently
 ```
 
+## Development
+
+Run unit tests and lint locally:
+
+```bash
+npm test
+npm run lint
+```
+
+Run the real end-to-end suite from inside herdr with an explicit test model:
+
+```bash
+PI_TEST_MODEL="deepseek/deepseek-v4-flash" npm run test:integration
+```
+
+`PI_TEST_MODEL` is applied to both the parent Pi sessions and the project-local test subagents created by the harness.
+
 ## Install
 
 Install the package from npm:
@@ -181,6 +198,7 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `fork`                 | boolean | `false`        | Force the full-context fork mode for this spawn, overriding any agent `session-mode` frontmatter  |
 | `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit`. |
 | `model`                | string  | —              | Override agent's default model                                                                    |
+| `thinking`             | string  | —              | Override agent's thinking level (`off` through `max`)                                              |
 | `systemPrompt`         | string  | —              | Append to system prompt                                                                           |
 | `skills`               | string  | —              | Comma-separated skill names                                                                       |
 | `tools`                | string  | —              | Comma-separated tool names                                                                        |

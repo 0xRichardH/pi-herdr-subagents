@@ -19,10 +19,10 @@ Stop and ask the user to start pi inside herdr if `HERDR_ENV` is not `1` or the 
 
 ## Integration suite
 
-From the repository root:
+From the repository root, run the suite with the project's reliable test model:
 
 ```bash
-npm run test:integration
+PI_TEST_MODEL="deepseek/deepseek-v4-flash" npm run test:integration
 ```
 
-The harness loads the extension directly from the working tree and creates isolated test agents. Report passing, failing, and skipped tests. Do not claim full verification when herdr-dependent tests were skipped.
+The harness loads the extension directly from the working tree and creates isolated test agents. `PI_TEST_MODEL` controls every real Pi/LLM session in the lifecycle suite; use `deepseek/deepseek-v4-flash` instead of the slower, less predictable `openrouter/free` default. Report passing, failing, and skipped tests. Do not claim full verification when herdr-dependent tests were skipped.

@@ -12,11 +12,11 @@ import { execFileSync } from "node:child_process";
 import {
   mkdtempSync,
   mkdirSync,
-  cpSync,
   readdirSync,
   rmSync,
   existsSync,
   readFileSync,
+  writeFileSync,
   unlinkSync,
 } from "node:fs";
 import { join, resolve, dirname } from "node:path";
@@ -134,10 +134,24 @@ export interface TestEnv {
   dir: string;
   /** Active mux backend for this test run */
   backend: MuxBackend;
-  /** Surfaces created during the test (cleaned up automatically) */
+  /** Workspace where the suite is running. */
+  workspaceId: string;
+  /** Pane IDs that existed before this test environment started. */
+  baselinePanes: Set<string>;
+  /** Surfaces created directly by the harness. */
   surfaces: string[];
   /** Temp files to clean up */
   tempFiles: string[];
+}
+
+function listWorkspacePaneIds(workspaceId: string): string[] {
+  const output = execFileSync("herdr", ["pane", "list", "--workspace", workspaceId], {
+    encoding: "utf8",
+  });
+  const parsed = JSON.parse(output) as { result?: { panes?: Array<{ pane_id?: unknown }> } };
+  return (parsed.result?.panes ?? [])
+    .map((pane) => pane.pane_id)
+    .filter((paneId): paneId is string => typeof paneId === "string" && paneId.length > 0);
 }
 
 /**
@@ -147,25 +161,46 @@ export interface TestEnv {
 export function createTestEnv(backend: MuxBackend): TestEnv {
   const dir = mkdtempSync(join(tmpdir(), "pi-integ-"));
   const agentsDir = join(dir, ".pi", "agents");
+  const workspaceId = process.env.HERDR_WORKSPACE_ID;
+  if (!workspaceId) throw new Error("HERDR_WORKSPACE_ID is required for integration cleanup");
+  const baselinePanes = new Set(listWorkspacePaneIds(workspaceId));
   mkdirSync(agentsDir, { recursive: true });
 
-  // Copy test agent definitions into the project-local agents dir
+  // Copy test agent definitions into the project-local agents dir and pin
+  // every child subagent to the same model selected for the outer Pi sessions.
+  // Without this rewrite, fixture frontmatter can silently bypass PI_TEST_MODEL.
   if (existsSync(TEST_AGENTS_SRC)) {
     for (const file of readdirSync(TEST_AGENTS_SRC)) {
       if (file.endsWith(".md")) {
-        cpSync(join(TEST_AGENTS_SRC, file), join(agentsDir, file));
+        const source = readFileSync(join(TEST_AGENTS_SRC, file), "utf8");
+        const configured = /^model:\s*.*$/m.test(source)
+          ? source.replace(/^model:\s*.*$/m, `model: ${TEST_MODEL}`)
+          : source.replace(/^---\n/, `---\nmodel: ${TEST_MODEL}\n`);
+        writeFileSync(join(agentsDir, file), configured, "utf8");
       }
     }
   }
 
-  return { dir, backend, surfaces: [], tempFiles: [] };
+  return { dir, backend, workspaceId, baselinePanes, surfaces: [], tempFiles: [] };
 }
 
 /**
  * Clean up all resources created during the test.
  */
 export function cleanupTestEnv(env: TestEnv): void {
-  for (const surface of env.surfaces) {
+  // Close every pane created since the environment started, not only the
+  // parent surfaces registered by the harness. Subagent panes are created by
+  // the extension itself and otherwise leak when a test times out or a child
+  // remains interactive unexpectedly.
+  let currentPanes: string[] = [];
+  try {
+    currentPanes = listWorkspacePaneIds(env.workspaceId);
+  } catch {}
+  const createdPanes = new Set([
+    ...env.surfaces,
+    ...currentPanes.filter((paneId) => !env.baselinePanes.has(paneId)),
+  ]);
+  for (const surface of createdPanes) {
     try {
       closePane(surface);
     } catch {}
