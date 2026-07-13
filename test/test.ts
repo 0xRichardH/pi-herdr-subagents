@@ -949,24 +949,56 @@ describe("subagent discovery", () => {
     });
   });
 
-  it("resolveEffectiveInteractive defaults to the inverse of auto-exit", () => {
-    // Autonomous agents (auto-exit: true) are NOT interactive — parent gets stall pings.
+  it("resolves auto-exit and interactive behavior for named and bare spawns", () => {
+    // Autonomous named agents are not interactive, so the parent gets status pings.
+    assert.equal(
+      testApi.resolveEffectiveAutoExit({ name: "A", task: "T" }, { autoExit: true }),
+      true,
+    );
     assert.equal(
       testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, { autoExit: true }),
       false,
     );
-    // Agents without auto-exit ARE interactive — parent does not receive status transition pings.
+
+    // Named agents without auto-exit preserve their interactive behavior.
+    assert.equal(
+      testApi.resolveEffectiveAutoExit({ name: "A", task: "T" }, { autoExit: false }),
+      false,
+    );
     assert.equal(
       testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, { autoExit: false }),
       true,
     );
+
+    // Bare task spawns are autonomous by default. Otherwise a normal final
+    // answer leaves the child open and no completion is delivered to the parent.
+    assert.equal(testApi.resolveEffectiveAutoExit({ name: "A", task: "T" }, null), true);
+    assert.equal(testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, null), false);
+
+    // A bare full-context fork invoked directly through the tool is still an
+    // autonomous task. Forking only controls inherited conversation context.
     assert.equal(
-      testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, {}),
+      testApi.resolveEffectiveAutoExit({ name: "A", task: "T", fork: true }, null),
       true,
     );
-    // Bare spawn with no agent defs (e.g. /iterate fork) is interactive by default.
     assert.equal(
-      testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, null),
+      testApi.resolveEffectiveInteractive({ name: "A", task: "T", fork: true }, null),
+      false,
+    );
+
+    // Interactive fork workflows such as /iterate opt out explicitly.
+    assert.equal(
+      testApi.resolveEffectiveAutoExit(
+        { name: "A", task: "T", fork: true, interactive: true },
+        null,
+      ),
+      false,
+    );
+    assert.equal(
+      testApi.resolveEffectiveInteractive(
+        { name: "A", task: "T", fork: true, interactive: true },
+        null,
+      ),
       true,
     );
   });
@@ -1007,24 +1039,26 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("bundled scout/worker/reviewer agents resolve as non-interactive; planner resolves as interactive", () => {
-    for (const name of ["scout", "worker", "reviewer"]) {
+  it("bundled agents select role-appropriate models, thinking, and interaction modes", () => {
+    const expected = {
+      scout: { model: "anthropic/claude-haiku-4-5", thinking: "minimal", interactive: false },
+      worker: { model: "anthropic/claude-sonnet-4-6", thinking: "minimal", interactive: false },
+      reviewer: { model: "anthropic/claude-opus-4-6", thinking: "medium", interactive: false },
+      planner: { model: "anthropic/claude-opus-4-6", thinking: "medium", interactive: true },
+      "visual-tester": { model: "anthropic/claude-sonnet-4-6", thinking: "minimal", interactive: false },
+    } as const;
+
+    for (const [name, wanted] of Object.entries(expected)) {
       const defs = testApi.loadAgentDefaults(name);
       assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
+      assert.equal(defs.model, wanted.model, `${name} should use the expected model tier`);
+      assert.equal(defs.thinking, wanted.thinking, `${name} should use the expected thinking level`);
       assert.equal(
         testApi.resolveEffectiveInteractive({ name, task: "" }, defs),
-        false,
-        `${name} should resolve as non-interactive (autonomous)`,
+        wanted.interactive,
+        `${name} should use the expected interaction mode`,
       );
     }
-
-    const planner = testApi.loadAgentDefaults("planner");
-    assert.ok(planner, "expected bundled planner to be discoverable");
-    assert.equal(
-      testApi.resolveEffectiveInteractive({ name: "planner", task: "" }, planner),
-      true,
-      "planner should resolve as interactive (no auto-exit)",
-    );
   });
 
   it("ignores invalid session-mode values", async () => {
@@ -1748,6 +1782,7 @@ describe("commands", () => {
 
     assert.equal(sentUserMessages.length, 1);
     assert.match(sentUserMessages[0], /fork: true/);
+    assert.match(sentUserMessages[0], /interactive: true/);
     assert.match(sentUserMessages[0], /name: "Iterate"/);
   });
 });

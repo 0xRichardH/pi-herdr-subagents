@@ -103,6 +103,12 @@ const SubagentParams = Type.Object({
     Type.String({ description: "Appended to system prompt (role instructions)" }),
   ),
   model: Type.Optional(Type.String({ description: "Model override (overrides agent default)" })),
+  thinking: Type.Optional(
+    Type.String({
+      description:
+        "Thinking-level override (overrides agent default), e.g. off, minimal, low, medium, high, xhigh, or max.",
+    }),
+  ),
   skills: Type.Optional(
     Type.String({ description: "Comma-separated skills (overrides agent default)" }),
   ),
@@ -353,13 +359,25 @@ function resolveLaunchBehavior(
  * typical for `/iterate` with `fork: true`), `autoExit` is undefined and the
  * subagent is treated as interactive — matching the intent of iterate.
  */
+function resolveEffectiveAutoExit(
+  params: Static<typeof SubagentParams>,
+  agentDefs: AgentDefaults | null,
+): boolean {
+  // Named agents preserve their declared behavior. Bare tool calls are
+  // autonomous by default, including full-context forks: `fork` controls
+  // context inheritance, not whether the child should remain open. Interactive
+  // flows such as /iterate opt out explicitly with `interactive: true`.
+  if (agentDefs) return agentDefs.autoExit ?? false;
+  return params.interactive !== true;
+}
+
 function resolveEffectiveInteractive(
   params: Static<typeof SubagentParams>,
   agentDefs: AgentDefaults | null,
 ): boolean {
   if (params.interactive != null) return params.interactive;
   if (agentDefs?.interactive != null) return agentDefs.interactive;
-  return !(agentDefs?.autoExit ?? false);
+  return !resolveEffectiveAutoExit(params, agentDefs);
 }
 
 function loadAgentDefaults(agentName: string): AgentDefaults | null {
@@ -1009,6 +1027,7 @@ export const __test__ = {
   discoverAgentDefinitions,
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
+  resolveEffectiveAutoExit,
   resolveEffectiveInteractive,
   buildSubagentToolAllowlist,
   buildPiPromptArgs,
@@ -1050,7 +1069,8 @@ async function launchSubagent(
   const effectiveModel = params.model ?? agentDefs?.model;
   const effectiveTools = params.tools ?? agentDefs?.tools;
   const effectiveSkills = params.skills ?? agentDefs?.skills;
-  const effectiveThinking = agentDefs?.thinking;
+  const effectiveThinking = params.thinking ?? agentDefs?.thinking;
+  const effectiveAutoExit = resolveEffectiveAutoExit(params, agentDefs);
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
 
   const sessionFile = ctx.sessionManager.getSessionFile();
@@ -1100,10 +1120,10 @@ async function launchSubagent(
   // Build the task message
   // Only full-context fork mode inherits prior conversation state.
   // Blank-session modes need the wrapper instructions and artifact-backed handoff.
-  const modeHint = agentDefs?.autoExit
+  const modeHint = effectiveAutoExit
     ? "Complete your task autonomously."
     : "Complete your task. When finished, call the subagent_done tool. The user can interact with you at any time.";
-  const summaryInstruction = agentDefs?.autoExit
+  const summaryInstruction = effectiveAutoExit
     ? "Your FINAL assistant message should summarize what you accomplished."
     : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
   const denySet = resolveDenyTools(agentDefs);
@@ -1194,8 +1214,10 @@ async function launchSubagent(
   parts.push("-e", shellQuote(subagentDonePath));
 
   if (effectiveModel) {
-    const model = effectiveThinking ? `${effectiveModel}:${effectiveThinking}` : effectiveModel;
-    parts.push("--model", shellQuote(model));
+    parts.push("--model", shellQuote(effectiveModel));
+  }
+  if (effectiveThinking) {
+    parts.push("--thinking", shellQuote(effectiveThinking));
   }
 
   // Pass agent body as system prompt via file to avoid shell escaping issues
@@ -1239,7 +1261,7 @@ async function launchSubagent(
   if (params.agent) {
     envParts.push(`PI_SUBAGENT_AGENT=${shellQuote(params.agent)}`);
   }
-  if (agentDefs?.autoExit) {
+  if (effectiveAutoExit) {
     envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
   }
   envParts.push(`PI_SUBAGENT_SESSION=${shellQuote(subagentSessionFile)}`);
@@ -2126,8 +2148,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     handler: async (args, _ctx) => {
       const task = args.trim() || "";
       const toolCall = task
-        ? `Use subagent to fork a session. fork: true, name: "Iterate", task: ${JSON.stringify(task)}`
-        : `Use subagent to fork a session. fork: true, name: "Iterate", task: "The user wants to do some hands-on work. Help them with whatever they need."`;
+        ? `Use subagent to fork an interactive session. fork: true, interactive: true, name: "Iterate", task: ${JSON.stringify(task)}`
+        : `Use subagent to fork an interactive session. fork: true, interactive: true, name: "Iterate", task: "The user wants to do some hands-on work. Help them with whatever they need."`;
       pi.sendUserMessage(toolCall);
     },
   });
