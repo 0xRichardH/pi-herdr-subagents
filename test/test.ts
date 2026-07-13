@@ -1059,23 +1059,23 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("bundled agents preserve role-specific runtime defaults and interaction modes", () => {
-    const expectedDefaults = {
-      scout: { model: "anthropic/claude-haiku-4-5", interactive: false },
-      worker: { model: "anthropic/claude-sonnet-4-6", thinking: "minimal", interactive: false },
-      reviewer: { model: "anthropic/claude-opus-4-6", thinking: "medium", interactive: false },
-      planner: { model: "anthropic/claude-opus-4-6", thinking: "medium", interactive: true },
-      "visual-tester": { model: "anthropic/claude-sonnet-4-6", interactive: false },
+  it("bundled agents inherit the parent runtime and preserve interaction modes", () => {
+    const expectedInteraction = {
+      scout: false,
+      worker: false,
+      reviewer: false,
+      planner: true,
+      "visual-tester": false,
     } as const;
 
-    for (const [name, expected] of Object.entries(expectedDefaults)) {
+    for (const [name, interactive] of Object.entries(expectedInteraction)) {
       const defs = testApi.loadAgentDefaults(name);
       assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
-      assert.equal(defs.model, expected.model, `${name} should preserve its role model`);
-      assert.equal(defs.thinking, expected.thinking, `${name} should preserve its role thinking level`);
+      assert.equal(defs.model, undefined, `${name} should inherit the parent model`);
+      assert.equal(defs.thinking, undefined, `${name} should inherit the parent thinking level`);
       assert.equal(
         testApi.resolveEffectiveInteractive({ name, task: "" }, defs),
-        expected.interactive,
+        interactive,
         `${name} should preserve its interaction mode`,
       );
     }
