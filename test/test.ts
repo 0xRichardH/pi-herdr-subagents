@@ -2752,6 +2752,22 @@ describe("herdr.ts", () => {
     });
   });
 
+  describe("herdr command construction", () => {
+    it("targets the current workspace when creating a subagent tab", () => {
+      assert.deepEqual(__herdrTest__.buildTabCreateArgs("reviewer", "/repo", "workspace-2"), [
+        "tab",
+        "create",
+        "--workspace",
+        "workspace-2",
+        "--label",
+        "reviewer",
+        "--cwd",
+        "/repo",
+        "--no-focus",
+      ]);
+    });
+  });
+
   describe("herdr response parsing", () => {
     it("extracts pane id from a pane split response", () => {
       const output = JSON.stringify({

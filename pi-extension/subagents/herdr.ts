@@ -114,18 +114,26 @@ function getHerdrCurrentPaneInfo(): {
   return { pane_id: paneId, tab_id: tabId, workspace_id: workspaceId };
 }
 
-export function createHerdrSurface(name: string): string {
-  // Create a new tab per subagent so parallel spawns each get a full tab
-  // instead of ever-narrower splits of the parent pane.
-  const output = herdrExec([
+function buildTabCreateArgs(name: string, cwd: string, workspaceId: string): string[] {
+  return [
     "tab",
     "create",
+    "--workspace",
+    workspaceId,
     "--label",
     name,
     "--cwd",
-    process.cwd(),
+    cwd,
     "--no-focus",
-  ]);
+  ];
+}
+
+export function createHerdrSurface(name: string): string {
+  // Create a new tab per subagent so parallel spawns each get a full tab
+  // instead of ever-narrower splits of the parent pane. Target the current
+  // workspace explicitly because Herdr's implicit default may be another space.
+  const { workspace_id: workspaceId } = getHerdrCurrentPaneInfo();
+  const output = herdrExec(buildTabCreateArgs(name, process.cwd(), workspaceId));
   const paneId = extractHerdrRootPaneId(output, "tab create");
   try {
     herdrExec(["pane", "rename", paneId, name]);
@@ -260,6 +268,7 @@ export function renameHerdrWorkspace(title: string): void {
 }
 
 export const __herdrTest__ = {
+  buildTabCreateArgs,
   parseHerdrJson,
   extractHerdrPaneId,
   extractHerdrRootPaneId,
