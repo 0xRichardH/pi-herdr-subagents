@@ -21,6 +21,25 @@ subagent({ name: "Scout: DB", agent: "scout", task: "Map database schema" });
 // Both return immediately, results steer back independently
 ```
 
+## Development
+
+Run unit tests and lint locally:
+
+```bash
+npm test
+npm run lint
+```
+
+Run the real end-to-end suite from inside herdr with an explicit test model:
+
+```bash
+PI_TEST_MODEL="deepseek/deepseek-v4-flash" PI_TEST_TIMEOUT=180000 npm run test:integration
+```
+
+The full suite launches real Pi sessions and can take several minutes. `PI_TEST_TIMEOUT` is the per-test timeout in milliseconds; use at least `180000` for the lifecycle suite.
+
+`PI_TEST_MODEL` is applied to both the parent Pi sessions and the project-local test subagents created by the harness.
+
 ## Install
 
 Install the package from npm:
@@ -71,13 +90,15 @@ Subagent tabs and panes are created without stealing keyboard focus. Launch comm
 
 ### Bundled Agents
 
-| Agent             | Model                  | Role                                                                                     |
-| ----------------- | ---------------------- | ---------------------------------------------------------------------------------------- |
-| **planner**       | Opus (medium thinking) | Brainstorming — clarifies requirements, explores approaches, writes plans, creates todos |
-| **scout**         | Haiku                  | Fast codebase reconnaissance — maps files, patterns, conventions                         |
-| **worker**        | Sonnet                 | Implements tasks from todos — writes code, runs tests, makes polished commits            |
-| **reviewer**      | Opus (medium thinking) | Reviews code for bugs, security issues, correctness                                      |
-| **visual-tester** | Sonnet                 | Visual QA via Chrome CDP — screenshots, responsive testing, interaction testing          |
+| Agent             | Default runtime | Role                                                                                     |
+| ----------------- | --------------- | ---------------------------------------------------------------------------------------- |
+| **planner**       | Inherit parent  | Brainstorming — clarifies requirements, explores approaches, writes plans, creates todos |
+| **scout**         | Inherit parent  | Fast codebase reconnaissance — maps files, patterns, conventions                         |
+| **worker**        | Inherit parent  | Implements tasks from todos — writes code, runs tests, makes polished commits            |
+| **reviewer**      | Inherit parent  | Reviews code for bugs, security issues, correctness                                      |
+| **visual-tester** | Inherit parent  | Visual QA via Chrome CDP — screenshots, responsive testing, interaction testing          |
+
+Bundled agents inherit the parent model and thinking level. The orchestrating agent can override either field for a specific task using an exact authenticated model ID and a supported Pi thinking level. Prefer changing thinking before changing models.
 
 Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global** (`~/.pi/agent/agents/`) > **package-bundled**. Override any bundled agent by placing your own version in the higher-priority location.
 
@@ -180,7 +201,8 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `agent`                | string  | —              | Load defaults from agent definition                                                               |
 | `fork`                 | boolean | `false`        | Force the full-context fork mode for this spawn, overriding any agent `session-mode` frontmatter  |
 | `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit`. |
-| `model`                | string  | —              | Override agent's default model                                                                    |
+| `model`                | string  | parent model   | Exact authenticated `provider/model-id`; omit to inherit the parent                               |
+| `thinking`             | string  | parent level   | Pi thinking level (`off` through `max`); omit to inherit the parent                                |
 | `systemPrompt`         | string  | —              | Append to system prompt                                                                           |
 | `skills`               | string  | —              | Comma-separated skill names                                                                       |
 | `tools`                | string  | —              | Comma-separated tool names                                                                        |
@@ -303,8 +325,8 @@ You are a specialized agent that does X...
 | ------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `name`        | string  | Agent name (used in `agent: "my-agent"`)                                                                                                                                                                                                                                    |
 | `description` | string  | Shown in `subagents_list` output                                                                                                                                                                                                                                            |
-| `model`       | string  | Default model (e.g. `anthropic/claude-sonnet-4-6`)                                                                                                                                                                                                                          |
-| `thinking`    | string  | Thinking level: `minimal`, `medium`, `high`                                                                                                                                                                                                                                 |
+| `model`       | string  | Optional exact authenticated model default; omit to inherit the parent                                                                                                                                                                                                      |
+| `thinking`    | string  | Optional Pi thinking default (`off` through `max`); omit to inherit the parent                                                                                                                                                                                                                                 |
 | `tools`       | string  | Comma-separated **native pi tools only**: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`                                                                                                                                                                             |
 | `skills`      | string  | Comma-separated skill names to auto-load                                                                                                                                                                                                                                    |
 | `session-mode` | string | Default child-session mode: `standalone`, `lineage-only`, or `fork` |

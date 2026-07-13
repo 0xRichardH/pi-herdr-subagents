@@ -17,6 +17,7 @@ import {
   getLeafId,
   getNewEntries,
   findLastAssistantMessage,
+  findObservedSessionRuntime,
   appendBranchSummary,
   copySessionFile,
   mergeNewEntries,
@@ -102,16 +103,22 @@ function createMockExtensionApi() {
   const registeredTools: Array<any> = [];
   const registeredCommands: Array<any> = [];
   const registeredMessageRenderers: Array<any> = [];
+  const eventHandlers = new Map<string, Array<Function>>();
   const sentUserMessages: string[] = [];
   const sentMessages: Array<any> = [];
   return {
     registeredTools,
     registeredCommands,
     registeredMessageRenderers,
+    eventHandlers,
     sentUserMessages,
     sentMessages,
     api: {
-      on() {},
+      on(event: string, handler: Function) {
+        const handlers = eventHandlers.get(event) ?? [];
+        handlers.push(handler);
+        eventHandlers.set(event, handlers);
+      },
       registerTool(tool: any) {
         registeredTools.push(tool);
       },
@@ -378,6 +385,19 @@ describe("session.ts", () => {
         },
       };
       assert.equal(findLastAssistantMessage([msg] as any[]), null);
+    });
+  });
+
+  describe("findObservedSessionRuntime", () => {
+    it("extracts the latest model and thinking entries", () => {
+      assert.deepEqual(
+        findObservedSessionRuntime([
+          { type: "model_change", id: "m1", provider: "fake", modelId: "old" },
+          { type: "thinking_level_change", id: "t1", thinkingLevel: "medium" },
+          { type: "model_change", id: "m2", provider: "other", modelId: "new" },
+        ]),
+        { provider: "other", modelId: "new", thinking: "medium" },
+      );
     });
   });
 
@@ -949,24 +969,56 @@ describe("subagent discovery", () => {
     });
   });
 
-  it("resolveEffectiveInteractive defaults to the inverse of auto-exit", () => {
-    // Autonomous agents (auto-exit: true) are NOT interactive — parent gets stall pings.
+  it("resolves auto-exit and interactive behavior for named and bare spawns", () => {
+    // Autonomous named agents are not interactive, so the parent gets status pings.
+    assert.equal(
+      testApi.resolveEffectiveAutoExit({ name: "A", task: "T" }, { autoExit: true }),
+      true,
+    );
     assert.equal(
       testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, { autoExit: true }),
       false,
     );
-    // Agents without auto-exit ARE interactive — parent does not receive status transition pings.
+
+    // Named agents without auto-exit preserve their interactive behavior.
+    assert.equal(
+      testApi.resolveEffectiveAutoExit({ name: "A", task: "T" }, { autoExit: false }),
+      false,
+    );
     assert.equal(
       testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, { autoExit: false }),
       true,
     );
+
+    // Bare task spawns are autonomous by default. Otherwise a normal final
+    // answer leaves the child open and no completion is delivered to the parent.
+    assert.equal(testApi.resolveEffectiveAutoExit({ name: "A", task: "T" }, null), true);
+    assert.equal(testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, null), false);
+
+    // A bare full-context fork invoked directly through the tool is still an
+    // autonomous task. Forking only controls inherited conversation context.
     assert.equal(
-      testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, {}),
+      testApi.resolveEffectiveAutoExit({ name: "A", task: "T", fork: true }, null),
       true,
     );
-    // Bare spawn with no agent defs (e.g. /iterate fork) is interactive by default.
     assert.equal(
-      testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, null),
+      testApi.resolveEffectiveInteractive({ name: "A", task: "T", fork: true }, null),
+      false,
+    );
+
+    // Interactive fork workflows such as /iterate opt out explicitly.
+    assert.equal(
+      testApi.resolveEffectiveAutoExit(
+        { name: "A", task: "T", fork: true, interactive: true },
+        null,
+      ),
+      false,
+    );
+    assert.equal(
+      testApi.resolveEffectiveInteractive(
+        { name: "A", task: "T", fork: true, interactive: true },
+        null,
+      ),
       true,
     );
   });
@@ -1007,24 +1059,26 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("bundled scout/worker/reviewer agents resolve as non-interactive; planner resolves as interactive", () => {
-    for (const name of ["scout", "worker", "reviewer"]) {
+  it("bundled agents inherit the parent runtime and preserve interaction modes", () => {
+    const expectedInteraction = {
+      scout: false,
+      worker: false,
+      reviewer: false,
+      planner: true,
+      "visual-tester": false,
+    } as const;
+
+    for (const [name, interactive] of Object.entries(expectedInteraction)) {
       const defs = testApi.loadAgentDefaults(name);
       assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
+      assert.equal(defs.model, undefined, `${name} should inherit the parent model`);
+      assert.equal(defs.thinking, undefined, `${name} should inherit the parent thinking level`);
       assert.equal(
         testApi.resolveEffectiveInteractive({ name, task: "" }, defs),
-        false,
-        `${name} should resolve as non-interactive (autonomous)`,
+        interactive,
+        `${name} should preserve its interaction mode`,
       );
     }
-
-    const planner = testApi.loadAgentDefaults("planner");
-    assert.ok(planner, "expected bundled planner to be discoverable");
-    assert.equal(
-      testApi.resolveEffectiveInteractive({ name: "planner", task: "" }, planner),
-      true,
-      "planner should resolve as interactive (no auto-exit)",
-    );
   });
 
   it("ignores invalid session-mode values", async () => {
@@ -1748,11 +1802,41 @@ describe("commands", () => {
 
     assert.equal(sentUserMessages.length, 1);
     assert.match(sentUserMessages[0], /fork: true/);
+    assert.match(sentUserMessages[0], /interactive: true/);
     assert.match(sentUserMessages[0], /name: "Iterate"/);
   });
 });
 
 describe("tool registration", () => {
+  it("refreshes subagent routing guidance from the live authenticated model registry", () => {
+    const { api, registeredTools, eventHandlers } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+
+    const subagent = registeredTools.find((tool) => tool.name === "subagent");
+    assert.ok(subagent);
+    const sessionStart = eventHandlers.get("session_start")?.[0];
+    assert.ok(sessionStart);
+    sessionStart({}, {
+      hasUI: false,
+      modelRegistry: {
+        find: (provider: string, id: string) => ({ provider, id, reasoning: true }),
+        getAvailable: () => [{
+          provider: "fake",
+          id: "fast",
+          reasoning: true,
+          input: ["text"],
+          contextWindow: 128_000,
+          maxTokens: 16_000,
+          cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
+        }],
+        hasConfiguredAuth: () => true,
+      },
+    });
+
+    assert.match(subagent.promptGuidelines.join("\n"), /fake\/fast/);
+    assert.match(subagent.promptGuidelines.join("\n"), /inherit the parent runtime/);
+  });
+
   it("ignores an inherited deny list in a parent process", () => {
     delete process.env.PI_SUBAGENT_ID;
     process.env.PI_DENY_TOOLS = "subagent,subagent_interrupt,subagent_resume,subagents_list";

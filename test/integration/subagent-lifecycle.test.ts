@@ -7,10 +7,12 @@
  *
  * Duration: ~30-120s per test, depending on the selected model.
  *
- * Run `npm run test:integration` from inside herdr.
+ * Run `PI_TEST_MODEL="deepseek/deepseek-v4-flash" PI_TEST_TIMEOUT=180000
+ * npm run test:integration` from inside herdr. The explicit model keeps
+ * real-LLM runs predictable and the longer timeout covers the lifecycle suite.
  *
  * Configuration:
- *   PI_TEST_MODEL     — model for all pi sessions (default: openrouter/free)
+ *   PI_TEST_MODEL     — model for all pi sessions (default: openrouter/free; recommended: deepseek/deepseek-v4-flash)
  *   PI_TEST_TIMEOUT   — per-test timeout in ms (default: 120000)
  */
 import { describe, it, before, after } from "node:test";
@@ -206,7 +208,7 @@ for (const backend of backends) {
         `  name: "Fork-${id}"`,
         `  fork: true`,
         `  task: "Run this bash command: echo 'FORK_OK_${id}' > '${markerFile}'"`,
-        `Do not set the agent parameter. Just set name, fork, and task.`,
+        `Do not set the agent or interactive parameters. Just set name, fork, and task.`,
         `After you receive the result, say FORK_COMPLETE.`,
       ].join("\n");
 
@@ -222,6 +224,9 @@ for (const backend of backends) {
         /FORK_COMPLETE|completed|Sub-agent.*"Fork/i,
         PI_TIMEOUT,
       );
+
+      // Receiving the result proves the bare fork auto-exited and its child pane
+      // was finalized instead of remaining at the editor as an interactive run.
 
       // Verify: the forked session has a parent link
       const sessionMatch = screen.match(/Session:\s*(\S+\.jsonl)/);

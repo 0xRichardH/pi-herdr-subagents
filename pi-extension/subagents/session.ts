@@ -100,6 +100,29 @@ export function getNewEntries(sessionFile: string, afterLine: number): SessionEn
  * auto-retry exhausts on a provider overload / rate limit / server error, and
  * without this fallback the parent would silently see a stale earlier message.
  */
+export interface ObservedSessionRuntime {
+  provider?: string;
+  modelId?: string;
+  thinking?: string;
+}
+
+/** Read the effective model and thinking entries recorded by Pi at session startup. */
+export function findObservedSessionRuntime(entries: SessionEntry[]): ObservedSessionRuntime {
+  const observed: ObservedSessionRuntime = {};
+  for (const entry of entries) {
+    if (entry.type === "model_change") {
+      if (typeof entry.provider === "string") observed.provider = entry.provider;
+      if (typeof entry.modelId === "string") observed.modelId = entry.modelId;
+    } else if (
+      entry.type === "thinking_level_change" &&
+      typeof entry.thinkingLevel === "string"
+    ) {
+      observed.thinking = entry.thinkingLevel;
+    }
+  }
+  return observed;
+}
+
 export function findLastAssistantMessage(entries: SessionEntry[]): string | null {
   for (let i = entries.length - 1; i >= 0; i--) {
     const entry = entries[i];
