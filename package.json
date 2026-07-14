@@ -14,7 +14,7 @@
   "type": "module",
   "scripts": {
     "lint": "oxlint pi-extension test",
-    "test": "node --test test/test.ts test/runtime-routing.test.ts",
+    "test": "node --test test/test.ts test/runtime-routing.test.ts test/release-workflow.test.ts",
     "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts"
   },
   "peerDependencies": {

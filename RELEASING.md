@@ -1,6 +1,8 @@
 # Release guide
 
-GitHub Actions publishes this package to npm when you push a tag named `vX.Y.Z`. The tag version must match the version in `package.json`.
+GitHub Actions publishes this package when the version in `package.json` changes on `main`. The release workflow validates the package, creates a matching `vX.Y.Z` tag, publishes to npm with provenance, and creates a GitHub Release with generated notes and a link to the npm package.
+
+The published version must be unique on npm.
 
 ## Prerequisites
 
@@ -14,6 +16,7 @@ Run the checks before starting:
 
 ```bash
 npm ci
+npm run lint
 npm test
 npm pack --dry-run
 ```
@@ -30,7 +33,7 @@ npm pack --dry-run
 
 Never store the token in the repository, `package.json`, or a committed `.npmrc` file.
 
-If the package does not exist on npm yet and the workflow cannot create it with the token, publish the first version locally with `npm login` and `npm publish --access public`. Keep the tag-driven workflow for later releases.
+If the package does not exist on npm yet and the workflow cannot create it with the token, publish the first version locally with `npm login` and `npm publish --access public`. Keep the version-driven workflow for later releases.
 
 ## Publish a release
 
@@ -40,33 +43,18 @@ Choose the semantic version increment:
 - `minor`: compatible features, such as `0.1.0` to `0.2.0`
 - `major`: breaking changes, such as `0.1.0` to `1.0.0`
 
-Create the version commit and tag:
-
-```bash
-npm version patch --sign-git-tag-version
-```
-
-Replace `patch` with `minor` or `major` when appropriate. If you do not sign Git tags, use:
+Create the version commit without a local tag:
 
 ```bash
 npm version patch --no-git-tag-version
-```
-
-In that case, create the tag separately after committing the version change:
-
-```bash
 git add package.json package-lock.json
-git commit -m "chore: release vX.Y.Z"
-git tag vX.Y.Z
+git commit -m "chore: release v$(node -p \"require('./package.json').version\")"
+git push origin main
 ```
 
-Push the release commit and tag:
+Replace `patch` with `minor` or `major` when appropriate. The push triggers the **Release** workflow, which installs dependencies, runs lint and tests, previews package contents, creates and pushes the version tag, publishes to npm with provenance, and creates the GitHub Release.
 
-```bash
-git push origin main --follow-tags
-```
-
-Watch the **Publish to npm** workflow on the repository's **Actions** page. The workflow installs dependencies, runs tests, checks the tag against `package.json`, previews the package contents, and publishes to npm with provenance.
+You can rerun a failed or incomplete release from **Actions → Release → Run workflow**. The workflow safely skips an npm version, tag, or GitHub Release that already exists, while verifying that an existing tag points to the release commit.
 
 ## Verify the release
 
@@ -86,9 +74,9 @@ The package should appear at <https://pi.dev/packages/pi-herdr-subagents> after 
 
 ## Troubleshooting
 
-### Tag and package versions differ
+### Tag points to another commit
 
-The workflow stops when, for example, tag `v0.1.1` points to a commit whose `package.json` still contains `0.1.0`. Create a new matching version and tag. Do not reuse a published npm version.
+The workflow stops if the matching version tag already points to a different commit. Do not move or reuse release tags. Increment the package version and push a new release commit instead.
 
 ### npm rejects authentication
 
@@ -96,7 +84,7 @@ Confirm that the GitHub secret is named exactly `NPM_TOKEN`, the token has write
 
 ### npm reports that the version already exists
 
-npm versions are immutable. Increment the package version, create a new tag, and run the release again.
+npm versions are immutable. Increment the package version and push a new release commit.
 
 ### The package is absent from pi.dev
 

@@ -50,7 +50,7 @@ pi install npm:pi-herdr-subagents
 
 This project does not install or load `HazAT/pi-interactive-subagents` automatically.
 
-For maintainers publishing a release to npm, see [RELEASING.md](RELEASING.md).
+Changing the `package.json` version on `main` automatically creates a matching Git tag and GitHub Release, generates release notes, and publishes the package to npm. For authentication, versioning, verification, and troubleshooting, see [RELEASING.md](RELEASING.md).
 
 Start herdr, then run pi inside it:
 
