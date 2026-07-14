@@ -1,6 +1,5 @@
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -51,11 +50,28 @@ export function parseModelConfig(rawConfig: unknown, source = "config.json"): Mo
       if (typeof model !== "string" || model.trim() === "") {
         invalidModelConfig(source, `models.agents.${agent} must be a non-empty string`);
       }
-      agents[agent] = model.trim();
+      Object.defineProperty(agents, agent, {
+        value: model.trim(),
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
     }
   }
 
   return { default: defaultModel, agents };
+}
+
+export function resolveModelDefault(
+  agentName: string | undefined,
+  agentModel: string | undefined,
+  config: ModelConfig,
+): string | undefined {
+  if (agentModel) return agentModel;
+  if (agentName && Object.hasOwn(config.agents, agentName)) {
+    return config.agents[agentName];
+  }
+  return config.default;
 }
 
 export function loadModelConfig(configPath = DEFAULT_MODEL_CONFIG_PATH): ModelConfig {

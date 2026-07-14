@@ -90,15 +90,15 @@ Subagent tabs and panes are created without stealing keyboard focus. Launch comm
 
 ### Bundled Agents
 
-| Agent             | Default runtime | Role                                                                                     |
-| ----------------- | --------------- | ---------------------------------------------------------------------------------------- |
-| **planner**       | Inherit parent  | Brainstorming — clarifies requirements, explores approaches, writes plans, creates todos |
-| **scout**         | Inherit parent  | Fast codebase reconnaissance — maps files, patterns, conventions                         |
-| **worker**        | Inherit parent  | Implements tasks from todos — writes code, runs tests, makes polished commits            |
-| **reviewer**      | Inherit parent  | Reviews code for bugs, security issues, correctness                                      |
-| **visual-tester** | Inherit parent  | Visual QA via Chrome CDP — screenshots, responsive testing, interaction testing          |
+| Agent             | Default runtime       | Role                                                                                     |
+| ----------------- | --------------------- | ---------------------------------------------------------------------------------------- |
+| **planner**       | Config, then parent   | Brainstorming — clarifies requirements, explores approaches, writes plans, creates todos |
+| **scout**         | Config, then parent   | Fast codebase reconnaissance — maps files, patterns, conventions                         |
+| **worker**        | Config, then parent   | Implements tasks from todos — writes code, runs tests, makes polished commits            |
+| **reviewer**      | Config, then parent   | Reviews code for bugs, security issues, correctness                                      |
+| **visual-tester** | Config, then parent   | Visual QA via Chrome CDP — screenshots, responsive testing, interaction testing          |
 
-Bundled agents inherit the parent model and thinking level. The orchestrating agent can override either field for a specific task using an exact authenticated model ID and a supported Pi thinking level. Prefer changing thinking before changing models.
+Bundled agents use model defaults from `config.json` when configured; otherwise they inherit the parent model. Thinking defaults still come from agent frontmatter or the parent level. The orchestrating agent can override either field for a specific task using an exact authenticated model ID and a supported Pi thinking level. Prefer changing thinking before changing models.
 
 Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global** (`~/.pi/agent/agents/`) > **package-bundled**. Override any bundled agent by placing your own version in the higher-priority location.
 
@@ -170,10 +170,20 @@ cp config.json.example config.json
     "enabled": true
   },
   "models": {
-    "default": "anthropic/claude-sonnet-4-6",
+    "agents": {}
+  }
+}
+```
+
+The copyable example is model-neutral, so it works without requiring credentials for a specific provider. To configure models, replace the empty section with exact IDs from your authenticated model catalog:
+
+```json
+{
+  "models": {
+    "default": "your-provider/your-default-model",
     "agents": {
-      "scout": "openai/gpt-5-mini",
-      "reviewer": "anthropic/claude-sonnet-4-6"
+      "scout": "your-provider/your-fast-model",
+      "reviewer": "your-provider/your-review-model"
     }
   }
 }
@@ -210,7 +220,7 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `agent`                | string  | —              | Load defaults from agent definition                                                               |
 | `fork`                 | boolean | `false`        | Force the full-context fork mode for this spawn, overriding any agent `session-mode` frontmatter  |
 | `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit`. |
-| `model`                | string  | parent model   | Exact authenticated `provider/model-id`; omit to inherit the parent                               |
+| `model`                | string  | configured or parent | Exact authenticated `provider/model-id`; resolution is tool argument → agent frontmatter → per-agent config → global config → parent |
 | `thinking`             | string  | parent level   | Pi thinking level (`off` through `max`); omit to inherit the parent                                |
 | `systemPrompt`         | string  | —              | Append to system prompt                                                                           |
 | `skills`               | string  | —              | Comma-separated skill names                                                                       |

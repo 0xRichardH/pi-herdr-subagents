@@ -25,7 +25,11 @@ import {
 } from "../pi-extension/subagents/session.ts";
 
 import { isHerdrAvailable, __herdrTest__ } from "../pi-extension/subagents/herdr.ts";
-import { loadModelConfig, parseModelConfig } from "../pi-extension/subagents/model-config.ts";
+import {
+  loadModelConfig,
+  parseModelConfig,
+  resolveModelDefault,
+} from "../pi-extension/subagents/model-config.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -923,6 +927,37 @@ describe("model configuration", () => {
   it("loads no model overrides when config.json is absent", () => {
     const config = loadModelConfig(join(createTestDir(), "missing-config.json"));
     assert.deepEqual(config, { agents: {} });
+  });
+
+  it("resolves frontmatter, per-agent, global, and parent fallback precedence", () => {
+    const config = parseModelConfig({
+      models: {
+        default: "fake/global",
+        agents: { scout: "fake/scout" },
+      },
+    });
+
+    assert.equal(resolveModelDefault("scout", "fake/frontmatter", config), "fake/frontmatter");
+    assert.equal(resolveModelDefault("scout", undefined, config), "fake/scout");
+    assert.equal(resolveModelDefault("reviewer", undefined, config), "fake/global");
+    assert.equal(resolveModelDefault(undefined, undefined, { agents: {} }), undefined);
+  });
+
+  it("does not read inherited object properties as agent model defaults", () => {
+    const config = parseModelConfig({ models: { agents: {} } });
+    for (const agent of ["constructor", "toString", "__proto__"]) {
+      assert.equal(resolveModelDefault(agent, undefined, config), undefined);
+    }
+  });
+
+  it("supports reserved property names when explicitly configured", () => {
+    const config = parseModelConfig(
+      JSON.parse(
+        '{"models":{"agents":{"constructor":"fake/constructor","__proto__":"fake/proto"}}}',
+      ),
+    );
+    assert.equal(resolveModelDefault("constructor", undefined, config), "fake/constructor");
+    assert.equal(resolveModelDefault("__proto__", undefined, config), "fake/proto");
   });
 
   it("rejects invalid model configuration", () => {

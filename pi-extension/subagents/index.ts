@@ -36,7 +36,7 @@ import {
   type ResolvedRuntimePlan,
   type ThinkingLevel,
 } from "./runtime-routing.ts";
-import { loadModelConfig } from "./model-config.ts";
+import { loadModelConfig, resolveModelDefault } from "./model-config.ts";
 
 import {
   findLastAssistantMessage,
@@ -1113,13 +1113,10 @@ async function launchSubagent(
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
   if (!ctx.model) throw new Error("Subagent launch requires a resolved parent model");
-  const configuredModel = params.agent
-    ? modelConfig.agents[params.agent] ?? modelConfig.default
-    : modelConfig.default;
   const runtimePlan = resolveRuntimePlan(
     { model: params.model, thinking: params.thinking },
     {
-      model: agentDefs?.model ?? configuredModel,
+      model: resolveModelDefault(params.agent, agentDefs?.model, modelConfig),
       thinking: agentDefs?.thinking,
     },
     { provider: ctx.model.provider, modelId: ctx.model.id, thinking: parentThinking },
@@ -2464,7 +2461,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         return;
       }
 
-      // Rename workspace and tab to show this is a planning session
+      // Rename the tab to show this is a planning session
       if (isTerminalAvailable()) {
         try {
           const label = task.length > 40 ? task.slice(0, 40) + "..." : task;
@@ -2484,4 +2481,3 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     },
   });
 }
-// test
