@@ -90,15 +90,15 @@ Subagent tabs and panes are created without stealing keyboard focus. Launch comm
 
 ### Bundled Agents
 
-| Agent             | Default runtime | Role                                                                                     |
-| ----------------- | --------------- | ---------------------------------------------------------------------------------------- |
-| **planner**       | Inherit parent  | Brainstorming — clarifies requirements, explores approaches, writes plans, creates todos |
-| **scout**         | Inherit parent  | Fast codebase reconnaissance — maps files, patterns, conventions                         |
-| **worker**        | Inherit parent  | Implements tasks from todos — writes code, runs tests, makes polished commits            |
-| **reviewer**      | Inherit parent  | Reviews code for bugs, security issues, correctness                                      |
-| **visual-tester** | Inherit parent  | Visual QA via Chrome CDP — screenshots, responsive testing, interaction testing          |
+| Agent             | Default runtime       | Role                                                                                     |
+| ----------------- | --------------------- | ---------------------------------------------------------------------------------------- |
+| **planner**       | Config, then parent   | Brainstorming — clarifies requirements, explores approaches, writes plans, creates todos |
+| **scout**         | Config, then parent   | Fast codebase reconnaissance — maps files, patterns, conventions                         |
+| **worker**        | Config, then parent   | Implements tasks from todos — writes code, runs tests, makes polished commits            |
+| **reviewer**      | Config, then parent   | Reviews code for bugs, security issues, correctness                                      |
+| **visual-tester** | Config, then parent   | Visual QA via Chrome CDP — screenshots, responsive testing, interaction testing          |
 
-Bundled agents inherit the parent model and thinking level. The orchestrating agent can override either field for a specific task using an exact authenticated model ID and a supported Pi thinking level. Prefer changing thinking before changing models.
+Bundled agents use model defaults from `config.json` when configured; otherwise they inherit the parent model. Thinking defaults still come from agent frontmatter or the parent level. The orchestrating agent can override either field for a specific task using an exact authenticated model ID and a supported Pi thinking level. Prefer changing thinking before changing models.
 
 Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global** (`~/.pi/agent/agents/`) > **package-bundled**. Override any bundled agent by placing your own version in the higher-priority location.
 
@@ -168,9 +168,28 @@ cp config.json.example config.json
 {
   "status": {
     "enabled": true
+  },
+  "models": {
+    "agents": {}
   }
 }
 ```
+
+The copyable example is model-neutral, so it works without requiring credentials for a specific provider. To configure models, replace the empty section with exact IDs from your authenticated model catalog:
+
+```json
+{
+  "models": {
+    "default": "your-provider/your-default-model",
+    "agents": {
+      "scout": "your-provider/your-fast-model",
+      "reviewer": "your-provider/your-review-model"
+    }
+  }
+}
+```
+
+`models.default` sets the model for subagents that do not specify a model. `models.agents` sets per-agent defaults, keyed by the agent name passed to `subagent({ agent: ... })`. Explicit `model` tool arguments take precedence, followed by agent frontmatter, per-agent config, the global default, and finally the parent model. Model values must be exact authenticated `provider/model-id` references.
 
 `config.json` is gitignored so local overrides don't get committed.
 
@@ -179,7 +198,7 @@ cp config.json.example config.json
 ## Spawning Subagents
 
 ```typescript
-// Named agent with defaults from agent definition
+// Named agent with defaults from agent definition or config.json
 subagent({ name: "Scout", agent: "scout", task: "Analyze the codebase..." });
 
 // Force a full-context fork for this spawn
@@ -201,7 +220,7 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `agent`                | string  | —              | Load defaults from agent definition                                                               |
 | `fork`                 | boolean | `false`        | Force the full-context fork mode for this spawn, overriding any agent `session-mode` frontmatter  |
 | `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit`. |
-| `model`                | string  | parent model   | Exact authenticated `provider/model-id`; omit to inherit the parent                               |
+| `model`                | string  | configured or parent | Exact authenticated `provider/model-id`; resolution is tool argument → agent frontmatter → per-agent config → global config → parent |
 | `thinking`             | string  | parent level   | Pi thinking level (`off` through `max`); omit to inherit the parent                                |
 | `systemPrompt`         | string  | —              | Append to system prompt                                                                           |
 | `skills`               | string  | —              | Comma-separated skill names                                                                       |
@@ -278,12 +297,7 @@ Phase 4: Execute          → Scout + sequential workers implement todos
 Phase 5: Review           → Reviewer subagent checks all changes
 ```
 
-Tab/window titles update to show current phase:
-
-```
-🔍 Investigating: dark mode → 💬 Planning: dark mode
-→ 🔨 Executing: 1/3 → 🔎 Reviewing → ✅ Done
-```
+The parent workspace and tab names stay unchanged. Subagents are created in newly named tabs or panes for each phase.
 
 ---
 

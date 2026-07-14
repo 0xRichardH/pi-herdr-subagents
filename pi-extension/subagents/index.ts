@@ -22,8 +22,6 @@ import {
   closePane,
   interruptPane,
   shellQuote,
-  renameCurrentTab,
-  renameCurrentWorkspace,
   readPane,
   readPaneAsync,
   inspectPane,
@@ -37,6 +35,7 @@ import {
   type ResolvedRuntimePlan,
   type ThinkingLevel,
 } from "./runtime-routing.ts";
+import { loadModelConfig, resolveModelDefault } from "./model-config.ts";
 
 import {
   findLastAssistantMessage,
@@ -468,6 +467,7 @@ function getArtifactDir(sessionDir: string, sessionId: string): string {
 }
 
 const statusConfig = loadStatusConfig();
+const modelConfig = loadModelConfig();
 
 function resolveResultPresentation(
   result: Pick<
@@ -1114,7 +1114,10 @@ async function launchSubagent(
   if (!ctx.model) throw new Error("Subagent launch requires a resolved parent model");
   const runtimePlan = resolveRuntimePlan(
     { model: params.model, thinking: params.thinking },
-    { model: agentDefs?.model, thinking: agentDefs?.thinking },
+    {
+      model: resolveModelDefault(params.agent, agentDefs?.model, modelConfig),
+      thinking: agentDefs?.thinking,
+    },
     { provider: ctx.model.provider, modelId: ctx.model.id, thinking: parentThinking },
     wrapPiModelRegistry(ctx.modelRegistry),
   );
@@ -2457,17 +2460,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         return;
       }
 
-      // Rename workspace and tab to show this is a planning session
-      if (isTerminalAvailable()) {
-        try {
-          const label = task.length > 40 ? task.slice(0, 40) + "..." : task;
-          renameCurrentWorkspace(`🎯 ${label}`);
-          renameCurrentTab(`🎯 Plan: ${label}`);
-        } catch {
-          // non-critical -- do not block the plan
-        }
-      }
-
       // Load the plan skill from the subagents extension directory
       const planSkillPath = join(SUBAGENTS_DIR, "plan-skill.md");
       let content = readFileSync(planSkillPath, "utf8");
@@ -2478,4 +2470,3 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     },
   });
 }
-// test

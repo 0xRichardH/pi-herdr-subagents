@@ -1,6 +1,6 @@
 {
   "name": "pi-herdr-subagents",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Interactive subagents for pi running in herdr",
   "keywords": [
     "pi-package"
