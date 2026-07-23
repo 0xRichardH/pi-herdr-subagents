@@ -1985,23 +1985,25 @@ describe("tool registration", () => {
 });
 
 describe("subagent parent lifecycle", () => {
-  it("preserves active subagents during extension reload", () => {
-    const abortController = new AbortController();
-    const agents = new Map([["child", {
-      abortController,
-      lifecycle: createLifecycle(1_000),
-    }]]);
+  it("preserves active subagents while replacing the parent session", () => {
+    for (const reason of ["reload", "new", "resume", "fork"]) {
+      const abortController = new AbortController();
+      const agents = new Map([["child", {
+        abortController,
+        lifecycle: createLifecycle(1_000),
+      }]]);
 
-    cleanupSubagentsForShutdown("reload", agents);
+      cleanupSubagentsForShutdown(reason, agents);
 
-    assert.equal(shouldPreserveSubagentsOnShutdown("reload"), true);
-    assert.equal(abortController.signal.aborted, false);
-    assert.equal(shouldDeliverSubagentCompletion(agents.get("child")!), true);
-    assert.equal(agents.size, 1);
+      assert.equal(shouldPreserveSubagentsOnShutdown(reason), true);
+      assert.equal(abortController.signal.aborted, false);
+      assert.equal(shouldDeliverSubagentCompletion(agents.get("child")!), true);
+      assert.equal(agents.size, 1);
+    }
   });
 
   it("aborts and clears active subagents during final shutdown", () => {
-    for (const reason of ["quit", "new", "resume", "fork", undefined]) {
+    for (const reason of ["quit", undefined]) {
       const abortController = new AbortController();
       const running = { abortController, lifecycle: createLifecycle(1_000) };
       const agents = new Map([["child", running]]);

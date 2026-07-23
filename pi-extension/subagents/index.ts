@@ -575,7 +575,7 @@ const runtime: SubagentRuntime =
 const runningSubagents = runtime.runningSubagents;
 
 export function shouldPreserveSubagentsOnShutdown(reason: unknown): boolean {
-  return reason === "reload";
+  return reason === "reload" || reason === "new" || reason === "resume" || reason === "fork";
 }
 
 export function cleanupSubagentsForShutdown(
