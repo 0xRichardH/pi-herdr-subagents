@@ -17,7 +17,8 @@
  */
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   getAvailableBackends,
   setBackend,
@@ -32,6 +33,7 @@ import {
   uniqueId,
   trackTempFile,
   readPane,
+  runInPane,
   PI_TIMEOUT,
   type TestEnv,
 } from "./harness.ts";
@@ -106,6 +108,45 @@ for (const backend of backends) {
         assert.equal(header.type, "session", "First entry should be session header");
         assert.ok(header.id, "Session header should have an id");
       }
+    });
+
+    it("delivers completion after the parent starts a new session", async () => {
+      const id = uniqueId();
+      const startFile = `/tmp/pi-integ-switch-start-${id}.txt`;
+      const markerFile = `/tmp/pi-integ-switch-done-${id}.txt`;
+      const childDir = join(env.dir, "sibling-project");
+      mkdirSync(childDir);
+      trackTempFile(env, startFile);
+      trackTempFile(env, markerFile);
+
+      const surface = createTrackedSurface(env, `switch-${id}`);
+      await sleep(1000);
+
+      const task = [
+        `Call the subagent tool with these EXACT parameters:`,
+        `  name: "Switch-${id}"`,
+        `  agent: "test-echo"`,
+        `  cwd: "${childDir}"`,
+        `  task: "Run this bash command: echo 'START_${id}' > '${startFile}'; sleep 12; echo 'DONE_${id}' > '${markerFile}'"`,
+        `Do not do anything else. Just call the subagent tool once.`,
+      ].join("\n");
+
+      startPi(surface, env.dir, task);
+      await waitForFile(startFile, PI_TIMEOUT, /START_/);
+      await sleep(1000);
+
+      runInPane(surface, "/new");
+
+      const content = await waitForFile(markerFile, PI_TIMEOUT, /DONE_/);
+      assert.ok(content.includes(`DONE_${id}`), "Subagent should finish after the parent session switch");
+
+      const screen = await waitForScreen(
+        surface,
+        new RegExp(`Switch-${id}.*completed|Sub-agent.*Switch-${id}`, "i"),
+        PI_TIMEOUT,
+        300,
+      );
+      assert.match(screen, new RegExp(`Switch-${id}`, "i"));
     });
 
     // ── In-progress activity snapshots ──

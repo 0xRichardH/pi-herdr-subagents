@@ -12,6 +12,7 @@ import {
   mkdirSync,
   copyFileSync,
   unlinkSync,
+  rmSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import {
@@ -183,6 +184,7 @@ interface AgentDefaults {
   sessionMode?: SubagentSessionMode;
   cwd?: string;
   cli?: string;
+  cliModel?: string;
   body?: string;
   disableModelInvocation?: boolean;
 }
@@ -287,6 +289,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
     sessionMode: parseSessionMode(getFrontmatterValue(frontmatter, "session-mode")),
     cwd: getFrontmatterValue(frontmatter, "cwd"),
     cli: getFrontmatterValue(frontmatter, "cli"),
+    cliModel: getFrontmatterValue(frontmatter, "cli-model"),
     body: body || undefined,
     disableModelInvocation:
       getFrontmatterValue(frontmatter, "disable-model-invocation")?.toLowerCase() === "true",
@@ -438,6 +441,61 @@ function formatElapsed(seconds: number): string {
  * (for example direnv/devenv), so the delay is configurable for users who hit
  * dropped commands. Keep the historical default at 500ms.
  */
+function captureWorkspaceBaseline(cwd: string): Set<string> | undefined {
+  try {
+    const output = execFileSync(
+      "git",
+      ["status", "--porcelain=v1", "--untracked-files=all", "-z"],
+      { cwd, encoding: "utf8" },
+    );
+    return new Set(
+      output
+        .split("\0")
+        .filter(Boolean)
+        .map((entry) => entry.slice(3)),
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+function guardClaudeWorkspace(running: RunningSubagent): string | undefined {
+  if (!running.workspaceBaseline || !running.workspaceCwd) return;
+
+  try {
+    const output = execFileSync(
+      "git",
+      ["status", "--porcelain=v1", "--untracked-files=all", "-z"],
+      { cwd: running.workspaceCwd, encoding: "utf8" },
+    );
+    const changed = output.split("\0").filter(Boolean).map((entry) => ({
+      status: entry.slice(0, 2),
+      path: entry.slice(3),
+    }));
+    const newPaths = changed.filter(({ path }) => !running.workspaceBaseline!.has(path));
+    const cleaned: string[] = [];
+
+    for (const { status, path } of newPaths) {
+      if (path.startsWith(".reviews/")) continue;
+      if (status === "??") {
+        rmSync(`${running.workspaceCwd}/${path}`, { recursive: true, force: true });
+      } else {
+        execFileSync("git", ["restore", "--staged", "--worktree", "--", path], {
+          cwd: running.workspaceCwd,
+          stdio: "ignore",
+        });
+      }
+      cleaned.push(path);
+    }
+
+    return cleaned.length > 0
+      ? `Claude workspace guard reverted newly introduced paths: ${cleaned.join(", ")}`
+      : undefined;
+  } catch (error: any) {
+    return `Claude workspace guard failed: ${error?.message ?? String(error)}`;
+  }
+}
+
 function getShellReadyDelayMs(): number {
   const raw = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS?.trim();
   const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
@@ -555,6 +613,9 @@ interface RunningSubagent {
   interactive: boolean;
   /** Parent-resolved model/thinking selection and provenance. */
   runtimePlan: ResolvedRuntimePlan | undefined;
+  /** Baseline used to clean up newly introduced Claude workspace changes. */
+  workspaceBaseline?: Set<string>;
+  workspaceCwd?: string;
 }
 
 interface SubagentRuntime {
@@ -575,7 +636,7 @@ const runtime: SubagentRuntime =
 const runningSubagents = runtime.runningSubagents;
 
 export function shouldPreserveSubagentsOnShutdown(reason: unknown): boolean {
-  return reason === "reload";
+  return reason === "reload" || reason === "new" || reason === "resume" || reason === "fork";
 }
 
 export function cleanupSubagentsForShutdown(
@@ -1136,6 +1197,9 @@ async function launchSubagent(
   const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
   const sessionDir = getDefaultSessionDirFor(targetCwdForSession, effectiveAgentDir);
+  const workspaceBaseline = agentDefs?.cli === "claude"
+    ? captureWorkspaceBaseline(targetCwdForSession)
+    : undefined;
 
   // Generate a deterministic session file path for this subagent.
   // This eliminates race conditions when multiple agents launch simultaneously —
@@ -1212,8 +1276,9 @@ async function launchSubagent(
       cmdParts.push("--plugin-dir", shellQuote(pluginDir));
     }
 
-    if (effectiveModel) {
-      cmdParts.push("--model", shellQuote(effectiveModel));
+    const cliModel = agentDefs.cliModel ?? effectiveModel;
+    if (cliModel) {
+      cmdParts.push("--model", shellQuote(cliModel));
     }
 
     const sp = params.systemPrompt ?? agentDefs.body;
@@ -1262,6 +1327,8 @@ async function launchSubagent(
       sentinelFile,
       interactive: effectiveInteractive,
       runtimePlan,
+      workspaceBaseline,
+      workspaceCwd: targetCwdForSession,
       lifecycle: markProcessRunning(createLifecycle(startTime), Date.now()),
     };
 
@@ -1463,6 +1530,7 @@ async function watchSubagent(
 
     if (running.cli === "claude") {
       // Claude Code result extraction
+      const guardMessage = guardClaudeWorkspace(running);
       let summary = "";
 
       if (running.sentinelFile) {
@@ -1482,6 +1550,7 @@ async function watchSubagent(
           ? `Claude Code exited with code ${result.exitCode}`
           : "Claude Code exited without output";
       }
+      if (guardMessage) summary += `\n\n${guardMessage}`;
 
       // Copy Claude session transcript
       let sessionId: string | null = null;
@@ -1560,6 +1629,7 @@ async function watchSubagent(
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
     };
   } catch (err: any) {
+    const guardMessage = running.cli === "claude" ? guardClaudeWorkspace(running) : undefined;
     try {
       closePane(surface);
     } catch {}
@@ -1575,7 +1645,7 @@ async function watchSubagent(
       return {
         name,
         task,
-        summary: "Subagent cancelled.",
+        summary: guardMessage ? `Subagent cancelled.\n\n${guardMessage}` : "Subagent cancelled.",
         exitCode: 1,
         elapsed: Math.floor((Date.now() - startTime) / 1000),
         error: "cancelled",
@@ -1585,7 +1655,9 @@ async function watchSubagent(
     return {
       name,
       task,
-      summary: `Subagent error: ${err?.message ?? String(err)}`,
+      summary: guardMessage
+        ? `Subagent error: ${err?.message ?? String(err)}\n\n${guardMessage}`
+        : `Subagent error: ${err?.message ?? String(err)}`,
       exitCode: 1,
       elapsed: Math.floor((Date.now() - startTime) / 1000),
       error: err?.message ?? String(err),

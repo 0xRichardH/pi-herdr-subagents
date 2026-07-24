@@ -96,6 +96,7 @@ Subagent tabs and panes are created without stealing keyboard focus. Launch comm
 | **scout**         | Config, then parent   | Fast codebase reconnaissance — maps files, patterns, conventions                         |
 | **worker**        | Config, then parent   | Implements tasks from todos — writes code, runs tests, makes polished commits            |
 | **reviewer**      | Config, then parent   | Reviews code for bugs, security issues, correctness                                      |
+| **adversarial-reviewer** | Grok + GPT + Claude | Three-model Optimizer/Skeptic review with evidence-backed findings                      |
 | **visual-tester** | Config, then parent   | Visual QA via Chrome CDP — screenshots, responsive testing, interaction testing          |
 
 Bundled agents use model defaults from `config.json` when configured; otherwise they inherit the parent model. Thinking defaults still come from agent frontmatter or the parent level. The orchestrating agent can override either field for a specific task using an exact authenticated model ID and a supported Pi thinking level. Prefer changing thinking before changing models.
@@ -114,7 +115,7 @@ Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global**
 5. Main agent processes result     → continues with new context
 ```
 
-Multiple subagents run concurrently — each steers its result back independently as it finishes. The live widget above the input tracks every agent still in flight:
+Multiple subagents run concurrently — each steers its result back independently as it finishes. Active watchers survive parent `/reload`, `/new`, `/resume`, and `/fork` transitions, so completion is delivered into the replacement session. Quitting Pi still stops parent-side delivery. The live widget above the input tracks every agent still in flight:
 
 ```
 ╭─ Subagents ──────────────────── 1 active · 2 open ─╮
@@ -339,7 +340,8 @@ You are a specialized agent that does X...
 | ------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `name`        | string  | Agent name (used in `agent: "my-agent"`)                                                                                                                                                                                                                                    |
 | `description` | string  | Shown in `subagents_list` output                                                                                                                                                                                                                                            |
-| `model`       | string  | Optional exact authenticated model default; omit to inherit the parent                                                                                                                                                                                                      |
+| `model`       | string  | Optional exact authenticated Pi model default; omit to inherit the parent                                                                                                                                                                                                   |
+| `cli-model`   | string  | Optional model name passed to an external CLI agent such as Claude; separate from Pi model routing                                                                                                                                                                             |
 | `thinking`    | string  | Optional Pi thinking default (`off` through `max`); omit to inherit the parent                                                                                                                                                                                                                                 |
 | `tools`       | string  | Comma-separated **native pi tools only**: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`                                                                                                                                                                             |
 | `skills`      | string  | Comma-separated skill names to auto-load                                                                                                                                                                                                                                    |
