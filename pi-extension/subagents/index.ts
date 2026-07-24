@@ -184,6 +184,7 @@ interface AgentDefaults {
   sessionMode?: SubagentSessionMode;
   cwd?: string;
   cli?: string;
+  cliModel?: string;
   body?: string;
   disableModelInvocation?: boolean;
 }
@@ -288,6 +289,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
     sessionMode: parseSessionMode(getFrontmatterValue(frontmatter, "session-mode")),
     cwd: getFrontmatterValue(frontmatter, "cwd"),
     cli: getFrontmatterValue(frontmatter, "cli"),
+    cliModel: getFrontmatterValue(frontmatter, "cli-model"),
     body: body || undefined,
     disableModelInvocation:
       getFrontmatterValue(frontmatter, "disable-model-invocation")?.toLowerCase() === "true",
@@ -1274,8 +1276,9 @@ async function launchSubagent(
       cmdParts.push("--plugin-dir", shellQuote(pluginDir));
     }
 
-    if (effectiveModel) {
-      cmdParts.push("--model", shellQuote(effectiveModel));
+    const cliModel = agentDefs.cliModel ?? effectiveModel;
+    if (cliModel) {
+      cmdParts.push("--model", shellQuote(cliModel));
     }
 
     const sp = params.systemPrompt ?? agentDefs.body;

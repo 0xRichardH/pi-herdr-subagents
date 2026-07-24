@@ -1,8 +1,8 @@
 ---
 name: claude-reviewer
 description: Claude CLI reviewer for report-only code review
-model: sonnet
 cli: claude
+cli-model: sonnet
 auto-exit: true
 system-prompt: append
 ---

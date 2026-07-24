@@ -1129,6 +1129,7 @@ describe("subagent discovery", () => {
       reviewer: false,
       planner: true,
       "visual-tester": false,
+      "claude-reviewer": false,
     } as const;
 
     for (const [name, interactive] of Object.entries(expectedInteraction)) {
@@ -1142,6 +1143,11 @@ describe("subagent discovery", () => {
         `${name} should preserve its interaction mode`,
       );
     }
+
+    const claude = testApi.loadAgentDefaults("claude-reviewer");
+    assert.ok(claude, "expected bundled Claude reviewer to be discoverable");
+    assert.equal(claude.model, undefined, "Claude CLI reviewer should inherit Pi routing");
+    assert.equal(claude.cliModel, "sonnet");
   });
 
   it("ignores invalid session-mode values", async () => {
