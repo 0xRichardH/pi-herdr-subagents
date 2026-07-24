@@ -96,6 +96,7 @@ Subagent tabs and panes are created without stealing keyboard focus. Launch comm
 | **scout**         | Config, then parent   | Fast codebase reconnaissance — maps files, patterns, conventions                         |
 | **worker**        | Config, then parent   | Implements tasks from todos — writes code, runs tests, makes polished commits            |
 | **reviewer**      | Config, then parent   | Reviews code for bugs, security issues, correctness                                      |
+| **adversarial-reviewer** | Grok + GPT          | Two-model Optimizer/Skeptic review with evidence-backed findings                         |
 | **visual-tester** | Config, then parent   | Visual QA via Chrome CDP — screenshots, responsive testing, interaction testing          |
 
 Bundled agents use model defaults from `config.json` when configured; otherwise they inherit the parent model. Thinking defaults still come from agent frontmatter or the parent level. The orchestrating agent can override either field for a specific task using an exact authenticated model ID and a supported Pi thinking level. Prefer changing thinking before changing models.
