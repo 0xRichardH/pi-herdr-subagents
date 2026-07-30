@@ -48,7 +48,7 @@ import {
   getSubagentActivityFile,
   readSubagentActivityFile,
 } from "../pi-extension/subagents/activity.ts";
-import {
+import subagentDoneExtension, {
   shouldMarkUserTookOver,
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
@@ -1386,6 +1386,62 @@ describe("subagent-done.ts", () => {
       // failure detail; staying open would just strand the worker.
       const messages = [{ role: "assistant", stopReason: "error", errorMessage: "529 overloaded" }];
       assert.equal(shouldAutoExitOnAgentEnd(false, messages), true);
+    });
+  });
+
+  describe("auto-exit lifecycle", () => {
+    it("waits for agent_settled and uses the latest agent result", () => {
+      withTempDir((dir) => {
+        const previousAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
+        const previousSession = process.env.PI_SUBAGENT_SESSION;
+        const sessionFile = join(dir, "child.jsonl");
+        process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+        process.env.PI_SUBAGENT_SESSION = sessionFile;
+
+        try {
+          const { api, eventHandlers } = createMockExtensionApi();
+          subagentDoneExtension(api);
+          const agentEnd = eventHandlers.get("agent_end")![0];
+          const agentSettled = eventHandlers.get("agent_settled")![0];
+          let shutdowns = 0;
+          const ctx = { shutdown: () => { shutdowns += 1; } };
+
+          agentEnd({ messages: [{ role: "assistant", stopReason: "stop" }] }, ctx);
+          assert.equal(shutdowns, 0, "agent_end must not shut down before Pi settles");
+          assert.equal(existsSync(`${sessionFile}.exit`), false);
+
+          agentEnd({ messages: [{ role: "assistant", stopReason: "error", errorMessage: "latest failure" }] }, ctx);
+          agentSettled({ type: "agent_settled" }, ctx);
+
+          assert.equal(shutdowns, 1);
+          assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), {
+            type: "error",
+            errorMessage: "latest failure",
+            stopReason: "error",
+          });
+        } finally {
+          restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
+          restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
+        }
+      });
+    });
+
+    it("preserves an aborted worker after agent_settled", () => {
+      const previousAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
+      process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+      try {
+        const { api, eventHandlers } = createMockExtensionApi();
+        subagentDoneExtension(api);
+        let shutdowns = 0;
+        const ctx = { shutdown: () => { shutdowns += 1; } };
+        eventHandlers.get("agent_end")![0]({
+          messages: [{ role: "assistant", stopReason: "aborted" }],
+        }, ctx);
+        eventHandlers.get("agent_settled")![0]({ type: "agent_settled" }, ctx);
+        assert.equal(shutdowns, 0);
+      } finally {
+        restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
+      }
     });
   });
 

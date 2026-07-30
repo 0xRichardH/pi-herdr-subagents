@@ -150,6 +150,7 @@ export default function (pi: ExtensionAPI) {
 
   let userTookOver = false;
   let agentStarted = false;
+  let latestAgentMessages: any[] | undefined;
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
@@ -178,22 +179,28 @@ export default function (pi: ExtensionAPI) {
     recorder.agentStart();
   });
 
-  pi.on("agent_end", (event, ctx) => {
-    const messages = (event as any).messages as any[] | undefined;
-    const shouldExit = autoExit && shouldAutoExitOnAgentEnd(userTookOver, messages);
+  pi.on("agent_end", (event) => {
+    // agent_end is not terminal: Pi may compact and automatically retry after
+    // this event. Keep the latest result, but do not publish completion or
+    // shut down until agent_settled confirms no continuation will run.
+    latestAgentMessages = (event as any).messages as any[] | undefined;
+    recorder.agentEndWaiting();
+  });
+
+  pi.on("agent_settled", (_event, ctx) => {
+    const shouldExit = autoExit
+      && shouldAutoExitOnAgentEnd(userTookOver, latestAgentMessages);
 
     if (shouldExit) {
       // Surface stopReason: "error" turns (auto-retry exhausted, provider
       // overload, etc.) to the parent via the .exit sidecar so the watcher
       // can report a clear failure with the underlying error message.
-      // Without this the parent would only see exit code 0 and a stale
-      // assistant message, mistaking the crash for a successful completion.
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       if (sessionFile) {
         try {
           writeFileSync(
             `${sessionFile}.exit`,
-            JSON.stringify(buildCompletionSidecar(messages)),
+            JSON.stringify(buildCompletionSidecar(latestAgentMessages)),
           );
         } catch {
           // Best effort — the watcher can still detect the terminal sentinel
@@ -206,10 +213,9 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    recorder.agentEndWaiting();
     if (autoExit) {
       // Reset any recorded manual input marker. Auto-exit is decided by whether
-      // the latest agent turn completed normally, not by who initiated it.
+      // the latest settled agent run completed normally, not by who initiated it.
       userTookOver = false;
     }
   });
