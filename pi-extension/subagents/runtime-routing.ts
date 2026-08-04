@@ -76,6 +76,13 @@ export interface ResolvedRuntimePlan {
   runtimeMismatch?: string;
 }
 
+export function modelForCli(
+  cli: "claude" | "pi",
+  runtimePlan: Pick<ResolvedRuntimePlan, "model" | "modelId">,
+): string {
+  return cli === "claude" ? runtimePlan.modelId : runtimePlan.model;
+}
+
 export class RuntimeResolutionError extends Error {
   constructor(message: string) {
     super(message);

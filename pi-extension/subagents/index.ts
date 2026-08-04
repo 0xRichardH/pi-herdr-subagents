@@ -29,6 +29,7 @@ import {
 import { waitForCompletion } from "./completion.ts";
 import {
   buildAuthenticatedModelCatalog,
+  modelForCli,
   resolveRuntimePlan,
   wrapPiModelRegistry,
   THINKING_LEVELS,
@@ -1121,7 +1122,6 @@ async function launchSubagent(
     { provider: ctx.model.provider, modelId: ctx.model.id, thinking: parentThinking },
     wrapPiModelRegistry(ctx.modelRegistry),
   );
-  const effectiveModel = runtimePlan.model;
   const effectiveTools = params.tools ?? agentDefs?.tools;
   const effectiveSkills = params.skills ?? agentDefs?.skills;
   const effectiveThinking = runtimePlan.thinking;
@@ -1200,6 +1200,7 @@ async function launchSubagent(
     : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
   // ── Claude Code CLI path ──
   if (agentDefs?.cli === "claude") {
+    const effectiveModel = modelForCli("claude", runtimePlan);
     const sentinelFile = `/tmp/pi-claude-${id}-done`;
     const pluginDir = join(SUBAGENTS_DIR, "plugin");
 
@@ -1272,6 +1273,7 @@ async function launchSubagent(
   // ── Pi CLI path ──
 
   // Build pi command
+  const effectiveModel = modelForCli("pi", runtimePlan);
   const parts: string[] = ["pi"];
   parts.push("--session", shellQuote(subagentSessionFile));
 
