@@ -307,7 +307,7 @@ export function buildAuthenticatedModelCatalog(
     lines.push(`- … ${models.length - visibleModels.length} more authenticated models omitted`);
   }
   lines.push(
-    "Default: inherit the parent model and thinking. Override thinking first; override model only when task capability, speed, cost, modality, or context warrants it.",
+    "Named agents keep their configured runtime when model and thinking overrides are omitted; bare spawns inherit the parent runtime. Pass overrides only when intentional.",
   );
   return lines.join("\n");
 }

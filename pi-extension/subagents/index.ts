@@ -98,12 +98,18 @@ const RUNTIME_KEY = Symbol.for("pi-subagents/runtime");
   }
 }
 
-function buildSubagentRoutingGuidelines(catalog?: string): string[] {
+function buildSubagentRoutingGuidelines(
+  modelCatalog?: string,
+  agentCatalog?: string,
+): string[] {
   return [
-    "For subagent model and thinking selection, inherit the parent runtime by omitting both fields unless the task warrants an override.",
-    "For subagent tasks, prefer changing thinking before changing models: minimal/low for bounded mechanical work, medium for ordinary implementation or review, and high+ for architecture, concurrency, security, or hard diagnosis.",
+    "Choose the named agent whose description most closely matches the task; do not use one agent as a generic default.",
+    "Omit model and thinking when invoking a named agent so its configured defaults apply. Passing either field is an explicit one-off override and takes precedence over agent frontmatter.",
+    "For a bare spawn, omit model and thinking to inherit the parent runtime.",
+    "When an intentional runtime override is necessary, prefer changing thinking before changing models: minimal/low for bounded mechanical work, medium for ordinary implementation or review, and high+ for architecture, concurrency, security, or hard diagnosis.",
     "When overriding a subagent model, use an exact authenticated provider/model-id from the live catalog below. Do not invent aliases or fuzzy names.",
-    catalog ?? "Authenticated subagent model catalog becomes available after session start.",
+    agentCatalog ?? "Available named subagent catalog becomes available after session start.",
+    modelCatalog ?? "Authenticated subagent model catalog becomes available after session start.",
   ];
 }
 
@@ -113,7 +119,7 @@ const ThinkingLevelSchema = Type.Union(
   THINKING_LEVELS.map((level) => Type.Literal(level)),
   {
     description:
-      "Pi thinking level. Omit to inherit the parent level. Prefer changing thinking before changing models: minimal/low for bounded mechanical work, medium for ordinary implementation or review, high+ for architecture, concurrency, security, or hard diagnosis.",
+      "Pi thinking level. Omit to use a named agent's thinking default, then the parent level. Passing a value explicitly overrides agent frontmatter for this spawn.",
   },
 );
 
@@ -123,7 +129,7 @@ const SubagentParams = Type.Object({
   agent: Type.Optional(
     Type.String({
       description:
-        "Agent name to load defaults from (e.g. 'worker', 'scout', 'reviewer'). Reads ~/.pi/agent/agents/<name>.md for model, tools, skills.",
+        "Agent name to load defaults from the available named subagent catalog. Agent frontmatter can provide model, thinking, tools, skills, and role instructions.",
     }),
   ),
   systemPrompt: Type.Optional(
@@ -132,7 +138,7 @@ const SubagentParams = Type.Object({
   model: Type.Optional(
     Type.String({
       description:
-        "Exact authenticated provider/model-id. Omit to inherit the parent model. Select another model only when task capability, speed, cost, modality, or context requirements warrant it.",
+        "Exact authenticated provider/model-id. Omit to use a named agent's model default, then the configured or parent model. Passing a value explicitly overrides agent frontmatter for this spawn.",
     }),
   ),
   thinking: Type.Optional(ThinkingLevelSchema),
@@ -314,6 +320,34 @@ function discoverAgentDefinitions(): ListedAgentDefinition[] {
   }
 
   return [...agents.values()];
+}
+
+function buildAvailableAgentCatalog(
+  agents: ListedAgentDefinition[],
+  limit = 24,
+): string {
+  const sorted = [...agents].sort((a, b) => a.name.localeCompare(b.name));
+  const visible = sorted.slice(0, limit);
+  const lines = [
+    "Available named subagents (choose by role; omit model/thinking to use agent defaults):",
+  ];
+
+  for (const agent of visible) {
+    const defaults = [
+      agent.model ? `model ${agent.model}` : undefined,
+      agent.thinking ? `thinking ${agent.thinking}` : undefined,
+    ].filter(Boolean);
+    const runtime = defaults.length > 0 ? `; defaults: ${defaults.join(", ")}` : "";
+    const description = agent.description ? ` — ${agent.description}` : "";
+    lines.push(`- ${agent.name} [${agent.source}${runtime}]${description}`);
+  }
+
+  if (visible.length === 0) lines.push("- none discovered; use a bare spawn");
+  if (sorted.length > visible.length) {
+    lines.push(`- … ${sorted.length - visible.length} more named subagents omitted`);
+  }
+
+  return lines.join("\n");
 }
 
 function resolveSubagentPaths(
@@ -562,6 +596,7 @@ interface SubagentRuntime {
   pi?: ExtensionAPI;
   latestCtx?: ExtensionContext;
   modelCatalog?: string;
+  agentCatalog?: string;
 }
 
 function createSubagentRuntime(): SubagentRuntime {
@@ -1601,7 +1636,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {
     runtime.latestCtx = ctx;
     runtime.modelCatalog = buildAuthenticatedModelCatalog(wrapPiModelRegistry(ctx.modelRegistry));
-    const refreshedGuidelines = buildSubagentRoutingGuidelines(runtime.modelCatalog);
+    runtime.agentCatalog = buildAvailableAgentCatalog(
+      discoverAgentDefinitions().filter((agent) => !agent.disableModelInvocation),
+    );
+    const refreshedGuidelines = buildSubagentRoutingGuidelines(
+      runtime.modelCatalog,
+      runtime.agentCatalog,
+    );
     subagentRoutingGuidelines.splice(0, subagentRoutingGuidelines.length, ...refreshedGuidelines);
     if (runningSubagents.size > 0) {
       startWidgetRefresh();
