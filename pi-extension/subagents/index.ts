@@ -35,7 +35,7 @@ import {
   type ResolvedRuntimePlan,
   type ThinkingLevel,
 } from "./runtime-routing.ts";
-import { loadModelConfig, resolveModelDefault } from "./model-config.ts";
+import { loadModelConfig, resolveModelDefault, type ModelConfig } from "./model-config.ts";
 
 import {
   findLastAssistantMessage,
@@ -310,12 +310,17 @@ function discoverAgentDefinitions(): ListedAgentDefinition[] {
   for (const { path: dir, source } of dirs) {
     if (!existsSync(dir)) continue;
     for (const file of readdirSync(dir).filter((entry) => entry.endsWith(".md"))) {
-      const parsed = parseAgentDefinition(
-        readFileSync(join(dir, file), "utf8"),
-        file.replace(/\.md$/, ""),
-      );
-      if (!parsed) continue;
-      agents.set(parsed.name, { ...parsed, source });
+      try {
+        const parsed = parseAgentDefinition(
+          readFileSync(join(dir, file), "utf8"),
+          file.replace(/\.md$/, ""),
+        );
+        if (!parsed) continue;
+        agents.set(parsed.name, { ...parsed, source });
+      } catch {
+        // Skip unreadable or racy entries rather than aborting discovery
+        // for every other agent definition.
+      }
     }
   }
 
@@ -325,6 +330,7 @@ function discoverAgentDefinitions(): ListedAgentDefinition[] {
 function buildAvailableAgentCatalog(
   agents: ListedAgentDefinition[],
   limit = 24,
+  config: ModelConfig = modelConfig,
 ): string {
   const sorted = [...agents].sort((a, b) => a.name.localeCompare(b.name));
   const visible = sorted.slice(0, limit);
@@ -333,8 +339,9 @@ function buildAvailableAgentCatalog(
   ];
 
   for (const agent of visible) {
+    const effectiveModel = resolveModelDefault(agent.name, agent.model, config);
     const defaults = [
-      agent.model ? `model ${agent.model}` : undefined,
+      effectiveModel ? `model ${effectiveModel}` : undefined,
       agent.thinking ? `thinking ${agent.thinking}` : undefined,
     ].filter(Boolean);
     const runtime = defaults.length > 0 ? `; defaults: ${defaults.join(", ")}` : "";
@@ -442,20 +449,11 @@ function resolveEffectiveInteractive(
 }
 
 function loadAgentDefaults(agentName: string): AgentDefaults | null {
-  const configDir = getAgentConfigDir();
-  const paths = [
-    join(process.cwd(), ".pi", "agents", `${agentName}.md`),
-    join(configDir, "agents", `${agentName}.md`),
-    join(getBundledAgentsDir(), `${agentName}.md`),
-  ];
-
-  for (const p of paths) {
-    if (!existsSync(p)) continue;
-    const parsed = parseAgentDefinition(readFileSync(p, "utf8"), agentName);
-    if (parsed) return parsed;
-  }
-
-  return null;
+  // Resolve through the same name-keyed map discoverAgentDefinitions() builds
+  // for the tool-guidance catalog, so a name advertised there always resolves
+  // to the same definition here — even when an agent's frontmatter `name`
+  // differs from its filename.
+  return discoverAgentDefinitions().find((agent) => agent.name === agentName) ?? null;
 }
 
 function formatElapsed(seconds: number): string {
@@ -1094,6 +1092,7 @@ export const __test__ = {
   renderSubagentWidgetLines,
   loadAgentDefaults,
   discoverAgentDefinitions,
+  buildAvailableAgentCatalog,
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
   resolveEffectiveAutoExit,

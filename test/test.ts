@@ -1354,6 +1354,84 @@ describe("subagent discovery", () => {
       assert.equal(loaded.disableModelInvocation, true);
     });
   });
+
+  it("resolves loadAgentDefaults by the frontmatter name the catalog advertises, not the filename", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "renamed-file-test-agent",
+        [
+          "name: aliased-test-agent",
+          "description: Frontmatter name differs from filename",
+          "model: anthropic/test-aliased",
+        ].join("\n"),
+        "You are the aliased agent.",
+      );
+
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+
+      const tool = registeredTools.find((tool) => tool.name === "subagents_list");
+      const result = await tool.execute();
+      const agents = result.details?.agents ?? [];
+      assert.ok(
+        agents.some((agent: any) => agent.name === "aliased-test-agent"),
+        "catalog should advertise the frontmatter name",
+      );
+
+      const loadedByFrontmatterName = testApi.loadAgentDefaults("aliased-test-agent");
+      assert.ok(
+        loadedByFrontmatterName,
+        "loadAgentDefaults must resolve the same name the catalog advertises",
+      );
+      assert.equal(loadedByFrontmatterName.model, "anthropic/test-aliased");
+
+      const loadedByFilename = testApi.loadAgentDefaults("renamed-file-test-agent");
+      assert.equal(
+        loadedByFilename,
+        null,
+        "the filename alone should not resolve once frontmatter overrides the name",
+      );
+    });
+  });
+
+  it("discoverAgentDefinitions skips an unreadable entry instead of aborting discovery", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "readable-sibling-test-agent",
+        ["name: readable-sibling-test-agent", "description: Should still be discovered"].join("\n"),
+      );
+      // A directory ending in .md passes the file filter but throws EISDIR on
+      // read — previously this aborted discoverAgentDefinitions() entirely.
+      mkdirSync(join(projectAgentsDir, "broken-entry-test-agent.md"));
+
+      const agents = testApi.discoverAgentDefinitions();
+      assert.ok(
+        agents.some((agent: any) => agent.name === "readable-sibling-test-agent"),
+        "a broken sibling entry should not prevent discovery of valid agents",
+      );
+    });
+  });
+
+  it("buildAvailableAgentCatalog reflects a config.json model override, not just frontmatter", () => {
+    const agents = [
+      {
+        name: "config-override-test-agent",
+        source: "project" as const,
+        description: "Agent without a frontmatter model",
+        disableModelInvocation: false,
+      },
+    ];
+
+    const withoutOverride = testApi.buildAvailableAgentCatalog(agents, 24, { agents: {} });
+    assert.doesNotMatch(withoutOverride, /model /);
+
+    const withOverride = testApi.buildAvailableAgentCatalog(agents, 24, {
+      agents: { "config-override-test-agent": "anthropic/test-config-model" },
+    });
+    assert.match(withOverride, /model anthropic\/test-config-model/);
+  });
 });
 describe("subagent-done.ts", () => {
   describe("shouldMarkUserTookOver", () => {
