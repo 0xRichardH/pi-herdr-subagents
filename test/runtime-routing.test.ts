@@ -187,7 +187,10 @@ describe("authenticated model catalog", () => {
     assert.match(catalog, /200k context/);
     assert.match(catalog, /other\/plain/);
     assert.match(catalog, /non-reasoning/);
-    assert.match(catalog, /Default: inherit the parent model and thinking/);
+    assert.match(
+      catalog,
+      /Named agents keep their configured runtime when model and thinking overrides are omitted/,
+    );
   });
 
   it("caps large catalogs and reports omitted models", () => {

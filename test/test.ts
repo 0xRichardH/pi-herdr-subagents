@@ -1122,26 +1122,28 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("bundled agents inherit the parent runtime and preserve interaction modes", () => {
-    const expectedInteraction = {
-      scout: false,
-      worker: false,
-      reviewer: false,
-      planner: true,
-      "visual-tester": false,
-    } as const;
+  it("bundled agents inherit the parent runtime and preserve interaction modes", async () => {
+    await withIsolatedAgentEnv(() => {
+      const expectedInteraction = {
+        scout: false,
+        worker: false,
+        reviewer: false,
+        planner: true,
+        "visual-tester": false,
+      } as const;
 
-    for (const [name, interactive] of Object.entries(expectedInteraction)) {
-      const defs = testApi.loadAgentDefaults(name);
-      assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
-      assert.equal(defs.model, undefined, `${name} should inherit the parent model`);
-      assert.equal(defs.thinking, undefined, `${name} should inherit the parent thinking level`);
-      assert.equal(
-        testApi.resolveEffectiveInteractive({ name, task: "" }, defs),
-        interactive,
-        `${name} should preserve its interaction mode`,
-      );
-    }
+      for (const [name, interactive] of Object.entries(expectedInteraction)) {
+        const defs = testApi.loadAgentDefaults(name);
+        assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
+        assert.equal(defs.model, undefined, `${name} should inherit the parent model`);
+        assert.equal(defs.thinking, undefined, `${name} should inherit the parent thinking level`);
+        assert.equal(
+          testApi.resolveEffectiveInteractive({ name, task: "" }, defs),
+          interactive,
+          `${name} should preserve its interaction mode`,
+        );
+      }
+    });
   });
 
   it("ignores invalid session-mode values", async () => {
@@ -1927,6 +1929,57 @@ describe("commands", () => {
 });
 
 describe("tool registration", () => {
+  it("advertises named agents and tells callers to preserve their runtime defaults", async () => {
+    await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
+      writeAgentFile(
+        globalAgentsDir,
+        "researcher",
+        [
+          "name: researcher",
+          "description: Researches external topics using authoritative sources",
+          "model: fake/research",
+          "thinking: max",
+        ].join("\n"),
+      );
+
+      const { api, registeredTools, eventHandlers } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+
+      const subagent = registeredTools.find((tool) => tool.name === "subagent");
+      assert.ok(subagent);
+      const sessionStart = eventHandlers.get("session_start")?.[0];
+      assert.ok(sessionStart);
+      sessionStart({}, {
+        hasUI: false,
+        modelRegistry: {
+          find: (provider: string, id: string) => ({ provider, id, reasoning: true }),
+          getAvailable: () => [{
+            provider: "fake",
+            id: "parent",
+            reasoning: true,
+            input: ["text"],
+            contextWindow: 128_000,
+            maxTokens: 16_000,
+            cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
+          }],
+          hasConfiguredAuth: () => true,
+        },
+      });
+
+      const guidance = subagent.promptGuidelines.join("\n");
+      assert.match(guidance, /Available named subagents/);
+      assert.match(
+        guidance,
+        /researcher.*Researches external topics using authoritative sources/,
+      );
+      assert.match(guidance, /omit.*model.*thinking.*named agent.*defaults/i);
+      assert.match(
+        subagent.parameters.properties.thinking.description,
+        /named agent's thinking default/i,
+      );
+    });
+  });
+
   it("refreshes subagent routing guidance from the live authenticated model registry", () => {
     const { api, registeredTools, eventHandlers } = createMockExtensionApi();
     (subagentsModule as any).default(api);
