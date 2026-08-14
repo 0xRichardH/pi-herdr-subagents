@@ -11,6 +11,7 @@ import {
   inspectHerdrPane,
   renameHerdrTab,
   renameHerdrWorkspace,
+  reportHerdrPaneTask,
   sendHerdrCommand,
   sendHerdrEscape,
 } from "./herdr.ts";
@@ -115,4 +116,9 @@ export async function inspectPane(paneId: PaneId): Promise<import("./lifecycle.t
 export function closePane(paneId: PaneId): void {
   assertTerminalAvailable();
   closeHerdrSurface(paneId);
+}
+
+export function setPaneTask(paneId: PaneId, task: string): void {
+  if (!isTerminalAvailable()) return;
+  reportHerdrPaneTask(paneId, task);
 }

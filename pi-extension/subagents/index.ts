@@ -25,6 +25,7 @@ import {
   readPane,
   readPaneAsync,
   inspectPane,
+  setPaneTask,
 } from "./terminal.ts";
 import { waitForCompletion } from "./completion.ts";
 import {
@@ -1196,6 +1197,9 @@ async function launchSubagent(
 
   const surfacePreCreated = !!options?.surface;
   const surface = options?.surface ?? createSubagentPane(params.name);
+  if (params.task) {
+    setPaneTask(surface, params.task);
+  }
   if (!surfacePreCreated) {
     await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
   }
@@ -2117,6 +2121,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
         const surface = createSubagentPane(name);
+        if (params.message) {
+          setPaneTask(surface, params.message);
+        }
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
         // Build pi resume command
