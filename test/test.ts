@@ -3100,6 +3100,40 @@ describe("herdr.ts", () => {
         "--no-focus",
       ]);
     });
+
+    it("constructs report-metadata arguments with normalized task token", () => {
+      assert.deepEqual(
+        __herdrTest__.buildPaneReportTaskArgs("pane-1", "Inspect failing test suite", "pi"),
+        [
+          "pane",
+          "report-metadata",
+          "pane-1",
+          "--source",
+          "pi",
+          "--token",
+          "task=Inspect failing test suite",
+        ],
+      );
+    });
+
+    it("flattens multi-line and tab-padded tasks into a single line", () => {
+      assert.deepEqual(
+        __herdrTest__.buildPaneReportTaskArgs(
+          "pane-2",
+          "  Line 1\n\tLine 2\r\nLine 3  ",
+          "pi",
+        ),
+        [
+          "pane",
+          "report-metadata",
+          "pane-2",
+          "--source",
+          "pi",
+          "--token",
+          "task=Line 1 Line 2 Line 3",
+        ],
+      );
+    });
   });
 
   describe("herdr response parsing", () => {

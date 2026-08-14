@@ -267,8 +267,40 @@ export function renameHerdrWorkspace(title: string): void {
   herdrExec(["workspace", "rename", workspaceId, title]);
 }
 
+function buildPaneReportTaskArgs(
+  paneId: string,
+  task: string,
+  source = "pi",
+): string[] {
+  const normalizedTask = task.replace(/[\r\n\t]+/g, " ").trim();
+  return [
+    "pane",
+    "report-metadata",
+    paneId,
+    "--source",
+    source,
+    "--token",
+    `task=${normalizedTask}`,
+  ];
+}
+
+export function reportHerdrPaneTask(
+  paneId: string,
+  task: string,
+  source = "pi",
+): void {
+  const normalizedTask = task.replace(/[\r\n\t]+/g, " ").trim();
+  if (!normalizedTask) return;
+  try {
+    herdrExec(buildPaneReportTaskArgs(paneId, task, source));
+  } catch {
+    // Non-fatal: cosmetic metadata report failure should not abort subagent launch.
+  }
+}
+
 export const __herdrTest__ = {
   buildTabCreateArgs,
+  buildPaneReportTaskArgs,
   parseHerdrJson,
   extractHerdrPaneId,
   extractHerdrRootPaneId,
