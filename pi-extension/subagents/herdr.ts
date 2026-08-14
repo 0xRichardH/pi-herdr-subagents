@@ -292,7 +292,7 @@ export function reportHerdrPaneTask(
   const normalizedTask = task.replace(/[\r\n\t]+/g, " ").trim();
   if (!normalizedTask) return;
   try {
-    herdrExec(buildPaneReportTaskArgs(paneId, task, source));
+    herdrExec(buildPaneReportTaskArgs(paneId, normalizedTask, source));
   } catch {
     // Non-fatal: cosmetic metadata report failure should not abort subagent launch.
   }
