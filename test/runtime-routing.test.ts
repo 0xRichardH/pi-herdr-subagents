@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import {
   RuntimeResolutionError,
   buildAuthenticatedModelCatalog,
+  modelForCli,
   resolveRuntimePlan,
   wrapPiModelRegistry,
   type ParentRuntime,
@@ -171,6 +172,24 @@ describe("runtime routing", () => {
       to: "off",
       reason: "non-reasoning",
     });
+  });
+});
+
+describe("CLI model routing", () => {
+  for (const modelId of ["fable", "opus", "sonnet"]) {
+    it(`passes the ${modelId} alias to Claude CLI without its provider`, () => {
+      assert.equal(
+        modelForCli("claude", { model: `anthropic/${modelId}`, modelId }),
+        modelId,
+      );
+    });
+  }
+
+  it("retains the provider-qualified model for Pi CLI", () => {
+    assert.equal(
+      modelForCli("pi", { model: "anthropic/claude-sonnet-4-5", modelId: "claude-sonnet-4-5" }),
+      "anthropic/claude-sonnet-4-5",
+    );
   });
 });
 
