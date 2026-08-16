@@ -256,7 +256,15 @@ function getBundledAgentsDir(): string {
 
 function getFrontmatterValue(frontmatter: string, key: string): string | undefined {
   const match = frontmatter.match(new RegExp(`^${key}:\\s*(.+)$`, "m"));
-  return match ? match[1].trim() : undefined;
+  if (!match) return undefined;
+  const value = match[1].trim();
+  if (
+    value.length >= 2 &&
+    ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))
+  ) {
+    return value.slice(1, -1);
+  }
+  return value;
 }
 
 function parseOptionalBoolean(value: string | undefined): boolean | undefined {
@@ -872,7 +880,7 @@ function ensureLifecycle(running: RunningSubagent): SubagentLifecycle {
         ...(state.activityLabel && state.activeScope === "tool" ? { toolName: state.activityLabel } : {}),
       },
     }, state.lastActivityAtMs ?? running.startTime);
-  } else if (state?.source !== "pi" || running.startTime) {
+  } else if (state?.hasActivitySnapshots === false || running.startTime) {
     // Pre-lifecycle Pi agents without a known phase still get a running process.
     lifecycle = markProcessRunning(lifecycle, running.startTime);
   }
@@ -960,7 +968,7 @@ function handleSubagentInterrupt(
           `Turn-only Escape interrupt is currently supported only for Pi-backed subagents. ${driver.name}-backed semantics have not been verified yet.`,
       }],
       details: {
-        error: `${running.cli === "claude" ? "claude" : (running.cli ?? "external")} interrupt unsupported`,
+        error: `${running.cli ?? "external"} interrupt unsupported`,
         id: running.id,
         name: running.name,
       },

@@ -6,6 +6,7 @@ import type {
   HarnessResult,
 } from "../types.ts";
 import type { ResolvedRuntimePlan } from "../../runtime-routing.ts";
+import { extractPaneSummary } from "../pane-summary.ts";
 
 export class OpenCodeHarnessDriver implements HarnessDriver {
   readonly id = "opencode";
@@ -67,17 +68,6 @@ export class OpenCodeHarnessDriver implements HarnessDriver {
   }
 
   async extractResult(context: SubagentResultContext): Promise<HarnessResult | null> {
-    const { completionResult, surface, readPane } = context;
-    let summary = readPane(surface, 200)
-      .replace(/__SUBAGENT_DONE_\d+__/, "")
-      .trimEnd();
-
-    if (!summary) {
-      summary = completionResult.exitCode !== 0
-        ? `OpenCode exited with code ${completionResult.exitCode}`
-        : "OpenCode exited without output";
-    }
-
-    return { summary };
+    return { summary: extractPaneSummary(context, this.name) };
   }
 }

@@ -8,6 +8,7 @@ import type {
   HarnessResult,
 } from "../types.ts";
 import type { ResolvedRuntimePlan, ThinkingLevel } from "../../runtime-routing.ts";
+import { extractPaneSummary } from "../pane-summary.ts";
 
 const CLAUDE_SESSIONS_DIR = join(
   process.env.HOME ?? "/tmp",
@@ -103,7 +104,7 @@ export class ClaudeHarnessDriver implements HarnessDriver {
   }
 
   async extractResult(context: SubagentResultContext): Promise<HarnessResult | null> {
-    const { running, completionResult, surface, readPane } = context;
+    const { running } = context;
     let summary = "";
 
     if (running.sentinelFile) {
@@ -113,15 +114,7 @@ export class ClaudeHarnessDriver implements HarnessDriver {
     }
 
     if (!summary) {
-      summary = readPane(surface, 200)
-        .replace(/__SUBAGENT_DONE_\d+__/, "")
-        .trimEnd();
-    }
-
-    if (!summary) {
-      summary = completionResult.exitCode !== 0
-        ? `Claude Code exited with code ${completionResult.exitCode}`
-        : "Claude Code exited without output";
+      summary = extractPaneSummary(context, this.name);
     }
 
     let sessionId: string | null = null;

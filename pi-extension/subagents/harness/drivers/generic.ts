@@ -6,6 +6,7 @@ import type {
   HarnessResult,
 } from "../types.ts";
 import type { ResolvedRuntimePlan } from "../../runtime-routing.ts";
+import { extractPaneSummary } from "../pane-summary.ts";
 
 export class GenericHarnessDriver implements HarnessDriver {
   readonly id: string;
@@ -44,14 +45,22 @@ export class GenericHarnessDriver implements HarnessDriver {
     let commandBody: string;
 
     if (template) {
-      // Replace template variables
+      // Replace template variables. Replacement values are passed via a
+      // replacer function (not a string) so that "$$", "$&", etc. in
+      // untrusted task/model/cwd text are inserted literally instead of
+      // being interpreted as String.replace() special patterns.
+      const quotedModel = effectiveModel ? shellQuote(effectiveModel) : "";
+      const quotedTask = shellQuote(fullTask);
+      const quotedCwd = effectiveCwd ? shellQuote(effectiveCwd) : ".";
+      const quotedName = shellQuote(params.name);
+      const quotedId = shellQuote(params.id);
       commandBody = template
-        .replace(/\{model\}/g, effectiveModel ? shellQuote(effectiveModel) : "")
-        .replace(/\{task\}/g, shellQuote(fullTask))
-        .replace(/\{prompt\}/g, shellQuote(fullTask))
-        .replace(/\{cwd\}/g, effectiveCwd ? shellQuote(effectiveCwd) : ".")
-        .replace(/\{name\}/g, shellQuote(params.name))
-        .replace(/\{id\}/g, shellQuote(params.id));
+        .replace(/\{model\}/g, () => quotedModel)
+        .replace(/\{task\}/g, () => quotedTask)
+        .replace(/\{prompt\}/g, () => quotedTask)
+        .replace(/\{cwd\}/g, () => quotedCwd)
+        .replace(/\{name\}/g, () => quotedName)
+        .replace(/\{id\}/g, () => quotedId);
     } else {
       const binary = this.id === "generic" ? (agentDefs?.cli ?? "subagent") : this.id;
       const cmdParts: string[] = [binary];
@@ -84,17 +93,6 @@ export class GenericHarnessDriver implements HarnessDriver {
   }
 
   async extractResult(context: SubagentResultContext): Promise<HarnessResult | null> {
-    const { completionResult, surface, readPane } = context;
-    let summary = readPane(surface, 200)
-      .replace(/__SUBAGENT_DONE_\d+__/, "")
-      .trimEnd();
-
-    if (!summary) {
-      summary = completionResult.exitCode !== 0
-        ? `${this.name} exited with code ${completionResult.exitCode}`
-        : `${this.name} exited without output`;
-    }
-
-    return { summary };
+    return { summary: extractPaneSummary(context, this.name) };
   }
 }
