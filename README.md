@@ -102,6 +102,19 @@ Bundled agents use model defaults from `config.json` when configured; otherwise 
 
 Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global** (`~/.pi/agent/agents/`) > **package-bundled**. Override any bundled agent by placing your own version in the higher-priority location. The discovered names, descriptions, and runtime defaults are included in the subagent tool guidance so the orchestrator can select by role instead of treating one agent as a generic default.
 
+### Supported Harness CLIs
+
+Agents default to running with `pi`, but can run inside any supported harness CLI or custom CLI configured via agent frontmatter:
+
+| Harness CLI | Frontmatter `cli:` | Model format | Notes |
+| :--- | :--- | :--- | :--- |
+| **Pi** (default) | `pi` (or omitted) | `provider/model` | Full support for thinking levels, turn interrupts, and live activity snapshots |
+| **OpenCode** | `opencode` | `provider/model` | Runs `opencode run --model <model> <task>` |
+| **Codex** | `codex` | bare model ID | Runs `codex --model <model>` with optional `--reasoning-effort` |
+| **Claude Code** | `claude` | bare model ID | Runs `claude --model <model>` with autonomous completion hook |
+| **Grok** | `grok` | bare model ID | Runs `grok --model <model> <task>` |
+| **Custom / Generic** | any CLI name | bare model ID | Supports custom `command:` template (e.g. `command: "aider --model {model} --message {task}"`) |
+
 ---
 
 ## Async Subagent Flow

@@ -4,6 +4,7 @@ import {
   type Model,
   type ModelThinkingLevel,
 } from "@earendil-works/pi-ai";
+import { getHarnessDriver } from "./harness/registry.ts";
 
 export const THINKING_LEVELS = [
   "off",
@@ -77,10 +78,11 @@ export interface ResolvedRuntimePlan {
 }
 
 export function modelForCli(
-  cli: "claude" | "pi",
+  cli: string,
   runtimePlan: Pick<ResolvedRuntimePlan, "model" | "modelId">,
 ): string {
-  return cli === "claude" ? runtimePlan.modelId : runtimePlan.model;
+  const driver = getHarnessDriver(cli);
+  return driver.formatModel(runtimePlan);
 }
 
 export class RuntimeResolutionError extends Error {

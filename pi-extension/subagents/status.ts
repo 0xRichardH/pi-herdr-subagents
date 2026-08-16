@@ -12,7 +12,7 @@ const DEFAULT_STATUS_CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
 const STATUS_CONFIG_EXAMPLE_PATH = join(PACKAGE_ROOT, "config.json.example");
 
 export type SubagentStatusKind = "starting" | "active" | "waiting" | "stalled" | "running";
-export type SubagentStatusSource = "pi" | "claude";
+export type SubagentStatusSource = string;
 export type SubagentStatusTransition = "stalled" | "recovered" | null;
 export type StatusSnapshotState = "unseen" | "present" | "missing" | "invalid" | "wrong-id";
 export type StatusActivityPhase = "starting" | "active" | "waiting" | "done";
@@ -42,6 +42,7 @@ export type StatusObservation =
 
 export interface SubagentStatusState {
   source: SubagentStatusSource;
+  hasActivitySnapshots: boolean;
   startTimeMs: number;
   firstObservationAtMs: number | null;
   lastActivityAtMs: number | null;
@@ -201,10 +202,14 @@ export function formatElapsedDuration(ms: number): string {
 export function createStatusState(params: {
   source: SubagentStatusSource;
   startTimeMs: number;
+  /** Whether the harness driver for `source` emits activity snapshots. Defaults to `source === "pi"` for callers that predate per-driver capability flags. */
+  hasActivitySnapshots?: boolean;
 }): SubagentStatusState {
-  const initialKind = params.source === "claude" ? "running" : "starting";
+  const hasActivitySnapshots = params.hasActivitySnapshots ?? params.source === "pi";
+  const initialKind = hasActivitySnapshots ? "starting" : "running";
   return {
     source: params.source,
+    hasActivitySnapshots,
     startTimeMs: params.startTimeMs,
     firstObservationAtMs: null,
     lastActivityAtMs: null,
@@ -218,7 +223,7 @@ export function createStatusState(params: {
     phase: null,
     latestEvent: null,
     activityLabel: null,
-    snapshotState: params.source === "claude" ? "unseen" : "unseen",
+    snapshotState: "unseen",
     snapshotProblemSinceMs: null,
     snapshotError: null,
     currentKind: initialKind,
@@ -230,7 +235,7 @@ export function observeStatus(
   observation: StatusObservation,
   now: number,
 ): SubagentStatusState {
-  if (state.source === "claude") return state;
+  if (!state.hasActivitySnapshots) return state;
 
   if (observation.snapshot !== "present") {
     return {
@@ -288,7 +293,7 @@ export function observeStatus(
 }
 
 export function forceStatusAfterInterrupt(state: SubagentStatusState, now: number): SubagentStatusState {
-  if (state.source === "claude") return state;
+  if (!state.hasActivitySnapshots) return state;
 
   return {
     ...state,
@@ -340,7 +345,7 @@ export function classifyStatus(state: SubagentStatusState, now: number): StatusS
   const elapsedMs = Math.max(0, now - state.startTimeMs);
   const elapsedText = formatElapsedDuration(elapsedMs);
 
-  if (state.source === "claude") {
+  if (!state.hasActivitySnapshots) {
     return {
       kind: "running",
       elapsedMs,

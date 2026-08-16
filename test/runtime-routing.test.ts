@@ -176,6 +176,13 @@ describe("runtime routing", () => {
 });
 
 describe("CLI model routing", () => {
+  it("defaults to Pi CLI and retains provider-qualified model reference", () => {
+    assert.equal(
+      modelForCli("pi", { model: "anthropic/claude-sonnet-4-5", modelId: "claude-sonnet-4-5" }),
+      "anthropic/claude-sonnet-4-5",
+    );
+  });
+
   for (const modelId of ["fable", "opus", "sonnet"]) {
     it(`passes the ${modelId} alias to Claude CLI without its provider`, () => {
       assert.equal(
@@ -185,10 +192,31 @@ describe("CLI model routing", () => {
     });
   }
 
-  it("retains the provider-qualified model for Pi CLI", () => {
+  it("retains the provider-qualified model for OpenCode CLI", () => {
     assert.equal(
-      modelForCli("pi", { model: "anthropic/claude-sonnet-4-5", modelId: "claude-sonnet-4-5" }),
-      "anthropic/claude-sonnet-4-5",
+      modelForCli("opencode", { model: "anthropic/claude-3-5-sonnet", modelId: "claude-3-5-sonnet" }),
+      "anthropic/claude-3-5-sonnet",
+    );
+  });
+
+  it("passes bare model ID to Codex CLI", () => {
+    assert.equal(
+      modelForCli("codex", { model: "openai/o3-mini", modelId: "o3-mini" }),
+      "o3-mini",
+    );
+  });
+
+  it("passes bare model ID to Grok CLI", () => {
+    assert.equal(
+      modelForCli("grok", { model: "xai/grok-3", modelId: "grok-3" }),
+      "grok-3",
+    );
+  });
+
+  it("passes bare model ID to generic custom CLIs", () => {
+    assert.equal(
+      modelForCli("aider", { model: "anthropic/claude-3-5-sonnet", modelId: "claude-3-5-sonnet" }),
+      "claude-3-5-sonnet",
     );
   });
 });
