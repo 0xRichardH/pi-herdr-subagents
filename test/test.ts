@@ -1414,6 +1414,35 @@ describe("subagent discovery", () => {
     });
   });
 
+  it("strips surrounding quotes from a quoted command: frontmatter value", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "quoted-command-test-agent",
+        [
+          "name: quoted-command-test-agent",
+          `command: "aider --model {model} --message {task}"`,
+        ].join("\n"),
+      );
+
+      const loaded = testApi.loadAgentDefaults("quoted-command-test-agent");
+      assert.equal(loaded?.commandTemplate, "aider --model {model} --message {task}");
+    });
+  });
+
+  it("leaves an unquoted command: frontmatter value untouched", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "unquoted-command-test-agent",
+        ["name: unquoted-command-test-agent", "command: aider --model {model} --message {task}"].join("\n"),
+      );
+
+      const loaded = testApi.loadAgentDefaults("unquoted-command-test-agent");
+      assert.equal(loaded?.commandTemplate, "aider --model {model} --message {task}");
+    });
+  });
+
   it("buildAvailableAgentCatalog reflects a config.json model override, not just frontmatter", () => {
     const agents = [
       {

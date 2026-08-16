@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import {
   getHarnessDriver,
   registerHarnessDriver,
@@ -12,6 +15,7 @@ import {
   type SubagentLaunchContext,
 } from "../pi-extension/subagents/harness/index.ts";
 import type { ResolvedRuntimePlan } from "../pi-extension/subagents/runtime-routing.ts";
+import type { SubagentResultContext } from "../pi-extension/subagents/harness/types.ts";
 
 function createMockLaunchContext(overrides?: Partial<SubagentLaunchContext>): SubagentLaunchContext {
   const runtimePlan: ResolvedRuntimePlan = {
@@ -44,6 +48,26 @@ function createMockLaunchContext(overrides?: Partial<SubagentLaunchContext>): Su
     taskDelivery: "direct",
     subagentsDir: "/path/to/subagents",
     shellQuote: (s: string) => `'${s.replace(/'/g, "'\\''")}'`,
+    ...overrides,
+  };
+}
+
+function createMockResultContext(overrides?: Partial<SubagentResultContext>): SubagentResultContext {
+  return {
+    running: {
+      id: "1",
+      name: "test",
+      task: "task",
+      surface: "s1",
+      startTime: Date.now(),
+      sessionFile: "f",
+      interactive: false,
+    },
+    completionResult: { reason: "done", exitCode: 0 },
+    surface: "s1",
+    readPane: () => "Finished repository inspection!\n__SUBAGENT_DONE_0__\n",
+    closePane: () => {},
+    artifactDir: "/tmp",
     ...overrides,
   };
 }
@@ -179,6 +203,21 @@ describe("Codex Harness Driver", () => {
     assert.ok(built.command.startsWith("cd '/tmp/project' && codex --model 'o3-mini' --reasoning-effort 'high'"));
     assert.ok(built.command.includes("echo '__SUBAGENT_DONE_'$?'__'"));
   });
+
+  it("extracts output from terminal pane buffer", async () => {
+    const result = await driver.extractResult(createMockResultContext());
+    assert.ok(result);
+    assert.equal(result.summary, "Finished repository inspection!");
+  });
+
+  it("falls back to an exit-code summary when the pane has no output", async () => {
+    const result = await driver.extractResult(createMockResultContext({
+      readPane: () => "",
+      completionResult: { reason: "done", exitCode: 1 },
+    }));
+    assert.ok(result);
+    assert.equal(result.summary, "Codex exited with code 1");
+  });
 });
 
 describe("Grok Harness Driver", () => {
@@ -200,6 +239,21 @@ describe("Grok Harness Driver", () => {
     assert.equal(built.cli, "grok");
     assert.ok(built.command.startsWith("cd '/tmp/project' && grok --model 'grok-3'"));
     assert.ok(built.command.includes("echo '__SUBAGENT_DONE_'$?'__'"));
+  });
+
+  it("extracts output from terminal pane buffer", async () => {
+    const result = await driver.extractResult(createMockResultContext());
+    assert.ok(result);
+    assert.equal(result.summary, "Finished repository inspection!");
+  });
+
+  it("falls back to an exit-code summary when the pane has no output", async () => {
+    const result = await driver.extractResult(createMockResultContext({
+      readPane: () => "",
+      completionResult: { reason: "done", exitCode: 1 },
+    }));
+    assert.ok(result);
+    assert.equal(result.summary, "Grok exited with code 1");
   });
 });
 
@@ -237,6 +291,45 @@ describe("Claude Harness Driver", () => {
       thinkingSource: "parent",
     }, "medium"));
   });
+
+  it("prefers the sentinel file over the terminal pane when both are present", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "claude-sentinel-test-"));
+    const sentinelFile = join(dir, "sentinel");
+    writeFileSync(sentinelFile, "Sentinel-reported summary\n");
+    try {
+      const result = await driver.extractResult(createMockResultContext({
+        running: {
+          id: "1",
+          name: "test",
+          task: "task",
+          surface: "s1",
+          startTime: Date.now(),
+          sessionFile: "f",
+          interactive: false,
+          sentinelFile,
+        },
+      }));
+      assert.ok(result);
+      assert.equal(result.summary, "Sentinel-reported summary");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to the terminal pane when no sentinel file is present", async () => {
+    const result = await driver.extractResult(createMockResultContext());
+    assert.ok(result);
+    assert.equal(result.summary, "Finished repository inspection!");
+  });
+
+  it("falls back to an exit-code summary when neither sentinel nor pane have output", async () => {
+    const result = await driver.extractResult(createMockResultContext({
+      readPane: () => "",
+      completionResult: { reason: "done", exitCode: 1 },
+    }));
+    assert.ok(result);
+    assert.equal(result.summary, "Claude Code exited with code 1");
+  });
 });
 
 describe("Generic Harness Driver & Templates", () => {
@@ -264,5 +357,37 @@ describe("Generic Harness Driver & Templates", () => {
 
     const built = driver.buildCommand(ctx);
     assert.ok(built.command.startsWith("cd '/tmp/project' && aider --model 'gpt-4o'"));
+  });
+
+  it("inserts $$ and $& in task text literally instead of as replace-pattern syntax", () => {
+    const driver = new GenericHarnessDriver("custom");
+    const ctx = createMockLaunchContext({
+      effectiveModel: "gemini-2.5-pro",
+      params: {
+        id: "abc12345",
+        name: "worker",
+        task: "use $$ for the current PID and $& for the whole match",
+      },
+      agentDefs: {
+        name: "custom",
+        commandTemplate: "gemini run --prompt {task}",
+      },
+    });
+
+    const built = driver.buildCommand(ctx);
+    assert.ok(
+      built.command.includes("use $$ for the current PID and $& for the whole match"),
+      `expected literal $$ and $& in: ${built.command}`,
+    );
+  });
+
+  it("extracts output from terminal pane buffer using the driver's display name", async () => {
+    const driver = new GenericHarnessDriver("aider");
+    const result = await driver.extractResult(createMockResultContext({
+      readPane: () => "",
+      completionResult: { reason: "done", exitCode: 1 },
+    }));
+    assert.ok(result);
+    assert.equal(result.summary, "aider exited with code 1");
   });
 });
