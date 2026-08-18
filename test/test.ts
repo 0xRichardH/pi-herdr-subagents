@@ -1489,6 +1489,11 @@ describe("subagent-done.ts", () => {
       assert.equal(shouldAutoExitOnAgentEnd(false, messages), false);
     });
 
+    it("stays open after a tool-use turn", () => {
+      const messages = [{ role: "assistant", stopReason: "toolUse" }];
+      assert.equal(shouldAutoExitOnAgentEnd(false, messages), false);
+    });
+
     it("still exits when the latest turn ended with stopReason=error", () => {
       // Auto-exit subagents must shut down on retry-exhaustion errors so the
       // parent is woken. The error sidecar (written separately) carries the
