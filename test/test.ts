@@ -1542,7 +1542,7 @@ describe("subagent-done.ts", () => {
         const { api, eventHandlers } = createMockExtensionApi();
         subagentDoneExtension(api);
         let shutdowns = 0;
-        const ctx = { shutdown: () => { shutdowns += 1; } };
+        const ctx = { shutdown: () => { shutdowns += 1; }, ui: { notify() {} } };
         eventHandlers.get("agent_end")![0]({
           messages: [{ role: "assistant", stopReason: "aborted" }],
         }, ctx);

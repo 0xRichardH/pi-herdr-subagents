@@ -37,6 +37,40 @@ export function shouldAutoExitOnAgentEnd(
   return true;
 }
 
+export interface AutoExitDecisionState {
+  /** Sticky: set when the operator typed into the session or Escape-aborted a run. */
+  disarmed: boolean;
+  /** Set by /auto-exit: allows exactly one more settled completion to exit. */
+  oneShotReArm: boolean;
+}
+
+/**
+ * Pure auto-exit decision for a settled agent turn.
+ *
+ * - Armed and untouched: exits on terminal stops and errors exactly as
+ *   v0.2.0 did; Escape-aborted runs keep the session open.
+ * - Disarmed (operator takeover): never exits, whatever the stop reason.
+ * - One-shot re-arm (/auto-exit): behaves like armed for a single further
+ *   completion; the caller consumes the flag once that exit happens.
+ */
+export function resolveAutoExit(
+  state: AutoExitDecisionState,
+  stopReason: string | undefined,
+): boolean {
+  if (state.disarmed && !state.oneShotReArm) return false;
+  return stopReason !== "aborted";
+}
+
+function latestAssistantStopReason(messages: any[] | undefined): string | undefined {
+  if (messages) {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const msg = messages[i];
+      if (msg?.role === "assistant") return msg.stopReason as string | undefined;
+    }
+  }
+  return undefined;
+}
+
 export interface SubagentErrorInfo {
   errorMessage: string;
   stopReason: "error";
@@ -148,9 +182,25 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
-  let userTookOver = false;
+  let disarmed = false;
+  let oneShotReArm = false;
+  let warnedOperatorTakeover = false;
   let agentStarted = false;
   let latestAgentMessages: any[] | undefined;
+
+  // Operator takeover (typed input or an Escape abort) permanently disarms
+  // auto-exit for this session. The warning is latched so it is emitted
+  // exactly once no matter how often the operator interacts afterwards.
+  function disarmAutoExit(cause: string, ctx: any): void {
+    disarmed = true;
+    if (!autoExit || warnedOperatorTakeover) return;
+    warnedOperatorTakeover = true;
+    ctx.ui.notify(
+      `Auto-exit disabled (${cause}). You are driving this session now — ` +
+        "/auto-exit closes it after its next completion.",
+      "warning",
+    );
+  }
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
@@ -162,12 +212,12 @@ export default function (pi: ExtensionAPI) {
     renderWidget(ctx, null);
   });
 
-  pi.on("input", () => {
+  pi.on("input", (_event, ctx) => {
     recorder.input();
     // Ignore the initial task message that starts an autonomous subagent.
     // Only inputs after the first agent run has started count as user takeover.
     if (!shouldMarkUserTookOver(agentStarted)) return;
-    userTookOver = true;
+    disarmAutoExit("operator input", ctx);
   });
 
   pi.on("before_agent_start", () => {
@@ -188,8 +238,21 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_settled", (_event, ctx) => {
+    const stopReason = latestAssistantStopReason(latestAgentMessages);
+
+    // An Escape-triggered abort is operator takeover too: permanently disarm
+    // (single warning above) and leave the session open for inspection.
+    if (stopReason === "aborted") {
+      disarmAutoExit("Escape", ctx);
+    }
+
     const shouldExit = autoExit
-      && shouldAutoExitOnAgentEnd(userTookOver, latestAgentMessages);
+      && resolveAutoExit({ disarmed, oneShotReArm }, stopReason);
+    if (shouldExit && oneShotReArm) {
+      // Consume the one-shot re-arm: after this exit auto-exit is disarmed
+      // again until the operator runs /auto-exit once more.
+      oneShotReArm = false;
+    }
 
     if (shouldExit) {
       // Surface stopReason: "error" turns (auto-retry exhausted, provider
@@ -211,12 +274,6 @@ export default function (pi: ExtensionAPI) {
       recorder.agentEndDone();
       ctx.shutdown();
       return;
-    }
-
-    if (autoExit) {
-      // Reset any recorded manual input marker. Auto-exit is decided by whether
-      // the latest settled agent run completed normally, not by who initiated it.
-      userTookOver = false;
     }
   });
 
@@ -265,6 +322,33 @@ export default function (pi: ExtensionAPI) {
   });
 
   // Toggle expand/collapse with Ctrl+J
+  // Re-arm auto-exit for exactly one completion after operator takeover.
+  pi.registerCommand("auto-exit", {
+    description: "Close this session automatically after its next completed turn",
+    handler: async (_args, ctx) => {
+      if (!autoExit) {
+        ctx.ui.notify("Auto-exit is not enabled for this session.", "info");
+        return;
+      }
+      if (!disarmed) {
+        ctx.ui.notify("Auto-exit is already armed.", "info");
+        return;
+      }
+      if (oneShotReArm) {
+        ctx.ui.notify(
+          "Auto-exit is already re-armed for the next completion.",
+          "info",
+        );
+        return;
+      }
+      oneShotReArm = true;
+      ctx.ui.notify(
+        "Auto-exit re-armed: this session will close after its next completion.",
+        "info",
+      );
+    },
+  });
+
   pi.registerShortcut("ctrl+j", {
     description: "Toggle subagent tools widget",
     handler: (ctx) => {
