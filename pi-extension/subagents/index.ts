@@ -210,7 +210,7 @@ interface ListedAgentDefinition extends AgentDefinition {
   source: AgentSource;
 }
 
-/** Tools that are gated by `spawning: false` */
+/** Tools gated behind an explicit frontmatter spawn grant (`spawning: true`) */
 const SPAWNING_TOOLS = new Set([
   "subagent",
   "subagent_interrupt",
@@ -219,21 +219,51 @@ const SPAWNING_TOOLS = new Set([
 ]);
 
 /**
- * Resolve the effective set of denied tool names from agent defaults.
- * `spawning: false` expands to all SPAWNING_TOOLS.
- * `deny-tools` adds individual tool names on top.
+ * Parse PI_SUBAGENT_SPAWN_DEPTH into a child-spawning allowance.
+ * Unset/blank/unparsable/negative → null (unlimited; a frontmatter grant is
+ * still required). A non-negative integer is the generation ceiling granted
+ * to this process's direct children.
  */
-function resolveDenyTools(agentDefs: AgentDefaults | null): Set<string> {
-  const denied = new Set<string>();
-  if (!agentDefs) return denied;
+function parseSpawnDepth(raw: string | undefined | null): number | null {
+  if (raw == null) return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const parsed = Number.parseInt(trimmed, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) return null;
+  return parsed;
+}
 
-  // spawning: false → deny all spawning tools
-  if (agentDefs.spawning === false) {
+/**
+ * Depth handed down to the next generation: decrements by one per
+ * generation, never rises, clamps at zero. Unlimited stays unlimited.
+ */
+function decrementSpawnDepth(allowance: number | null): number | null {
+  return allowance === null ? null : Math.max(0, allowance - 1);
+}
+
+/**
+ * Resolve the effective set of denied tool names from agent defaults.
+ *
+ * Spawning is deny-by-default: all SPAWNING_TOOLS are denied unless the
+ * agent frontmatter explicitly grants `spawning: true` AND depth remains
+ * (`spawnAllowance > 0`, or null = unlimited).
+ * `deny-tools` additions stack on top either way.
+ */
+function resolveDenyTools(
+  agentDefs: AgentDefaults | null,
+  spawnAllowance: number | null = null,
+): Set<string> {
+  const denied = new Set<string>();
+
+  // Deny-by-default: only spawning:true + remaining depth keeps the tools.
+  const spawnGranted =
+    agentDefs?.spawning === true && (spawnAllowance === null || spawnAllowance > 0);
+  if (!spawnGranted) {
     for (const t of SPAWNING_TOOLS) denied.add(t);
   }
 
-  // deny-tools: explicit list
-  if (agentDefs.denyTools) {
+  // deny-tools: explicit list stacks on top of the default denial
+  if (agentDefs?.denyTools) {
     for (const t of agentDefs.denyTools
       .split(",")
       .map((s) => s.trim())
@@ -243,6 +273,48 @@ function resolveDenyTools(agentDefs: AgentDefaults | null): Set<string> {
   }
 
   return denied;
+}
+
+/**
+ * Resume clamp: first-launch metadata is authoritative. The resumed session
+ * never receives more spawning allowance than its first launch recorded —
+ * min(recorded, requested). Missing/corrupt metadata resolves to 0 (deny).
+ */
+function clampResumeSpawn(
+  recorded: { allowance?: unknown } | null | undefined,
+  requestedAllowance: number | null,
+): { maySpawn: boolean; childEnvDepth: number | null } {
+  const capRaw = recorded?.allowance;
+  if (capRaw !== null && (typeof capRaw !== "number" || !Number.isFinite(capRaw) || capRaw < 0)) {
+    return { maySpawn: false, childEnvDepth: 0 };
+  }
+  const cap = capRaw === null ? null : Math.floor(capRaw);
+  const effective =
+    cap === null
+      ? requestedAllowance
+      : requestedAllowance === null
+        ? cap
+        : Math.min(cap, requestedAllowance);
+  const maySpawn = effective === null || effective > 0;
+  return { maySpawn, childEnvDepth: decrementSpawnDepth(effective) };
+}
+
+/**
+ * Read the first-launch spawn metadata sidecar written next to a subagent
+ * session file. Any failure (missing file, corrupt JSON) → null, which the
+ * clamp treats as zero allowance.
+ */
+function readSpawnMetadata(sessionFile: string): { allowance?: unknown } | null {
+  try {
+    return JSON.parse(readFileSync(`${sessionFile}.spawn.json`, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+/** Same-agent respawn guard: an agent never spawns another instance of itself. */
+function blockedSelfSpawn(requestedAgent: string | undefined, currentAgent: string | undefined): boolean {
+  return !!requestedAgent && !!currentAgent && requestedAgent === currentAgent;
 }
 
 /** Resolve the global agent config directory, respecting PI_CODING_AGENT_DIR. */
@@ -1079,6 +1151,12 @@ export const __test__ = {
   buildPiPromptArgs,
   observeRunningSubagent,
   resolveDenyTools,
+  parseSpawnDepth,
+  decrementSpawnDepth,
+  clampResumeSpawn,
+  readSpawnMetadata,
+  blockedSelfSpawn,
+  SPAWNING_TOOLS,
   resolveInterruptTarget,
   requestSubagentInterrupt,
   handleSubagentInterrupt,
@@ -1197,7 +1275,12 @@ async function launchSubagent(
   const summaryInstruction = effectiveAutoExit
     ? "Your FINAL assistant message should summarize what you accomplished."
     : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
-  const denySet = resolveDenyTools(agentDefs);
+  // Spawn grant + depth: this process's PI_SUBAGENT_SPAWN_DEPTH is the
+  // generation ceiling for our direct children; they receive one less so
+  // mutual spawning terminates.
+  const launcherAllowance = parseSpawnDepth(process.env.PI_SUBAGENT_SPAWN_DEPTH);
+  const spawnGranted = agentDefs?.spawning === true;
+  const denySet = resolveDenyTools(agentDefs, launcherAllowance);
   const identity = agentDefs?.body ?? params.systemPrompt ?? null;
   const systemPromptMode = agentDefs?.systemPromptMode;
   const identityInSystemPrompt = systemPromptMode && identity;
@@ -1222,6 +1305,7 @@ async function launchSubagent(
     inheritsConversationContext,
     taskDelivery: launchBehavior.taskDelivery,
     denySet,
+    childSpawnDepth: decrementSpawnDepth(launcherAllowance),
     identity,
     identityInSystemPrompt: Boolean(identityInSystemPrompt),
     systemPromptMode,
@@ -1267,6 +1351,18 @@ async function launchSubagent(
       ? markProcessRunning(createLifecycle(startTime), Date.now())
       : createLifecycle(startTime),
   };
+
+  // First-launch spawn metadata: authoritative cap for later subagent_resume.
+  // Non-granted agents record 0 so resume can never enlarge their rights.
+  try {
+    writeFileSync(
+      `${running.sessionFile}.spawn.json`,
+      JSON.stringify({ allowance: spawnGranted ? launcherAllowance ?? null : 0 }),
+      "utf8",
+    );
+  } catch {
+    // Unwritable sidecar ⇒ resume conservatively denies spawning.
+  }
 
   runningSubagents.set(id, running);
   return running;
@@ -1501,8 +1597,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         // Prevent self-spawning (e.g. planner spawning another planner)
-        const currentAgent = process.env.PI_SUBAGENT_AGENT;
-        if (params.agent && currentAgent && params.agent === currentAgent) {
+        if (blockedSelfSpawn(params.agent, process.env.PI_SUBAGENT_AGENT)) {
           return {
             content: [
               {
@@ -1964,6 +2059,18 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
         if (autoExit) {
           resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
+        }
+        // Spawn rights on resume are clamped to what the first launch recorded:
+        // missing metadata ⇒ 0 (deny); never larger than first launch.
+        const resumeSpawn = clampResumeSpawn(
+          readSpawnMetadata(params.sessionPath),
+          parseSpawnDepth(process.env.PI_SUBAGENT_SPAWN_DEPTH),
+        );
+        if (!resumeSpawn.maySpawn) {
+          resumeEnvParts.push(`PI_DENY_TOOLS=${shellQuote([...SPAWNING_TOOLS].join(","))}`);
+        }
+        if (resumeSpawn.childEnvDepth !== null) {
+          resumeEnvParts.push(`PI_SUBAGENT_SPAWN_DEPTH=${resumeSpawn.childEnvDepth}`);
         }
         const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
 

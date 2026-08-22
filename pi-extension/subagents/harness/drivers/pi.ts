@@ -70,6 +70,7 @@ export class PiHarnessDriver implements HarnessDriver {
       effectiveAutoExit,
       taskDelivery,
       denySet,
+      childSpawnDepth,
       identity,
       identityInSystemPrompt,
       systemPromptMode,
@@ -123,6 +124,9 @@ export class PiHarnessDriver implements HarnessDriver {
 
     if (denySet && denySet.size > 0) {
       envParts.push(`PI_DENY_TOOLS=${shellQuote([...denySet].join(","))}`);
+    }
+    if (childSpawnDepth != null) {
+      envParts.push(`PI_SUBAGENT_SPAWN_DEPTH=${childSpawnDepth}`);
     }
     envParts.push(`PI_SUBAGENT_NAME=${shellQuote(params.name)}`);
     if (params.agent) {

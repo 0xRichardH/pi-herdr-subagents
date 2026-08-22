@@ -357,7 +357,7 @@ You are a specialized agent that does X...
 | `tools`       | string  | Comma-separated **native pi tools only**: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`                                                                                                                                                                             |
 | `skills`      | string  | Comma-separated skill names to auto-load                                                                                                                                                                                                                                    |
 | `session-mode` | string | Default child-session mode: `standalone`, `lineage-only`, or `fork` |
-| `spawning`    | boolean | Set `false` to deny all subagent-spawning tools                                                                                                                                                                                                                             |
+| `spawning`    | boolean | **Spawn grant.** Subagent-spawning tools are denied for every child by default; set `true` to grant them (still bounded by `PI_SUBAGENT_SPAWN_DEPTH`, see below).                                                                                                              |
 | `deny-tools`  | string  | Comma-separated extension tool names to deny                                                                                                                                                                                                                                |
 | `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
 | `interactive` | boolean | derived        | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
@@ -439,18 +439,32 @@ subagent({ name: "Scout", agent: "scout", interactive: true, task: "..." });
 
 ## Tool Access Control
 
-By default, every sub-agent can spawn further sub-agents. Control this with frontmatter:
+By default, every sub-agent is launched **without** the subagent lifecycle tools (`subagent`, `subagent_interrupt`, `subagents_list`, `subagent_resume`) — spawning is a granted capability, not a given.
 
-### `spawning: false`
+### `spawning: true`
 
-Denies all subagent lifecycle tools (`subagent`, `subagent_interrupt`, `subagents_list`, `subagent_resume`):
+Grants the full subagent lifecycle tools to this agent:
 
 ```yaml
 ---
-name: worker
-spawning: false
+name: planner
+spawning: true
 ---
 ```
+
+Without this grant (the default), a child cannot spawn further sub-agents even if it tries. Any `deny-tools` entries still stack on top of a grant.
+
+### Recursion depth: `PI_SUBAGENT_SPAWN_DEPTH`
+
+Spawning agents can be bounded by setting `PI_SUBAGENT_SPAWN_DEPTH` in the top-level session's environment. The value is a generation ceiling for direct children:
+
+- Generation-1 children receive an allowance equal to the env value; each granted agent passes `remaining − 1` down to its own children, so the allowance decrements every generation and never rises.
+- A granted agent with `remaining = 0` cannot spawn — exhaustion overrides the frontmatter grant.
+- When the variable is unset, depth is unlimited but the `spawning: true` grant is still required.
+
+Example: `PI_SUBAGENT_SPAWN_DEPTH=2` allows children to spawn grandchildren, but great-grandchildren are denied. Mutually-spawning agents (`A` spawns `B`, `B` spawns `A`) therefore always terminate.
+
+Resumed sessions (`subagent_resume`) never receive more allowance than their first launch recorded in `<session-file>.spawn.json`; if that metadata is missing, resume denies spawning entirely.
 
 ### `deny-tools`
 
@@ -467,11 +481,11 @@ deny-tools: subagent
 
 | Agent      | `spawning`  | Rationale                                    |
 | ---------- | ----------- | -------------------------------------------- |
-| planner    | _(default)_ | Legitimately spawns scouts for investigation |
-| worker     | `false`     | Should implement tasks, not delegate         |
-| researcher | `false`     | Should research, not spawn                   |
-| reviewer   | `false`     | Should review, not spawn                     |
-| scout      | `false`     | Should gather context, not spawn             |
+| planner    | `true`      | Legitimately spawns scouts for investigation |
+| worker     | _(default)_ | Should implement tasks, not delegate         |
+| researcher | _(default)_ | Should research, not spawn                   |
+| reviewer   | _(default)_ | Should review, not spawn                     |
+| scout      | _(default)_ | Should gather context, not spawn             |
 
 ---
 
