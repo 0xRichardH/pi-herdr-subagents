@@ -167,6 +167,14 @@ When `activeCount === 0` (every tracked row is open), the border uses an amber a
 
 A fixed internal watchdog marks a run as `stalled` when pane inspection fails or the pane disappears without a completion sidecar; valid long-running `active` or `waiting` states do not become `stalled` just because time passes. When a run enters `stalled` or recovers from it, the parent agent receives a steer message so it can react. All other status transitions stay in the widget only.
 
+For a non-interactive child that remains genuinely `stalled`, the recovery ladder waits 30 seconds, sends one Escape nudge, waits another 60 seconds to escalate, then waits 90 seconds before closing the pane and aborting the watcher. The delivered result is a `recovery-kill` failure, never a completion. Configure the three consecutive delays (stall→nudge, nudge→escalation, escalation→kill) with comma-separated milliseconds:
+
+```bash
+export PI_SUBAGENT_RECOVERY_DELAYS_MS=30000,60000,90000
+```
+
+Missing or malformed values use those defaults; each value below `10000` ms is clamped to `10000` ms. The ladder runs only from the stalled pane projection, so active/streaming/provider work is not timed out by wall clock. Interactive children and report-only wrap-up stages are exempt.
+
 **Interactive subagents stay silent.** Long-running user-driven subagents (e.g. `planner`, or any `/iterate` fork) do not wake the parent session on `stalled`/`recovered` transitions — the user is working directly in the subagent's pane, and a steer message there would just burn an orchestrator turn on a no-op "still waiting" ping. The widget still updates normally, and activity snapshots are still recorded/classified regardless of the `interactive` setting. By default, agents with `auto-exit: true` are treated as autonomous and get stall pings; agents without it are treated as interactive and stay quiet. Override per-agent with `interactive: true|false` in frontmatter, or per-spawn with `interactive: true|false` on the tool call.
 
 #### Configuration

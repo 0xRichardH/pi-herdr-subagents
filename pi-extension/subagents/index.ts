@@ -78,6 +78,13 @@ import {
   type SubagentLifecycle,
   type PaneInspection,
 } from "./lifecycle.ts";
+import {
+  advanceRecoveryLadder,
+  formatRecoveryKillError,
+  parseRecoveryDelays,
+  type RecoveryDelays,
+  type RecoveryState,
+} from "./recovery.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -584,6 +591,10 @@ interface RunningSubagent {
     error?: string;
   };
   abortController?: AbortController;
+  recovery?: RecoveryState;
+  recoveryKilled?: { errorMessage: string; killedAt: number };
+  /** Reserved for the L-96 report-only continuation. */
+  wrapupPending?: boolean;
   cli?: string;
   sentinelFile?: string;
   /**
@@ -604,6 +615,18 @@ interface RunningSubagent {
   /** Parent-resolved model/thinking selection and provenance. */
   runtimePlan: ResolvedRuntimePlan | undefined;
 }
+
+interface RecoveryPaneOperations {
+  interruptPane: (surface: string) => void;
+  closePane: (surface: string) => void;
+  abortWatcher: (controller: AbortController | undefined) => void;
+}
+
+const DEFAULT_RECOVERY_PANE_OPERATIONS: RecoveryPaneOperations = {
+  interruptPane,
+  closePane,
+  abortWatcher: (controller) => controller?.abort(),
+};
 
 interface SubagentRuntime {
   runningSubagents: Map<string, RunningSubagent>;
@@ -946,6 +969,75 @@ function requestSubagentInterrupt(
   }
 }
 
+function isTerminalLifecycle(lifecycle: SubagentLifecycle): boolean {
+  return lifecycle.process.kind === "completed" || lifecycle.process.kind === "failed";
+}
+
+/** Idempotent failure teardown shared with future hard-stop paths. */
+function failAndTeardownSubagent(
+  running: RunningSubagent,
+  error: string,
+  now: number,
+  operations: Pick<RecoveryPaneOperations, "closePane" | "abortWatcher"> = DEFAULT_RECOVERY_PANE_OPERATIONS,
+  beforeAbort?: () => void,
+): boolean {
+  const lifecycle = ensureLifecycle(running);
+  if (isTerminalLifecycle(lifecycle)) return false;
+
+  beforeAbort?.();
+  running.lifecycle = markFailed(lifecycle, error, now, 1);
+  try {
+    operations.closePane(running.surface);
+  } catch {}
+  try {
+    operations.abortWatcher(running.abortController);
+  } catch {}
+  return true;
+}
+
+function advanceRunningRecovery(
+  running: RunningSubagent,
+  projection: LifecycleProjection,
+  now: number,
+  delays: RecoveryDelays,
+  operations: RecoveryPaneOperations = DEFAULT_RECOVERY_PANE_OPERATIONS,
+) {
+  const advance = advanceRecoveryLadder(running.recovery, {
+    now,
+    stalled: projection.kind === "stalled",
+    exempt: running.interactive || running.wrapupPending === true,
+    delays,
+  });
+  running.recovery = advance.state;
+
+  if (advance.action === "nudge") {
+    requestSubagentInterrupt(running, operations.interruptPane);
+  } else if (advance.action === "kill") {
+    const error = formatRecoveryKillError(now - running.startTime);
+    failAndTeardownSubagent(running, error, now, operations, () => {
+      // The watcher observes its abort asynchronously, so set this first.
+      running.recoveryKilled = { errorMessage: error, killedAt: now };
+    });
+  }
+
+  return advance;
+}
+
+function buildRecoveryKilledResult(running: RunningSubagent, now: number): SubagentResult | null {
+  const recoveryKilled = running.recoveryKilled;
+  if (!recoveryKilled) return null;
+  return {
+    name: running.name,
+    task: running.task,
+    summary: `Subagent error: ${recoveryKilled.errorMessage}`,
+    sessionFile: running.sessionFile,
+    exitCode: 1,
+    elapsed: Math.floor(Math.max(0, now - running.startTime) / 1000),
+    error: recoveryKilled.errorMessage,
+    errorMessage: recoveryKilled.errorMessage,
+  };
+}
+
 function handleSubagentInterrupt(
   params: { id?: string; name?: string },
   interruptPaneKey: (surface: string) => void = interruptPane,
@@ -997,6 +1089,7 @@ function handleSubagentInterrupt(
 
 function startStatusRefresh(pi: ExtensionAPI) {
   if (!statusConfig.enabled || statusInterval) return;
+  const recoveryDelays = parseRecoveryDelays(process.env.PI_SUBAGENT_RECOVERY_DELAYS_MS);
 
   statusInterval = setInterval(() => {
     if (runningSubagents.size === 0) {
@@ -1016,6 +1109,8 @@ function startStatusRefresh(pi: ExtensionAPI) {
       // Dual-writes lifecycle + statusState for reload hydration; steers use lifecycle only.
       observeRunningSubagent(running, now);
       const projection = projectLifecycle(ensureLifecycle(running), now);
+      const recovery = advanceRunningRecovery(running, projection, now, recoveryDelays);
+      if (recovery.action) shouldRefreshWidget = true;
       const transition = lifecycleTransition(running.lastProjectedKind, projection.kind);
       if (running.lastProjectedKind !== projection.kind) {
         shouldRefreshWidget = true;
@@ -1081,6 +1176,9 @@ export const __test__ = {
   resolveDenyTools,
   resolveInterruptTarget,
   requestSubagentInterrupt,
+  failAndTeardownSubagent,
+  advanceRunningRecovery,
+  buildRecoveryKilledResult,
   handleSubagentInterrupt,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
@@ -1301,6 +1399,11 @@ async function watchSubagent(
     });
 
     const detectedAt = Date.now();
+    const recoveryResult = buildRecoveryKilledResult(running, detectedAt);
+    if (recoveryResult) {
+      updateWidget();
+      return recoveryResult;
+    }
     running.lifecycle = markCompletionDetected(running.lifecycle, result, detectedAt);
     updateWidget();
     const elapsed = Math.floor((detectedAt - startTime) / 1000);
@@ -1395,13 +1498,21 @@ async function watchSubagent(
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
     };
   } catch (err: any) {
+    const now = Date.now();
+    const recoveryResult = buildRecoveryKilledResult(running, now);
+    if (recoveryResult) {
+      running.lifecycle = markFailed(running.lifecycle, recoveryResult.errorMessage!, now, 1);
+      updateWidget();
+      return recoveryResult;
+    }
+
     try {
       closePane(surface);
     } catch {}
     running.lifecycle = markFailed(
       running.lifecycle,
       signal.aborted ? "Subagent cancelled." : err?.message ?? String(err),
-      Date.now(),
+      now,
       1,
     );
     updateWidget();
@@ -1412,7 +1523,7 @@ async function watchSubagent(
         task,
         summary: "Subagent cancelled.",
         exitCode: 1,
-        elapsed: Math.floor((Date.now() - startTime) / 1000),
+        elapsed: Math.floor((now - startTime) / 1000),
         error: "cancelled",
         sessionFile,
       };
@@ -1422,7 +1533,7 @@ async function watchSubagent(
       task,
       summary: `Subagent error: ${err?.message ?? String(err)}`,
       exitCode: 1,
-      elapsed: Math.floor((Date.now() - startTime) / 1000),
+      elapsed: Math.floor((now - startTime) / 1000),
       error: err?.message ?? String(err),
     };
   }
