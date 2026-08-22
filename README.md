@@ -359,7 +359,7 @@ You are a specialized agent that does X...
 | `session-mode` | string | Default child-session mode: `standalone`, `lineage-only`, or `fork` |
 | `spawning`    | boolean | Set `false` to deny all subagent-spawning tools                                                                                                                                                                                                                             |
 | `deny-tools`  | string  | Comma-separated extension tool names to deny                                                                                                                                                                                                                                |
-| `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
+| `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. Operator input or an Escape abort permanently disarms it for that session (with a one-time warning); the `/auto-exit` slash command re-arms it for exactly one completion. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
 | `interactive` | boolean | derived        | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
 | `disable-model-invocation` | boolean | Hide this agent from discovery surfaces like `subagents_list`. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`. |
@@ -393,8 +393,10 @@ When set to `true`, the agent session shuts down automatically as soon as the ag
 
 **Behavior:**
 
-- The session closes after the agent's final message (on the `agent_end` event)
-- If the user sends **any input** before the agent finishes, auto-exit is permanently disabled for that session — the user takes over interactively
+- The session closes after the agent's settled final message
+- **Operator takeover disarms auto-exit permanently:** any input sent after the first agent run starts, or an Escape-triggered abort, disables auto-exit for the rest of the session and emits a one-time warning in the child pane. The session then behaves like a normal interactive session
+- **`/auto-exit` re-arms once:** run this slash command inside the child pane after taking over; auto-exit closes the session after its next completed turn (writing the usual done/error sidecar) and is disarmed again until the command is run once more. It is a no-op while auto-exit is already armed or already re-armed
+- Background children that never receive operator input keep exiting on their first normal completion — behavior is unchanged from previous releases
 - The modeHint injected into the agent's task is adjusted accordingly: autonomous agents see "Complete your task autonomously." rather than instructions to call `subagent_done`
 
 **When to use:**
