@@ -369,8 +369,13 @@ You are a specialized agent that does X...
 | `deny-tools`  | string  | Comma-separated extension tool names to deny                                                                                                                                                                                                                                |
 | `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
 | `interactive` | boolean | derived        | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
+| `time-limit` | positive integer seconds | — | Whole-run deadline for a non-interactive agent. At the deadline the pane closes and the parent receives a timed-out failure with the session still resumable. |
+| `idle-timeout` | positive integer seconds | — | Deadline measured from the latest Pi activity snapshot; it is ignored when no activity snapshots are available. |
+| `timeout-warn-threshold` | fraction `0 < n < 1` | — | Optional warning fraction for either limit on Pi-backed children. At the threshold the child receives one report-only continuation; omit it for hard-stop only. Other CLIs retain the hard deadline only. |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
 | `disable-model-invocation` | boolean | Hide this agent from discovery surfaces like `subagents_list`. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`. |
+
+A warning writes a directive beside the child session, sends Escape only to interrupt the active turn, and reserves the original deadline for one final report-only turn. That normal completion is delivered as a **partial report under time limit** (not a full completion); the directive never types text into the child pane and fresh report activity cannot extend an idle deadline.
 
 ---
 
