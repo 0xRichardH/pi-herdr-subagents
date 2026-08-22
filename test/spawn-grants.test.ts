@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { PiHarnessDriver } from "../pi-extension/subagents/harness/index.ts";
 import type { SubagentLaunchContext } from "../pi-extension/subagents/harness/types.ts";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
+import subagentsExtension from "../pi-extension/subagents/index.ts";
 
 const testApi = (subagentsModule as any).__test__;
 const SPAWNING_TOOLS = [...testApi.SPAWNING_TOOLS as Set<string>].sort();
@@ -208,5 +209,83 @@ describe("termination regression", () => {
     assert.equal(testApi.blockedSelfSpawn("planner", "scout"), false);
     assert.equal(testApi.blockedSelfSpawn(undefined, "scout"), false);
     assert.equal(testApi.blockedSelfSpawn("scout", undefined), false);
+  });
+});
+
+describe("self-spawn guard via the real registered tool execute()", () => {
+  function registerExtensionAndGetTools() {
+    const tools = new Map<string, any>();
+    // Registration-time calls only; handler bodies never run in these tests.
+    const mockPi = {
+      on: () => {},
+      registerTool: (tool: any) => tools.set(tool.name, tool),
+      registerCommand: () => {},
+      registerMessageRenderer: () => {},
+      sendMessage: () => {},
+      sendUserMessage: () => {},
+      getThinkingLevel: () => "off",
+    };
+    // Strip child-agent env so no spawning tools look denied during registration.
+    const savedId = process.env.PI_SUBAGENT_ID;
+    const savedDeny = process.env.PI_DENY_TOOLS;
+    delete process.env.PI_SUBAGENT_ID;
+    delete process.env.PI_DENY_TOOLS;
+    try {
+      subagentsExtension(mockPi as any);
+    } finally {
+      if (savedId === undefined) delete process.env.PI_SUBAGENT_ID;
+      else process.env.PI_SUBAGENT_ID = savedId;
+      if (savedDeny === undefined) delete process.env.PI_DENY_TOOLS;
+      else process.env.PI_DENY_TOOLS = savedDeny;
+    }
+    return tools;
+  }
+
+  it("returns guidance text instead of throwing when an agent spawns itself", async () => {
+    const previousAgent = process.env.PI_SUBAGENT_AGENT;
+    process.env.PI_SUBAGENT_AGENT = "planner";
+    try {
+      const tool = registerExtensionAndGetTools().get("subagent");
+      assert.ok(tool, "subagent tool must be registered");
+
+      const result = await tool.execute(
+        "test-call",
+        { name: "dup", task: "do work", agent: "planner" },
+        undefined,
+        undefined,
+        {},
+      );
+
+      const text = result.content[0].text as string;
+      assert.match(text, /You are the planner agent/);
+      assert.match(text, /do not start another planner/);
+      assert.deepEqual(result.details, { error: "self-spawn blocked" });
+    } finally {
+      if (previousAgent === undefined) delete process.env.PI_SUBAGENT_AGENT;
+      else process.env.PI_SUBAGENT_AGENT = previousAgent;
+    }
+  });
+
+  it("does not block spawning a different agent", async () => {
+    process.env.PI_SUBAGENT_AGENT = "planner";
+    try {
+      const tool = registerExtensionAndGetTools().get("subagent");
+      assert.ok(tool);
+
+      await assert.rejects(
+        () =>
+          tool.execute(
+            "test-call",
+            { name: "s", task: "t", agent: "scout" },
+            undefined,
+            undefined,
+            {},
+          ),
+        // Guard passes; execution then fails later on missing prerequisites.
+        // Any throw proves it got past the self-spawn guard without one.
+      );
+    } finally {
+      delete process.env.PI_SUBAGENT_AGENT;
+    }
   });
 });

@@ -1597,7 +1597,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         // Prevent self-spawning (e.g. planner spawning another planner)
-        if (blockedSelfSpawn(params.agent, process.env.PI_SUBAGENT_AGENT)) {
+        // Non-empty here is guaranteed by blockedSelfSpawn requiring both args
+        // truthy and equal, so the message always renders a real identity.
+        const currentAgent = process.env.PI_SUBAGENT_AGENT;
+        if (blockedSelfSpawn(params.agent, currentAgent)) {
           return {
             content: [
               {
