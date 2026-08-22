@@ -1,5 +1,6 @@
 import type { ActivityReadResult, SubagentActivityScope } from "./activity.ts";
 import type { CompletionResult } from "./completion.ts";
+import { DEFAULT_ACTIVE_TOOL_STALL_MS } from "./recovery.ts";
 
 export type HerdrAgentStatus =
   | "idle"
@@ -387,7 +388,11 @@ export function markDelivery(lifecycle: SubagentLifecycle, delivery: CompletionD
   return { ...lifecycle, delivery };
 }
 
-export function projectLifecycle(lifecycle: SubagentLifecycle, now: number): LifecycleProjection {
+export function projectLifecycle(
+  lifecycle: SubagentLifecycle,
+  now: number,
+  opts?: { activeToolStallMs?: number },
+): LifecycleProjection {
   const process = lifecycle.process;
   if (process.kind === "finalizing") return { kind: "finalizing", runtimeEndedAt: process.detectedAt };
   if (process.kind === "completed") return { kind: "completed", runtimeEndedAt: process.completedAt };
@@ -407,6 +412,18 @@ export function projectLifecycle(lifecycle: SubagentLifecycle, now: number): Lif
     case "interrupted":
       return { kind: "interrupted", stateDurationSince: turn.requestedAt };
     case "active": {
+      // A child wedged in one tool call keeps phase=active but stops emitting
+      // events, so a tool-scope detail older than the stall window counts as
+      // stalled; stateDurationSince = last activity so duration == silence.
+      const activeToolStallMs = opts?.activeToolStallMs ?? DEFAULT_ACTIVE_TOOL_STALL_MS;
+      if (
+        turn.activity?.kind === "scope" &&
+        turn.activity.scope === "tool" &&
+        activeToolStallMs > 0 &&
+        now - turn.activity.observedAt >= activeToolStallMs
+      ) {
+        return { kind: "stalled", stateDurationSince: turn.activity.observedAt };
+      }
       if (turn.activity?.kind === "scope") {
         const label = turn.activity.label ?? turn.activity.scope;
         return { kind: "active", label, stateDurationSince: turn.startedAt };

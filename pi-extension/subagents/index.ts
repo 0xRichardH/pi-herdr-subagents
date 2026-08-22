@@ -81,6 +81,7 @@ import {
 import {
   advanceRecoveryLadder,
   formatRecoveryKillError,
+  parseActiveToolStallMs,
   parseRecoveryDelays,
   type RecoveryDelays,
   type RecoveryState,
@@ -783,7 +784,12 @@ function formatLifecycleWidgetLabel(
 
 function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): string[] {
   const now = Date.now();
-  const rendered = agents.map((agent) => ({ agent, projection: projectLifecycle(ensureLifecycle(agent), now) }));
+  const rendered = agents.map((agent) => ({
+    agent,
+    projection: projectLifecycle(ensureLifecycle(agent), now, {
+      activeToolStallMs: parseActiveToolStallMs(process.env.PI_SUBAGENT_ACTIVE_TOOL_STALL_MS),
+    }),
+  }));
   const activeCount = rendered.filter(({ projection }) =>
     projection.kind === "active" ||
     projection.kind === "starting" ||
@@ -1090,6 +1096,7 @@ function handleSubagentInterrupt(
 function startStatusRefresh(pi: ExtensionAPI) {
   if (!statusConfig.enabled || statusInterval) return;
   const recoveryDelays = parseRecoveryDelays(process.env.PI_SUBAGENT_RECOVERY_DELAYS_MS);
+  const activeToolStallMs = parseActiveToolStallMs(process.env.PI_SUBAGENT_ACTIVE_TOOL_STALL_MS);
 
   statusInterval = setInterval(() => {
     if (runningSubagents.size === 0) {
@@ -1108,7 +1115,7 @@ function startStatusRefresh(pi: ExtensionAPI) {
     for (const running of runningSubagents.values()) {
       // Dual-writes lifecycle + statusState for reload hydration; steers use lifecycle only.
       observeRunningSubagent(running, now);
-      const projection = projectLifecycle(ensureLifecycle(running), now);
+      const projection = projectLifecycle(ensureLifecycle(running), now, { activeToolStallMs });
       const recovery = advanceRunningRecovery(running, projection, now, recoveryDelays);
       if (recovery.action) shouldRefreshWidget = true;
       const transition = lifecycleTransition(running.lastProjectedKind, projection.kind);

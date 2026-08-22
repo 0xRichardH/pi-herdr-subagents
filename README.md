@@ -175,6 +175,14 @@ export PI_SUBAGENT_RECOVERY_DELAYS_MS=30000,60000,90000
 
 Missing or malformed values use those defaults; each value below `10000` ms is clamped to `10000` ms. The ladder runs only from the stalled pane projection, so active/streaming/provider work is not timed out by wall clock. Interactive children and report-only wrap-up stages are exempt.
 
+A child wedged inside a single long-running tool call never leaves the `tool` activity scope, so by default it also projects `stalled` after `600000` ms (10 minutes) of tool-scope silence — the last tool-scope activity snapshot aging past the window — and drives the same wait→nudge→kill ladder automatically. Hung tool calls therefore recover without extra configuration; set to `0` to disable:
+
+```bash
+export PI_SUBAGENT_ACTIVE_TOOL_STALL_MS=600000
+```
+
+Missing or malformed values use that default. Only `tool`-scope staleness counts: provider/streaming/agent scopes are never stale-stalled because LLM calls may legitimately think silently. When fresh tool activity arrives, the child emits a `recovered` transition like any other stall recovery.
+
 **Interactive subagents stay silent.** Long-running user-driven subagents (e.g. `planner`, or any `/iterate` fork) do not wake the parent session on `stalled`/`recovered` transitions — the user is working directly in the subagent's pane, and a steer message there would just burn an orchestrator turn on a no-op "still waiting" ping. The widget still updates normally, and activity snapshots are still recorded/classified regardless of the `interactive` setting. By default, agents with `auto-exit: true` are treated as autonomous and get stall pings; agents without it are treated as interactive and stay quiet. Override per-agent with `interactive: true|false` in frontmatter, or per-spawn with `interactive: true|false` on the tool call.
 
 #### Configuration

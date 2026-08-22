@@ -19,6 +19,17 @@ function defaultRecoveryDelays(): RecoveryDelays {
   return [...DEFAULT_RECOVERY_DELAYS];
 }
 
+export const DEFAULT_ACTIVE_TOOL_STALL_MS = 600_000;
+
+/** Parse PI_SUBAGENT_ACTIVE_TOOL_STALL_MS without reading process.env; 0 disables. */
+export function parseActiveToolStallMs(raw: string | undefined): number {
+  const trimmed = raw?.trim();
+  if (!trimmed) return DEFAULT_ACTIVE_TOOL_STALL_MS;
+  const value = Number(trimmed);
+  if (!Number.isSafeInteger(value) || value < 0) return DEFAULT_ACTIVE_TOOL_STALL_MS;
+  return value;
+}
+
 /** Parse PI_SUBAGENT_RECOVERY_DELAYS_MS without reading process.env. */
 export function parseRecoveryDelays(raw: string | undefined): RecoveryDelays {
   const parts = raw?.split(",").map((part) => part.trim());
