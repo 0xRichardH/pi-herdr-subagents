@@ -78,6 +78,24 @@ import {
   type SubagentLifecycle,
   type PaneInspection,
 } from "./lifecycle.ts";
+import {
+  advanceRecoveryLadder,
+  formatRecoveryKillError,
+  parseActiveToolStallMs,
+  parseRecoveryDelays,
+  type RecoveryDelays,
+  type RecoveryState,
+} from "./recovery.ts";
+import {
+  cleanupWrapupDirective,
+  evalTimeLimit,
+  formatTimeLimitError,
+  getTimeLimitDeadlineAt,
+  parsePositiveIntegerSeconds,
+  parseTimeoutWarnThreshold,
+  writeWrapupDirective,
+  type TimeLimitConfig,
+} from "./time-limits.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -189,6 +207,9 @@ interface AgentDefaults {
   spawning?: boolean;
   autoExit?: boolean;
   interactive?: boolean;
+  timeLimitSeconds?: number;
+  idleTimeoutSeconds?: number;
+  timeoutWarnThreshold?: number;
   systemPromptMode?: "append" | "replace";
   sessionMode?: SubagentSessionMode;
   cwd?: string;
@@ -303,6 +324,11 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
     spawning: parseOptionalBoolean(getFrontmatterValue(frontmatter, "spawning")),
     autoExit: parseOptionalBoolean(getFrontmatterValue(frontmatter, "auto-exit")),
     interactive: parseOptionalBoolean(getFrontmatterValue(frontmatter, "interactive")),
+    timeLimitSeconds: parsePositiveIntegerSeconds(getFrontmatterValue(frontmatter, "time-limit")),
+    idleTimeoutSeconds: parsePositiveIntegerSeconds(getFrontmatterValue(frontmatter, "idle-timeout")),
+    timeoutWarnThreshold: parseTimeoutWarnThreshold(
+      getFrontmatterValue(frontmatter, "timeout-warn-threshold"),
+    ),
     sessionMode: parseSessionMode(getFrontmatterValue(frontmatter, "session-mode")),
     cwd: getFrontmatterValue(frontmatter, "cwd"),
     cli: getFrontmatterValue(frontmatter, "cli"),
@@ -464,6 +490,20 @@ function resolveEffectiveInteractive(
   return !resolveEffectiveAutoExit(params, agentDefs);
 }
 
+function resolveTimeLimitConfig(
+  agentDefs: AgentDefaults | null,
+  interactive: boolean,
+  supportsWrapup = true,
+): TimeLimitConfig | undefined {
+  if (interactive || !agentDefs) return undefined;
+  const config: TimeLimitConfig = {
+    timeLimitSeconds: agentDefs.timeLimitSeconds,
+    idleTimeoutSeconds: agentDefs.idleTimeoutSeconds,
+    timeoutWarnThreshold: supportsWrapup ? agentDefs.timeoutWarnThreshold : undefined,
+  };
+  return config.timeLimitSeconds || config.idleTimeoutSeconds ? config : undefined;
+}
+
 function loadAgentDefaults(agentName: string): AgentDefaults | null {
   // Resolve through the same name-keyed map discoverAgentDefinitions() builds
   // for the tool-guidance catalog, so a name advertised there always resolves
@@ -520,7 +560,7 @@ const modelConfig = loadModelConfig();
 function resolveResultPresentation(
   result: Pick<
     SubagentResult,
-    "exitCode" | "elapsed" | "summary" | "sessionFile" | "errorMessage"
+    "exitCode" | "elapsed" | "summary" | "sessionFile" | "errorMessage" | "partial" | "timeout"
   >,
   name: string,
 ): string {
@@ -542,9 +582,23 @@ function resolveResultPresentation(
     );
   }
 
+  if (result.partial) {
+    return (
+      `Sub-agent "${name}" delivered a partial report under its time limit ` +
+      `(${formatElapsed(result.elapsed)}).\n\n${result.summary}${sessionRef}`
+    );
+  }
+
   return result.exitCode !== 0
     ? `Sub-agent "${name}" failed (exit code ${result.exitCode}).\n\n${result.summary}${sessionRef}`
     : `Sub-agent "${name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${sessionRef}`;
+}
+
+function buildResultTimeoutDetails(result: Pick<SubagentResult, "partial" | "timeout">) {
+  return {
+    ...(result.partial ? { partial: true } : {}),
+    ...(result.timeout ? { timeout: result.timeout } : {}),
+  };
 }
 
 /**
@@ -561,6 +615,9 @@ interface SubagentResult {
   error?: string;
   /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
   errorMessage?: string;
+  /** A normal completion produced by the one-shot time-limit report continuation. */
+  partial?: boolean;
+  timeout?: "warned-wrapup" | "hard-stop";
   ping?: { name: string; message: string };
 }
 
@@ -584,6 +641,15 @@ interface RunningSubagent {
     error?: string;
   };
   abortController?: AbortController;
+  recovery?: RecoveryState;
+  recoveryKilled?: { errorMessage: string; killedAt: number };
+  timeLimit?: TimeLimitConfig;
+  timeLimitWarned?: boolean;
+  /** The deadline fixed at warning time so fresh report activity cannot extend an idle limit. */
+  timeLimitDeadlineAt?: number;
+  timeLimitStopped?: { errorMessage: string; stoppedAt: number };
+  /** A report-only continuation has been requested and awaits its normal completion. */
+  wrapupPending?: boolean;
   cli?: string;
   sentinelFile?: string;
   /**
@@ -604,6 +670,29 @@ interface RunningSubagent {
   /** Parent-resolved model/thinking selection and provenance. */
   runtimePlan: ResolvedRuntimePlan | undefined;
 }
+
+interface RecoveryPaneOperations {
+  interruptPane: (surface: string) => void;
+  closePane: (surface: string) => void;
+  abortWatcher: (controller: AbortController | undefined) => void;
+}
+
+const DEFAULT_RECOVERY_PANE_OPERATIONS: RecoveryPaneOperations = {
+  interruptPane,
+  closePane,
+  abortWatcher: (controller) => controller?.abort(),
+};
+
+interface TimeLimitPaneOperations extends RecoveryPaneOperations {
+  writeWrapup: (sessionFile: string) => void;
+  removeWrapup: (sessionFile: string) => void;
+}
+
+const DEFAULT_TIME_LIMIT_PANE_OPERATIONS: TimeLimitPaneOperations = {
+  ...DEFAULT_RECOVERY_PANE_OPERATIONS,
+  writeWrapup: writeWrapupDirective,
+  removeWrapup: cleanupWrapupDirective,
+};
 
 interface SubagentRuntime {
   runningSubagents: Map<string, RunningSubagent>;
@@ -760,7 +849,12 @@ function formatLifecycleWidgetLabel(
 
 function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): string[] {
   const now = Date.now();
-  const rendered = agents.map((agent) => ({ agent, projection: projectLifecycle(ensureLifecycle(agent), now) }));
+  const rendered = agents.map((agent) => ({
+    agent,
+    projection: projectLifecycle(ensureLifecycle(agent), now, {
+      activeToolStallMs: parseActiveToolStallMs(process.env.PI_SUBAGENT_ACTIVE_TOOL_STALL_MS),
+    }),
+  }));
   const activeCount = rendered.filter(({ projection }) =>
     projection.kind === "active" ||
     projection.kind === "starting" ||
@@ -946,6 +1040,166 @@ function requestSubagentInterrupt(
   }
 }
 
+function isTerminalLifecycle(lifecycle: SubagentLifecycle): boolean {
+  return lifecycle.process.kind === "completed" || lifecycle.process.kind === "failed";
+}
+
+/** Idempotent failure teardown shared with future hard-stop paths. */
+function failAndTeardownSubagent(
+  running: RunningSubagent,
+  error: string,
+  now: number,
+  operations: Pick<RecoveryPaneOperations, "closePane" | "abortWatcher"> = DEFAULT_RECOVERY_PANE_OPERATIONS,
+  beforeAbort?: () => void,
+): boolean {
+  const lifecycle = ensureLifecycle(running);
+  if (isTerminalLifecycle(lifecycle)) return false;
+
+  beforeAbort?.();
+  running.lifecycle = markFailed(lifecycle, error, now, 1);
+  try {
+    operations.closePane(running.surface);
+  } catch {}
+  try {
+    operations.abortWatcher(running.abortController);
+  } catch {}
+  return true;
+}
+
+function advanceRunningRecovery(
+  running: RunningSubagent,
+  projection: LifecycleProjection,
+  now: number,
+  delays: RecoveryDelays,
+  operations: RecoveryPaneOperations = DEFAULT_RECOVERY_PANE_OPERATIONS,
+) {
+  const advance = advanceRecoveryLadder(running.recovery, {
+    now,
+    stalled: projection.kind === "stalled",
+    exempt:
+      running.interactive ||
+      running.wrapupPending === true ||
+      running.timeLimitStopped != null,
+    delays,
+  });
+  running.recovery = advance.state;
+
+  if (advance.action === "nudge") {
+    requestSubagentInterrupt(running, operations.interruptPane);
+  } else if (advance.action === "kill") {
+    const error = formatRecoveryKillError(now - running.startTime);
+    failAndTeardownSubagent(running, error, now, operations, () => {
+      // The watcher observes its abort asynchronously, so set this first.
+      running.recoveryKilled = { errorMessage: error, killedAt: now };
+    });
+  }
+
+  return advance;
+}
+
+function buildRecoveryKilledResult(running: RunningSubagent, now: number): SubagentResult | null {
+  const recoveryKilled = running.recoveryKilled;
+  if (!recoveryKilled) return null;
+  return {
+    name: running.name,
+    task: running.task,
+    summary: `Subagent error: ${recoveryKilled.errorMessage}`,
+    sessionFile: running.sessionFile,
+    exitCode: 1,
+    elapsed: Math.floor(Math.max(0, now - running.startTime) / 1000),
+    error: recoveryKilled.errorMessage,
+    errorMessage: recoveryKilled.errorMessage,
+  };
+}
+
+function advanceRunningTimeLimit(
+  running: RunningSubagent,
+  now: number,
+  operations: TimeLimitPaneOperations = DEFAULT_TIME_LIMIT_PANE_OPERATIONS,
+): { action: "warn" | "hard-stop" | null } {
+  if (
+    running.interactive ||
+    !running.timeLimit ||
+    running.recoveryKilled ||
+    running.timeLimitStopped
+  ) {
+    return { action: null };
+  }
+
+  const lastActivityAt = running.activity?.updatedAt;
+  const action = running.timeLimitDeadlineAt != null
+    ? now >= running.timeLimitDeadlineAt ? "hard-stop" : "none"
+    : evalTimeLimit(
+      now,
+      running.startTime,
+      lastActivityAt,
+      running.timeLimit,
+      running.timeLimitWarned === true,
+    );
+
+  if (action === "warn") {
+    try {
+      operations.writeWrapup(running.sessionFile);
+    } catch {
+      return { action: null };
+    }
+    const interruption = requestSubagentInterrupt(running, operations.interruptPane);
+    if ("error" in interruption) {
+      try {
+        operations.removeWrapup(running.sessionFile);
+      } catch {}
+      return { action: null };
+    }
+
+    running.timeLimitWarned = true;
+    running.wrapupPending = true;
+    running.timeLimitDeadlineAt = getTimeLimitDeadlineAt(
+      running.startTime,
+      lastActivityAt,
+      running.timeLimit,
+    );
+    running.lifecycle = markInterruptRequested(ensureLifecycle(running), now);
+    return { action: "warn" };
+  }
+
+  if (action === "hard-stop") {
+    const error = formatTimeLimitError(now - running.startTime);
+    const stopped = failAndTeardownSubagent(running, error, now, operations, () => {
+      running.timeLimitStopped = { errorMessage: error, stoppedAt: now };
+      running.wrapupPending = false;
+      try {
+        operations.removeWrapup(running.sessionFile);
+      } catch {}
+    });
+    return { action: stopped ? "hard-stop" : null };
+  }
+
+  return { action: null };
+}
+
+function buildTimeLimitStoppedResult(running: RunningSubagent, now: number): SubagentResult | null {
+  const stopped = running.timeLimitStopped;
+  if (!stopped) return null;
+
+  let tail: string | null = null;
+  try {
+    if (existsSync(running.sessionFile)) {
+      tail = findLastAssistantMessage(getNewEntries(running.sessionFile, 0));
+    }
+  } catch {}
+
+  return {
+    name: running.name,
+    task: running.task,
+    summary: `${stopped.errorMessage}${tail ? `\n\nLast session output:\n${tail}` : ""}`,
+    sessionFile: running.sessionFile,
+    exitCode: 1,
+    elapsed: Math.floor(Math.max(0, now - running.startTime) / 1_000),
+    error: stopped.errorMessage,
+    timeout: "hard-stop",
+  };
+}
+
 function handleSubagentInterrupt(
   params: { id?: string; name?: string },
   interruptPaneKey: (surface: string) => void = interruptPane,
@@ -997,6 +1251,8 @@ function handleSubagentInterrupt(
 
 function startStatusRefresh(pi: ExtensionAPI) {
   if (!statusConfig.enabled || statusInterval) return;
+  const recoveryDelays = parseRecoveryDelays(process.env.PI_SUBAGENT_RECOVERY_DELAYS_MS);
+  const activeToolStallMs = parseActiveToolStallMs(process.env.PI_SUBAGENT_ACTIVE_TOOL_STALL_MS);
 
   statusInterval = setInterval(() => {
     if (runningSubagents.size === 0) {
@@ -1015,7 +1271,9 @@ function startStatusRefresh(pi: ExtensionAPI) {
     for (const running of runningSubagents.values()) {
       // Dual-writes lifecycle + statusState for reload hydration; steers use lifecycle only.
       observeRunningSubagent(running, now);
-      const projection = projectLifecycle(ensureLifecycle(running), now);
+      const projection = projectLifecycle(ensureLifecycle(running), now, { activeToolStallMs });
+      const recovery = advanceRunningRecovery(running, projection, now, recoveryDelays);
+      if (recovery.action) shouldRefreshWidget = true;
       const transition = lifecycleTransition(running.lastProjectedKind, projection.kind);
       if (running.lastProjectedKind !== projection.kind) {
         shouldRefreshWidget = true;
@@ -1075,12 +1333,20 @@ export const __test__ = {
   resolveLaunchBehavior,
   resolveEffectiveAutoExit,
   resolveEffectiveInteractive,
+  resolveTimeLimitConfig,
+  parseAgentDefinition,
   buildSubagentToolAllowlist,
   buildPiPromptArgs,
   observeRunningSubagent,
   resolveDenyTools,
   resolveInterruptTarget,
   requestSubagentInterrupt,
+  failAndTeardownSubagent,
+  advanceRunningRecovery,
+  buildRecoveryKilledResult,
+  advanceRunningTimeLimit,
+  buildTimeLimitStoppedResult,
+  buildResultTimeoutDetails,
   handleSubagentInterrupt,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
@@ -1136,6 +1402,9 @@ async function launchSubagent(
   const effectiveThinking = runtimePlan.thinking;
   const effectiveAutoExit = resolveEffectiveAutoExit(params, agentDefs);
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
+  const cliId = agentDefs?.cli ?? "pi";
+  const driver = getHarnessDriver(cliId);
+  const timeLimit = resolveTimeLimitConfig(agentDefs, effectiveInteractive, driver.id === "pi");
 
   const sessionFile = ctx.sessionManager.getSessionFile();
   if (!sessionFile) throw new Error("No session file");
@@ -1158,8 +1427,6 @@ async function launchSubagent(
   ].join("-");
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
 
-  const cliId = agentDefs?.cli ?? "pi";
-  const driver = getHarnessDriver(cliId);
   driver.validateRuntimePlan?.(runtimePlan, parentThinking);
 
   const surfacePreCreated = !!options?.surface;
@@ -1263,6 +1530,7 @@ async function launchSubagent(
     interactive: effectiveInteractive,
     runtimePlan,
     activityFile: driver.hasActivitySnapshots ? activityFile : undefined,
+    timeLimit,
     lifecycle: !driver.hasActivitySnapshots
       ? markProcessRunning(createLifecycle(startTime), Date.now())
       : createLifecycle(startTime),
@@ -1296,11 +1564,23 @@ async function watchSubagent(
         updateWidget();
       },
       onTick() {
-        observeRunningSubagent(running);
+        const now = Date.now();
+        observeRunningSubagent(running, now);
+        if (advanceRunningTimeLimit(running, now).action) updateWidget();
       },
     });
 
     const detectedAt = Date.now();
+    const timeLimitResult = buildTimeLimitStoppedResult(running, detectedAt);
+    if (timeLimitResult) {
+      updateWidget();
+      return timeLimitResult;
+    }
+    const recoveryResult = buildRecoveryKilledResult(running, detectedAt);
+    if (recoveryResult) {
+      updateWidget();
+      return recoveryResult;
+    }
     running.lifecycle = markCompletionDetected(running.lifecycle, result, detectedAt);
     updateWidget();
     const elapsed = Math.floor((detectedAt - startTime) / 1000);
@@ -1329,6 +1609,7 @@ async function watchSubagent(
           exitCode: result.exitCode,
           elapsed,
           ...(extracted.sessionId ? { claudeSessionId: extracted.sessionId } : {}),
+          ...(result.wrapup ? { partial: true, timeout: "warned-wrapup" as const } : {}),
           ...extracted.details,
         };
       }
@@ -1392,16 +1673,30 @@ async function watchSubagent(
       exitCode: result.exitCode,
       elapsed,
       ping: result.ping,
+      ...(result.wrapup ? { partial: true, timeout: "warned-wrapup" as const } : {}),
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
     };
   } catch (err: any) {
+    const now = Date.now();
+    const timeLimitResult = buildTimeLimitStoppedResult(running, now);
+    if (timeLimitResult) {
+      updateWidget();
+      return timeLimitResult;
+    }
+    const recoveryResult = buildRecoveryKilledResult(running, now);
+    if (recoveryResult) {
+      running.lifecycle = markFailed(running.lifecycle, recoveryResult.errorMessage!, now, 1);
+      updateWidget();
+      return recoveryResult;
+    }
+
     try {
       closePane(surface);
     } catch {}
     running.lifecycle = markFailed(
       running.lifecycle,
       signal.aborted ? "Subagent cancelled." : err?.message ?? String(err),
-      Date.now(),
+      now,
       1,
     );
     updateWidget();
@@ -1412,7 +1707,7 @@ async function watchSubagent(
         task,
         summary: "Subagent cancelled.",
         exitCode: 1,
-        elapsed: Math.floor((Date.now() - startTime) / 1000),
+        elapsed: Math.floor((now - startTime) / 1000),
         error: "cancelled",
         sessionFile,
       };
@@ -1422,9 +1717,11 @@ async function watchSubagent(
       task,
       summary: `Subagent error: ${err?.message ?? String(err)}`,
       exitCode: 1,
-      elapsed: Math.floor((Date.now() - startTime) / 1000),
+      elapsed: Math.floor((now - startTime) / 1000),
       error: err?.message ?? String(err),
     };
+  } finally {
+    cleanupWrapupDirective(sessionFile);
   }
 }
 
@@ -1606,6 +1903,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   exitCode: result.exitCode,
                   elapsed: result.elapsed,
                   sessionFile: result.sessionFile,
+                  ...buildResultTimeoutDetails(result),
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
                   ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
                   ...(running.runtimePlan ? { runtimePlan: running.runtimePlan } : {}),
@@ -2068,6 +2366,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   exitCode: result.exitCode,
                   elapsed: result.elapsed,
                   sessionFile: params.sessionPath,
+                  ...buildResultTimeoutDetails(result),
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
                   ...(running.runtimePlan ? { runtimePlan: running.runtimePlan } : {}),
                 },
@@ -2162,18 +2461,25 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const exitCode = details.exitCode ?? 0;
         const errorMessage = typeof details.errorMessage === "string" ? details.errorMessage : "";
         const failed = exitCode !== 0 || !!errorMessage;
+        const partial = !failed && (details.partial === true || details.timeout === "warned-wrapup");
         const elapsed = details.elapsed != null ? formatElapsed(details.elapsed) : "?";
         const bgFn = failed
           ? (text: string) => theme.bg("toolErrorBg", text)
-          : (text: string) => theme.bg("toolSuccessBg", text);
+          : partial
+            ? (text: string) => theme.bg("customMessageBg", text)
+            : (text: string) => theme.bg("toolSuccessBg", text);
         const icon = failed
           ? theme.fg("error", "✗")
-          : theme.fg("success", "✓");
+          : partial
+            ? theme.fg("warning", "⚠")
+            : theme.fg("success", "✓");
         const status = errorMessage
           ? "failed (provider/agent error)"
           : failed
             ? `failed (exit ${exitCode})`
-            : "completed";
+            : partial
+              ? "partial report (time limit)"
+              : "completed";
         const agentTag = details.agent ? theme.fg("dim", ` (${details.agent})`) : "";
 
         const header = `${icon} ${theme.fg("toolTitle", theme.bold(name))}${agentTag} ${theme.fg("dim", "—")} ${status} ${theme.fg("dim", `(${elapsed})`)}`;

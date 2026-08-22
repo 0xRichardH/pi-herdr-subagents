@@ -167,6 +167,22 @@ When `activeCount === 0` (every tracked row is open), the border uses an amber a
 
 A fixed internal watchdog marks a run as `stalled` when pane inspection fails or the pane disappears without a completion sidecar; valid long-running `active` or `waiting` states do not become `stalled` just because time passes. When a run enters `stalled` or recovers from it, the parent agent receives a steer message so it can react. All other status transitions stay in the widget only.
 
+For a non-interactive child that remains genuinely `stalled`, the recovery ladder waits 30 seconds, sends one Escape nudge, waits another 60 seconds to escalate, then waits 90 seconds before closing the pane and aborting the watcher. The delivered result is a `recovery-kill` failure, never a completion. Configure the three consecutive delays (stall→nudge, nudge→escalation, escalation→kill) with comma-separated milliseconds:
+
+```bash
+export PI_SUBAGENT_RECOVERY_DELAYS_MS=30000,60000,90000
+```
+
+Missing or malformed values use those defaults; each value below `10000` ms is clamped to `10000` ms. The ladder runs only from the stalled pane projection, so active/streaming/provider work is not timed out by wall clock. Interactive children and report-only wrap-up stages are exempt.
+
+A child wedged inside a single long-running tool call never leaves the `tool` activity scope, so by default it also projects `stalled` after `600000` ms (10 minutes) of tool-scope silence — the last tool-scope activity snapshot aging past the window — and drives the same wait→nudge→kill ladder automatically. Hung tool calls therefore recover without extra configuration; set to `0` to disable:
+
+```bash
+export PI_SUBAGENT_ACTIVE_TOOL_STALL_MS=600000
+```
+
+Missing or malformed values use that default. Only `tool`-scope staleness counts: provider/streaming/agent scopes are never stale-stalled because LLM calls may legitimately think silently. When fresh tool activity arrives, the child emits a `recovered` transition like any other stall recovery.
+
 **Interactive subagents stay silent.** Long-running user-driven subagents (e.g. `planner`, or any `/iterate` fork) do not wake the parent session on `stalled`/`recovered` transitions — the user is working directly in the subagent's pane, and a steer message there would just burn an orchestrator turn on a no-op "still waiting" ping. The widget still updates normally, and activity snapshots are still recorded/classified regardless of the `interactive` setting. By default, agents with `auto-exit: true` are treated as autonomous and get stall pings; agents without it are treated as interactive and stay quiet. Override per-agent with `interactive: true|false` in frontmatter, or per-spawn with `interactive: true|false` on the tool call.
 
 #### Configuration
@@ -361,8 +377,13 @@ You are a specialized agent that does X...
 | `deny-tools`  | string  | Comma-separated extension tool names to deny                                                                                                                                                                                                                                |
 | `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
 | `interactive` | boolean | derived        | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
+| `time-limit` | positive integer seconds | — | Whole-run deadline for a non-interactive agent. At the deadline the pane closes and the parent receives a timed-out failure with the session still resumable. |
+| `idle-timeout` | positive integer seconds | — | Deadline measured from the latest Pi activity snapshot; it is ignored when no activity snapshots are available. |
+| `timeout-warn-threshold` | fraction `0 < n < 1` | — | Optional warning fraction for either limit on Pi-backed children. At the threshold the child receives one report-only continuation; omit it for hard-stop only. Other CLIs retain the hard deadline only. |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
 | `disable-model-invocation` | boolean | Hide this agent from discovery surfaces like `subagents_list`. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`. |
+
+A warning writes a directive beside the child session, sends Escape only to interrupt the active turn, and reserves the original deadline for one final report-only turn. That normal completion is delivered as a **partial report under time limit** (not a full completion); the directive never types text into the child pane and fresh report activity cannot extend an idle deadline.
 
 ---
 

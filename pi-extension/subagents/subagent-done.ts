@@ -8,6 +8,7 @@ import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
+import { consumeWrapupDirective } from "./time-limits.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -68,11 +69,19 @@ export function findLatestAssistantError(
   return null;
 }
 
-export function buildCompletionSidecar(messages: any[] | undefined):
-  | { type: "done" }
+export function buildCompletionSidecar(messages: any[] | undefined, wrapup = false):
+  | { type: "done"; wrapup?: true }
   | { type: "error"; errorMessage: string; stopReason: "error" } {
   const errorInfo = findLatestAssistantError(messages);
-  return errorInfo ? { type: "error", ...errorInfo } : { type: "done" };
+  return errorInfo ? { type: "error", ...errorInfo } : { type: "done", ...(wrapup ? { wrapup: true } : {}) };
+}
+
+export function latestAssistantWasAborted(messages: any[] | undefined): boolean {
+  if (!messages) return false;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role === "assistant") return messages[i].stopReason === "aborted";
+  }
+  return false;
 }
 
 export function parseDeniedTools(rawValue: string | undefined): string[] {
@@ -151,6 +160,7 @@ export default function (pi: ExtensionAPI) {
   let userTookOver = false;
   let agentStarted = false;
   let latestAgentMessages: any[] | undefined;
+  let wrapupInProgress = false;
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
@@ -162,8 +172,11 @@ export default function (pi: ExtensionAPI) {
     renderWidget(ctx, null);
   });
 
-  pi.on("input", () => {
+  pi.on("input", (event) => {
     recorder.input();
+    // Extension-injected report directives are not operator takeover. This keeps
+    // the report-only continuation compatible with sticky auto-exit disarming.
+    if ((event as any).source === "extension") return;
     // Ignore the initial task message that starts an autonomous subagent.
     // Only inputs after the first agent run has started count as user takeover.
     if (!shouldMarkUserTookOver(agentStarted)) return;
@@ -188,19 +201,30 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_settled", (_event, ctx) => {
-    const shouldExit = autoExit
-      && shouldAutoExitOnAgentEnd(userTookOver, latestAgentMessages);
+    const sessionFile = process.env.PI_SUBAGENT_SESSION;
+    const directive = !wrapupInProgress && latestAssistantWasAborted(latestAgentMessages)
+      ? consumeWrapupDirective(sessionFile)
+      : null;
+    if (directive) {
+      wrapupInProgress = true;
+      // This creates an extension-sourced turn; it is not text typed into the pane.
+      pi.sendUserMessage(directive);
+      return;
+    }
+
+    const shouldExit =
+      (autoExit && shouldAutoExitOnAgentEnd(userTookOver, latestAgentMessages)) ||
+      (wrapupInProgress && !latestAssistantWasAborted(latestAgentMessages));
 
     if (shouldExit) {
       // Surface stopReason: "error" turns (auto-retry exhausted, provider
       // overload, etc.) to the parent via the .exit sidecar so the watcher
       // can report a clear failure with the underlying error message.
-      const sessionFile = process.env.PI_SUBAGENT_SESSION;
       if (sessionFile) {
         try {
           writeFileSync(
             `${sessionFile}.exit`,
-            JSON.stringify(buildCompletionSidecar(latestAgentMessages)),
+            JSON.stringify(buildCompletionSidecar(latestAgentMessages, wrapupInProgress)),
           );
         } catch {
           // Best effort — the watcher can still detect the terminal sentinel
@@ -320,7 +344,10 @@ export default function (pi: ExtensionAPI) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       recorder.subagentDone();
       if (sessionFile) {
-        writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
+        writeFileSync(
+          `${sessionFile}.exit`,
+          JSON.stringify({ type: "done", ...(wrapupInProgress ? { wrapup: true } : {}) }),
+        );
       }
       ctx.shutdown();
       return {
