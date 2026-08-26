@@ -75,17 +75,22 @@ before(() => {
   delete process.env.PI_SUBAGENT_ID;
   delete process.env.PI_DENY_TOOLS;
 });
+const createdTestDirs: string[] = [];
+
 after(() => {
   if (inheritedSubagentId == null) delete process.env.PI_SUBAGENT_ID;
   else process.env.PI_SUBAGENT_ID = inheritedSubagentId;
   if (inheritedDenyTools == null) delete process.env.PI_DENY_TOOLS;
   else process.env.PI_DENY_TOOLS = inheritedDenyTools;
+  for (const dir of createdTestDirs) rmSync(dir, { recursive: true, force: true });
 });
 
 // --- Helpers ---
 
 function createTestDir(): string {
-  return mkdtempSync(join(tmpdir(), "subagents-test-"));
+  const dir = mkdtempSync(join(tmpdir(), "subagents-test-"));
+  createdTestDirs.push(dir);
+  return dir;
 }
 
 function createSessionFile(dir: string, entries: object[]): string {
@@ -1489,6 +1494,11 @@ describe("subagent-done.ts", () => {
       assert.equal(shouldAutoExitOnAgentEnd(false, messages), false);
     });
 
+    it("stays open after a tool-use turn", () => {
+      const messages = [{ role: "assistant", stopReason: "toolUse" }];
+      assert.equal(shouldAutoExitOnAgentEnd(false, messages), false);
+    });
+
     it("still exits when the latest turn ended with stopReason=error", () => {
       // Auto-exit subagents must shut down on retry-exhaustion errors so the
       // parent is woken. The error sidecar (written separately) carries the
@@ -1542,7 +1552,7 @@ describe("subagent-done.ts", () => {
         const { api, eventHandlers } = createMockExtensionApi();
         subagentDoneExtension(api);
         let shutdowns = 0;
-        const ctx = { shutdown: () => { shutdowns += 1; } };
+        const ctx = { shutdown: () => { shutdowns += 1; }, ui: { notify() {} } };
         eventHandlers.get("agent_end")![0]({
           messages: [{ role: "assistant", stopReason: "aborted" }],
         }, ctx);

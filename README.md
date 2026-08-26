@@ -167,6 +167,14 @@ When `activeCount === 0` (every tracked row is open), the border uses an amber a
 
 A fixed internal watchdog marks a run as `stalled` when pane inspection fails or the pane disappears without a completion sidecar; valid long-running `active` or `waiting` states do not become `stalled` just because time passes. When a run enters `stalled` or recovers from it, the parent agent receives a steer message so it can react. All other status transitions stay in the widget only.
 
+For a non-interactive child that remains genuinely `stalled`, the recovery ladder waits 30 seconds, sends one Escape nudge, waits another 60 seconds to escalate, then waits 90 seconds before closing the pane and aborting the watcher. The delivered result is a `recovery-kill` failure, never a completion. Configure the three consecutive delays (stall→nudge, nudge→escalation, escalation→kill) with comma-separated milliseconds:
+
+```bash
+export PI_SUBAGENT_RECOVERY_DELAYS_MS=30000,60000,90000
+```
+
+Missing or malformed values use those defaults; each value below `10000` ms is clamped to `10000` ms. The ladder runs only from the stalled pane projection, so active/streaming/provider work is not timed out by wall clock. Interactive children and report-only wrap-up stages are exempt.
+
 **Interactive subagents stay silent.** Long-running user-driven subagents (e.g. `planner`, or any `/iterate` fork) do not wake the parent session on `stalled`/`recovered` transitions — the user is working directly in the subagent's pane, and a steer message there would just burn an orchestrator turn on a no-op "still waiting" ping. The widget still updates normally, and activity snapshots are still recorded/classified regardless of the `interactive` setting. By default, agents with `auto-exit: true` are treated as autonomous and get stall pings; agents without it are treated as interactive and stay quiet. Override per-agent with `interactive: true|false` in frontmatter, or per-spawn with `interactive: true|false` on the tool call.
 
 #### Configuration
@@ -357,12 +365,17 @@ You are a specialized agent that does X...
 | `tools`       | string  | Comma-separated **native pi tools only**: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`                                                                                                                                                                             |
 | `skills`      | string  | Comma-separated skill names to auto-load                                                                                                                                                                                                                                    |
 | `session-mode` | string | Default child-session mode: `standalone`, `lineage-only`, or `fork` |
-| `spawning`    | boolean | Set `false` to deny all subagent-spawning tools                                                                                                                                                                                                                             |
+| `spawning`    | boolean | **Spawn grant.** Subagent-spawning tools are denied for every child by default; set `true` to grant them (still bounded by `PI_SUBAGENT_SPAWN_DEPTH`, see below).                                                                                                              |
 | `deny-tools`  | string  | Comma-separated extension tool names to deny                                                                                                                                                                                                                                |
-| `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
+| `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. Operator input or an Escape abort permanently disarms it for that session (with a one-time warning); the `/auto-exit` slash command re-arms it for exactly one completion. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
 | `interactive` | boolean | derived        | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
+| `time-limit` | positive integer seconds | — | Whole-run deadline for a non-interactive agent. At the deadline the pane closes and the parent receives a timed-out failure with the session still resumable. |
+| `idle-timeout` | positive integer seconds | — | Deadline measured from the latest Pi activity snapshot; it is ignored when no activity snapshots are available. |
+| `timeout-warn-threshold` | fraction `0 < n < 1` | — | Optional warning fraction for either limit on Pi-backed children. At the threshold the child receives one report-only continuation; omit it for hard-stop only. Other CLIs retain the hard deadline only. |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
 | `disable-model-invocation` | boolean | Hide this agent from discovery surfaces like `subagents_list`. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`. |
+
+A warning writes a directive beside the child session, sends Escape only to interrupt the active turn, and reserves the original deadline for one final report-only turn. That normal completion is delivered as a **partial report under time limit** (not a full completion); the directive never types text into the child pane and fresh report activity cannot extend an idle deadline.
 
 ---
 
@@ -393,8 +406,10 @@ When set to `true`, the agent session shuts down automatically as soon as the ag
 
 **Behavior:**
 
-- The session closes after the agent's final message (on the `agent_end` event)
-- If the user sends **any input** before the agent finishes, auto-exit is permanently disabled for that session — the user takes over interactively
+- The session closes after the agent's settled final message
+- **Operator takeover disarms auto-exit permanently:** any input sent after the first agent run starts, or an Escape-triggered abort, disables auto-exit for the rest of the session and emits a one-time warning in the child pane. The session then behaves like a normal interactive session
+- **`/auto-exit` re-arms once:** run this slash command inside the child pane after taking over; auto-exit closes the session after its next completed turn (writing the usual done/error sidecar) and is disarmed again until the command is run once more. It is a no-op while auto-exit is already armed or already re-armed
+- Background children that never receive operator input keep exiting on their first normal completion — behavior is unchanged from previous releases
 - The modeHint injected into the agent's task is adjusted accordingly: autonomous agents see "Complete your task autonomously." rather than instructions to call `subagent_done`
 
 **When to use:**
@@ -439,18 +454,32 @@ subagent({ name: "Scout", agent: "scout", interactive: true, task: "..." });
 
 ## Tool Access Control
 
-By default, every sub-agent can spawn further sub-agents. Control this with frontmatter:
+By default, every sub-agent is launched **without** the subagent lifecycle tools (`subagent`, `subagent_interrupt`, `subagents_list`, `subagent_resume`) — spawning is a granted capability, not a given.
 
-### `spawning: false`
+### `spawning: true`
 
-Denies all subagent lifecycle tools (`subagent`, `subagent_interrupt`, `subagents_list`, `subagent_resume`):
+Grants the full subagent lifecycle tools to this agent:
 
 ```yaml
 ---
-name: worker
-spawning: false
+name: planner
+spawning: true
 ---
 ```
+
+Without this grant (the default), a child cannot spawn further sub-agents even if it tries. Any `deny-tools` entries still stack on top of a grant.
+
+### Recursion depth: `PI_SUBAGENT_SPAWN_DEPTH`
+
+Spawning agents can be bounded by setting `PI_SUBAGENT_SPAWN_DEPTH` in the top-level session's environment. The value is a generation ceiling for direct children:
+
+- Generation-1 children receive an allowance equal to the env value; each granted agent passes `remaining − 1` down to its own children, so the allowance decrements every generation and never rises.
+- A granted agent with `remaining = 0` cannot spawn — exhaustion overrides the frontmatter grant.
+- When the variable is unset, depth is unlimited but the `spawning: true` grant is still required.
+
+Example: `PI_SUBAGENT_SPAWN_DEPTH=2` allows children to spawn grandchildren, but great-grandchildren are denied. Mutually-spawning agents (`A` spawns `B`, `B` spawns `A`) therefore always terminate.
+
+Resumed sessions (`subagent_resume`) never receive more allowance than their first launch recorded in `<session-file>.spawn.json`; if that metadata is missing, resume denies spawning entirely.
 
 ### `deny-tools`
 
@@ -467,11 +496,11 @@ deny-tools: subagent
 
 | Agent      | `spawning`  | Rationale                                    |
 | ---------- | ----------- | -------------------------------------------- |
-| planner    | _(default)_ | Legitimately spawns scouts for investigation |
-| worker     | `false`     | Should implement tasks, not delegate         |
-| researcher | `false`     | Should research, not spawn                   |
-| reviewer   | `false`     | Should review, not spawn                     |
-| scout      | `false`     | Should gather context, not spawn             |
+| planner    | `true`      | Legitimately spawns scouts for investigation |
+| worker     | _(default)_ | Should implement tasks, not delegate         |
+| researcher | _(default)_ | Should research, not spawn                   |
+| reviewer   | _(default)_ | Should review, not spawn                     |
+| scout      | _(default)_ | Should gather context, not spawn             |
 
 ---
 
