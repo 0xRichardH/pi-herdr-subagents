@@ -37,7 +37,7 @@ function hasCommand(command: string): boolean {
 }
 
 export function isHerdrAvailable(): boolean {
-  return process.env.HERDR_ENV === "1" && hasCommand("herdr");
+  return process.env.HERDR_ENV === "1" && !!process.env.HERDR_PANE_ID && hasCommand("herdr");
 }
 
 function parseHerdrJson(value: string): unknown {
@@ -84,6 +84,21 @@ function getHerdrParentPaneId(): string {
   return paneId;
 }
 
+function swapHerdrPane(
+  paneId: string,
+  parentPaneId: string,
+  run: (args: string[]) => string = herdrExec,
+): void {
+  try {
+    run(["pane", "swap", "--source-pane", paneId, "--target-pane", parentPaneId]);
+  } catch (error) {
+    try {
+      run(["pane", "close", paneId]);
+    } catch {}
+    throw error;
+  }
+}
+
 function getHerdrCurrentPaneInfo(): {
   pane_id: string;
   tab_id: string;
@@ -96,7 +111,7 @@ function getHerdrCurrentPaneInfo(): {
   // Fall back to `herdr pane current` if any identity env var is missing —
   // older herdr versions may not set all three.
   if (!paneId || !tabId || !workspaceId) {
-    const output = herdrExec(["pane", "current"]);
+    const output = herdrExec(["pane", "current", "--current"]);
     const parsed = parseHerdrJson(output);
     const pane = (parsed as { result?: { pane?: unknown } } | null)?.result?.pane as
       | { pane_id?: string; tab_id?: string; workspace_id?: string }
@@ -138,20 +153,26 @@ export function createHerdrSurface(name: string): string {
 export function createHerdrSurfaceSplit(
   name: string,
   direction: "left" | "right" | "up" | "down",
+  fromSurface?: string,
 ): string {
-  const parentPaneId = getHerdrParentPaneId();
-  const dir = direction === "left" || direction === "right" ? "right" : "down";
+  const parentPaneId = fromSurface ?? getHerdrParentPaneId();
+  // Herdr exposes split axes as right/down; left/up map to the same axis.
+  const splitDirection = direction === "left" || direction === "right" ? "right" : "down";
   const output = herdrExec([
     "pane",
     "split",
+    "--pane",
     parentPaneId,
     "--direction",
-    dir,
+    splitDirection,
     "--no-focus",
     "--cwd",
     process.cwd(),
   ]);
   const paneId = extractHerdrPaneId(output, "pane split");
+  if (direction === "left" || direction === "up") {
+    swapHerdrPane(paneId, parentPaneId);
+  }
   try {
     herdrExec(["pane", "rename", paneId, name]);
   } catch {
@@ -161,14 +182,29 @@ export function createHerdrSurfaceSplit(
 }
 
 export function readHerdrScreen(surface: string, lines = 50): string {
-  // `visible` is the current viewport — reliable for freshly-created panes
-  // where `recent` scrollback may not be populated yet. Matches what tmux
-  // capture-pane and zellij dump-screen return.
-  return herdrExec(["pane", "read", surface, "--source", "visible", "--lines", String(lines)]);
+  // Hidden Herdr tabs do not populate host scrollback until viewed, so read
+  // their live viewport instead of the empty recent/recent-unwrapped sources.
+  return herdrExec([
+    "pane",
+    "read",
+    surface,
+    "--source",
+    "visible",
+    "--lines",
+    String(Math.max(1, lines)),
+  ]);
 }
 
 export async function readHerdrScreenAsync(surface: string, lines = 50): Promise<string> {
-  return herdrExecAsync(["pane", "read", surface, "--source", "visible", "--lines", String(lines)]);
+  return herdrExecAsync([
+    "pane",
+    "read",
+    surface,
+    "--source",
+    "visible",
+    "--lines",
+    String(Math.max(1, lines)),
+  ]);
 }
 
 export function sendHerdrCommand(surface: string, command: string): void {
@@ -178,7 +214,7 @@ export function sendHerdrCommand(surface: string, command: string): void {
 }
 
 export function sendHerdrEscape(surface: string): void {
-  herdrExec(["pane", "send-keys", surface, "Escape"]);
+  herdrExec(["pane", "send-keys", surface, "esc"]);
 }
 
 export function closeHerdrSurface(surface: string): void {
@@ -199,4 +235,5 @@ export const __herdrTest__ = {
   parseHerdrJson,
   extractHerdrPaneId,
   extractHerdrRootPaneId,
+  swapHerdrPane,
 };

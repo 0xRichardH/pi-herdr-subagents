@@ -30,6 +30,7 @@ import {
   predictZellijSplitDirection,
   selectZellijPlacement,
   selectZellijStackPlacement,
+  __muxTest__,
 } from "../pi-extension/subagents/cmux.ts";
 import { isHerdrAvailable, __herdrTest__ } from "../pi-extension/subagents/herdr.ts";
 import {
@@ -2087,6 +2088,12 @@ describe("subagents widget rendering", () => {
 });
 
 describe("cmux.ts", () => {
+  it("prefers Herdr over inherited outer multiplexer environments", () => {
+    const available = new Set(["herdr", "cmux"]);
+    assert.equal(__muxTest__.selectMuxBackend(null, (backend) => available.has(backend)), "herdr");
+    assert.equal(__muxTest__.selectMuxBackend("cmux", (backend) => available.has(backend)), "cmux");
+  });
+
   describe("shellEscape", () => {
     it("wraps in single quotes", () => {
       assert.equal(shellEscape("hello"), "'hello'");
@@ -2380,9 +2387,19 @@ describe("cmux.ts", () => {
 
 describe("herdr.ts", () => {
   describe("isHerdrAvailable", () => {
-    it("returns boolean based on HERDR_ENV", () => {
-      const result = isHerdrAvailable();
-      assert.equal(typeof result, "boolean");
+    it("requires Herdr's explicit pane context", () => {
+      const previousEnv = process.env.HERDR_ENV;
+      const previousPane = process.env.HERDR_PANE_ID;
+      process.env.HERDR_ENV = "1";
+      delete process.env.HERDR_PANE_ID;
+      try {
+        assert.equal(isHerdrAvailable(), false);
+      } finally {
+        if (previousEnv === undefined) delete process.env.HERDR_ENV;
+        else process.env.HERDR_ENV = previousEnv;
+        if (previousPane === undefined) delete process.env.HERDR_PANE_ID;
+        else process.env.HERDR_PANE_ID = previousPane;
+      }
     });
   });
 
@@ -2391,23 +2408,23 @@ describe("herdr.ts", () => {
       const output = JSON.stringify({
         result: {
           pane: {
-            pane_id: "1-3",
-            tab_id: "1:2",
-            workspace_id: "1",
+            pane_id: "w1:p3",
+            tab_id: "w1:t2",
+            workspace_id: "w1",
           },
         },
       });
-      assert.equal(__herdrTest__.extractHerdrPaneId(output, "pane split"), "1-3");
+      assert.equal(__herdrTest__.extractHerdrPaneId(output, "pane split"), "w1:p3");
     });
 
     it("extracts root pane id from a tab create response", () => {
       const output = JSON.stringify({
         result: {
-          tab: { tab_id: "1:2" },
-          root_pane: { pane_id: "1-2" },
+          tab: { tab_id: "w1:t2" },
+          root_pane: { pane_id: "w1:p2" },
         },
       });
-      assert.equal(__herdrTest__.extractHerdrRootPaneId(output, "tab create"), "1-2");
+      assert.equal(__herdrTest__.extractHerdrRootPaneId(output, "tab create"), "w1:p2");
     });
 
     it("throws on malformed herdr JSON", () => {
@@ -2415,6 +2432,25 @@ describe("herdr.ts", () => {
         () => __herdrTest__.extractHerdrPaneId("not json", "pane split"),
         /Unexpected herdr pane split output/,
       );
+    });
+
+    it("closes a new pane and rethrows when left/up placement fails", () => {
+      const calls: string[][] = [];
+      const failure = new Error("swap failed");
+      const run = (args: string[]) => {
+        calls.push(args);
+        if (args[1] === "swap") throw failure;
+        return "";
+      };
+
+      assert.throws(
+        () => __herdrTest__.swapHerdrPane("w1:p2", "w1:p1", run),
+        (error) => error === failure,
+      );
+      assert.deepEqual(calls, [
+        ["pane", "swap", "--source-pane", "w1:p2", "--target-pane", "w1:p1"],
+        ["pane", "close", "w1:p2"],
+      ]);
     });
   });
 });
