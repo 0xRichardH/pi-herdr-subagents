@@ -143,12 +143,12 @@ export function createHerdrSurface(name: string): string {
   return paneId;
 }
 
-export function createHerdrSurfaceSplit(
-  name: string,
+function buildPaneSplitArgs(
+  parentPaneId: string,
   direction: "right" | "down",
-): string {
-  const parentPaneId = getHerdrParentPaneId();
-  const output = herdrExec([
+  cwd: string,
+): string[] {
+  return [
     "pane",
     "split",
     parentPaneId,
@@ -156,8 +156,16 @@ export function createHerdrSurfaceSplit(
     direction,
     "--no-focus",
     "--cwd",
-    process.cwd(),
-  ]);
+    cwd,
+  ];
+}
+
+export function createHerdrSurfaceSplit(
+  name: string,
+  direction: "right" | "down",
+): string {
+  const parentPaneId = getHerdrParentPaneId();
+  const output = herdrExec(buildPaneSplitArgs(parentPaneId, direction, process.cwd()));
   const paneId = extractHerdrPaneId(output, "pane split");
   try {
     herdrExec(["pane", "rename", paneId, name]);
@@ -300,6 +308,7 @@ export function reportHerdrPaneTask(
 
 export const __herdrTest__ = {
   buildTabCreateArgs,
+  buildPaneSplitArgs,
   buildPaneReportTaskArgs,
   parseHerdrJson,
   extractHerdrPaneId,

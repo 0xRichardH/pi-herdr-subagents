@@ -19,7 +19,39 @@ import {
 export type PaneId = string;
 export type SplitDirection = "right" | "down";
 
+/**
+ * Where a subagent surface should be created:
+ *   - `"tab"`   — a brand-new tab (default)
+ *   - `"right"` — split the orchestrator pane to the right
+ *   - `"down"`  — split the orchestrator pane below
+ */
+export type SubagentLayout = "tab" | SplitDirection;
+
 const SETUP_HINT = "Start pi inside herdr (`herdr`, then run `pi`).";
+
+/**
+ * Parse the `PI_SUBAGENT_LAYOUT` env var into a {@link SubagentLayout}.
+ * Accepted values (case-sensitive, trimmed): `split`, `split:right` (both map
+ * to a right-hand split), `split:down` (split below). Anything else — unset,
+ * empty, or unknown — falls back to the default `tab`.
+ */
+export function parseSubagentLayout(raw?: string): SubagentLayout {
+  const value = (raw ?? "").trim();
+  if (value === "split" || value === "split:right") return "right";
+  if (value === "split:down") return "down";
+  return "tab";
+}
+
+/** Read `PI_SUBAGENT_LAYOUT` from the provided environment (defaults to the process env). */
+export function resolveSubagentLayout(env: Record<string, string | undefined> = process.env): SubagentLayout {
+  return parseSubagentLayout(env.PI_SUBAGENT_LAYOUT);
+}
+
+/** Create the surface for a subagent according to the requested layout. */
+export function createSubagentSurface(name: string, layout: SubagentLayout = "tab"): PaneId {
+  assertTerminalAvailable();
+  return layout === "tab" ? createSubagentPane(name) : splitCurrentPane(name, layout);
+}
 
 export function isTerminalAvailable(): boolean {
   return isHerdrAvailable();
