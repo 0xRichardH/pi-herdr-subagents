@@ -134,6 +134,10 @@ describe("Pi Harness Driver", () => {
     assert.ok(built.command.includes("pi --session '/tmp/sessions/subagent.jsonl'"));
     assert.ok(built.command.includes("--model 'anthropic/claude-sonnet-4-5'"));
     assert.ok(built.command.includes("--thinking 'high'"));
+    assert.ok(
+      built.command.includes("PI_SUBAGENT_ACTIVITY_FILE='/tmp/artifacts/subagent-activity/abc12345.json'"),
+      "the child and parent must use the same activity file for idle-timeout supervision",
+    );
     assert.ok(built.command.includes("echo '__SUBAGENT_DONE_'$?'__'"));
   });
 });

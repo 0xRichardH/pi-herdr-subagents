@@ -8,6 +8,7 @@ import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
+import { consumeWrapupDirective } from "./time-limits.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -35,6 +36,40 @@ export function shouldAutoExitOnAgentEnd(
   }
 
   return true;
+}
+
+export interface AutoExitDecisionState {
+  /** Sticky: set when the operator typed into the session or Escape-aborted a run. */
+  disarmed: boolean;
+  /** Set by /auto-exit: allows exactly one more settled completion to exit. */
+  oneShotReArm: boolean;
+}
+
+/**
+ * Pure auto-exit decision for a settled agent turn.
+ *
+ * - Armed and untouched: exits on terminal stops and errors exactly as
+ *   v0.2.0 did; Escape-aborted runs keep the session open.
+ * - Disarmed (operator takeover): never exits, whatever the stop reason.
+ * - One-shot re-arm (/auto-exit): behaves like armed for a single further
+ *   completion; the caller consumes the flag once that exit happens.
+ */
+export function resolveAutoExit(
+  state: AutoExitDecisionState,
+  stopReason: string | undefined,
+): boolean {
+  if (state.disarmed && !state.oneShotReArm) return false;
+  return stopReason !== "aborted";
+}
+
+function latestAssistantStopReason(messages: any[] | undefined): string | undefined {
+  if (messages) {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const msg = messages[i];
+      if (msg?.role === "assistant") return msg.stopReason as string | undefined;
+    }
+  }
+  return undefined;
 }
 
 export interface SubagentErrorInfo {
@@ -68,11 +103,11 @@ export function findLatestAssistantError(
   return null;
 }
 
-export function buildCompletionSidecar(messages: any[] | undefined):
-  | { type: "done" }
+export function buildCompletionSidecar(messages: any[] | undefined, wrapup = false):
+  | { type: "done"; wrapup?: true }
   | { type: "error"; errorMessage: string; stopReason: "error" } {
   const errorInfo = findLatestAssistantError(messages);
-  return errorInfo ? { type: "error", ...errorInfo } : { type: "done" };
+  return errorInfo ? { type: "error", ...errorInfo } : { type: "done", ...(wrapup ? { wrapup: true } : {}) };
 }
 
 export function parseDeniedTools(rawValue: string | undefined): string[] {
@@ -148,9 +183,26 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
-  let userTookOver = false;
+  let disarmed = false;
+  let oneShotReArm = false;
+  let warnedOperatorTakeover = false;
   let agentStarted = false;
   let latestAgentMessages: any[] | undefined;
+  let wrapupInProgress = false;
+
+  // Operator takeover (typed input or an Escape abort) permanently disarms
+  // auto-exit for this session. The warning is latched so it is emitted
+  // exactly once no matter how often the operator interacts afterwards.
+  function disarmAutoExit(cause: string, ctx: any): void {
+    disarmed = true;
+    if (!autoExit || warnedOperatorTakeover) return;
+    warnedOperatorTakeover = true;
+    ctx.ui.notify(
+      `Auto-exit disabled (${cause}). You are driving this session now — ` +
+        "/auto-exit closes it after its next completion.",
+      "warning",
+    );
+  }
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
@@ -162,12 +214,15 @@ export default function (pi: ExtensionAPI) {
     renderWidget(ctx, null);
   });
 
-  pi.on("input", () => {
+  pi.on("input", (event, ctx) => {
     recorder.input();
+    // Extension-injected report directives are not operator takeover. This keeps
+    // the report-only continuation compatible with sticky auto-exit disarming.
+    if ((event as any).source === "extension") return;
     // Ignore the initial task message that starts an autonomous subagent.
     // Only inputs after the first agent run has started count as user takeover.
     if (!shouldMarkUserTookOver(agentStarted)) return;
-    userTookOver = true;
+    disarmAutoExit("operator input", ctx);
   });
 
   pi.on("before_agent_start", () => {
@@ -188,19 +243,54 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_settled", (_event, ctx) => {
-    const shouldExit = autoExit
-      && shouldAutoExitOnAgentEnd(userTookOver, latestAgentMessages);
+    const sessionFile = process.env.PI_SUBAGENT_SESSION;
+    const stopReason = latestAssistantStopReason(latestAgentMessages);
+
+    // Time-limit wrap-up: an interrupt left the latest assistant turn aborted
+    // and a .wrapup directive exists. Consume it once and inject a report-only
+    // continuation. Checked BEFORE the Escape-disarm below so a machine-caused
+    // time-limit interrupt is never mistaken for operator takeover.
+    const directive = !wrapupInProgress && stopReason === "aborted"
+      ? consumeWrapupDirective(sessionFile)
+      : null;
+    if (directive) {
+      wrapupInProgress = true;
+      // Extension-sourced turn: pi.sendUserMessage re-enters the "input"
+      // event with source: "extension", which the input handler ignores, so
+      // this continuation never flips the operator-takeover disarm latch.
+      pi.sendUserMessage(directive);
+      return;
+    }
+
+    // An Escape-triggered abort is operator takeover too: permanently disarm
+    // (single warning above) and leave the session open for inspection.
+    if (stopReason === "aborted") {
+      disarmAutoExit("Escape", ctx);
+    }
+
+    // Exit when auto-exit says so, OR when a wrap-up continuation finished a
+    // non-aborted turn: that partial report must reach the parent even if the
+    // operator had disarmed auto-exit earlier. The one-shot re-arm is consumed
+    // only when the auto-exit branch itself decided the exit (L-95 rule).
+    const autoExitShouldFire = autoExit
+      && resolveAutoExit({ disarmed, oneShotReArm }, stopReason);
+    const shouldExit = autoExitShouldFire
+      || (wrapupInProgress && stopReason !== "aborted");
+    if (autoExitShouldFire && oneShotReArm) {
+      // Consume the one-shot re-arm: after this exit auto-exit is disarmed
+      // again until the operator runs /auto-exit once more.
+      oneShotReArm = false;
+    }
 
     if (shouldExit) {
       // Surface stopReason: "error" turns (auto-retry exhausted, provider
       // overload, etc.) to the parent via the .exit sidecar so the watcher
       // can report a clear failure with the underlying error message.
-      const sessionFile = process.env.PI_SUBAGENT_SESSION;
       if (sessionFile) {
         try {
           writeFileSync(
             `${sessionFile}.exit`,
-            JSON.stringify(buildCompletionSidecar(latestAgentMessages)),
+            JSON.stringify(buildCompletionSidecar(latestAgentMessages, wrapupInProgress)),
           );
         } catch {
           // Best effort — the watcher can still detect the terminal sentinel
@@ -211,12 +301,6 @@ export default function (pi: ExtensionAPI) {
       recorder.agentEndDone();
       ctx.shutdown();
       return;
-    }
-
-    if (autoExit) {
-      // Reset any recorded manual input marker. Auto-exit is decided by whether
-      // the latest settled agent run completed normally, not by who initiated it.
-      userTookOver = false;
     }
   });
 
@@ -265,6 +349,33 @@ export default function (pi: ExtensionAPI) {
   });
 
   // Toggle expand/collapse with Ctrl+J
+  // Re-arm auto-exit for exactly one completion after operator takeover.
+  pi.registerCommand("auto-exit", {
+    description: "Close this session automatically after its next completed turn",
+    handler: async (_args, ctx) => {
+      if (!autoExit) {
+        ctx.ui.notify("Auto-exit is not enabled for this session.", "info");
+        return;
+      }
+      if (!disarmed) {
+        ctx.ui.notify("Auto-exit is already armed.", "info");
+        return;
+      }
+      if (oneShotReArm) {
+        ctx.ui.notify(
+          "Auto-exit is already re-armed for the next completion.",
+          "info",
+        );
+        return;
+      }
+      oneShotReArm = true;
+      ctx.ui.notify(
+        "Auto-exit re-armed: this session will close after its next completion.",
+        "info",
+      );
+    },
+  });
+
   pi.registerShortcut("ctrl+j", {
     description: "Toggle subagent tools widget",
     handler: (ctx) => {
@@ -314,13 +425,28 @@ export default function (pi: ExtensionAPI) {
     description:
       "Call this tool when you have completed your task. " +
       "It will close this session and return your results to the main session. " +
-      "Your LAST assistant message before calling this becomes the summary returned to the caller.",
-    parameters: Type.Object({}),
+      "The final report must be written as text in the SAME assistant message as this tool call — " +
+      "include the report text alongside the tool call. " +
+      "Calling it without accompanying text returns no summary to the caller " +
+      "(\"Sub-agent exited without output\"). " +
+      "Profiles which cannot emit text alongside tool calls must pass the report via the `report` argument.",
+    parameters: Type.Object({
+      report: Type.Optional(
+        Type.String({
+          description:
+            "Final report summary for the parent session. Use this when your profile cannot emit text alongside the tool call; otherwise prefer same-message text.",
+          minLength: 1,
+        }),
+      ),
+    }),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       recorder.subagentDone();
       if (sessionFile) {
-        writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
+        writeFileSync(
+          `${sessionFile}.exit`,
+          JSON.stringify({ type: "done", ...(wrapupInProgress ? { wrapup: true } : {}) }),
+        );
       }
       ctx.shutdown();
       return {

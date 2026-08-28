@@ -75,17 +75,22 @@ before(() => {
   delete process.env.PI_SUBAGENT_ID;
   delete process.env.PI_DENY_TOOLS;
 });
+const createdTestDirs: string[] = [];
+
 after(() => {
   if (inheritedSubagentId == null) delete process.env.PI_SUBAGENT_ID;
   else process.env.PI_SUBAGENT_ID = inheritedSubagentId;
   if (inheritedDenyTools == null) delete process.env.PI_DENY_TOOLS;
   else process.env.PI_DENY_TOOLS = inheritedDenyTools;
+  for (const dir of createdTestDirs) rmSync(dir, { recursive: true, force: true });
 });
 
 // --- Helpers ---
 
 function createTestDir(): string {
-  return mkdtempSync(join(tmpdir(), "subagents-test-"));
+  const dir = mkdtempSync(join(tmpdir(), "subagents-test-"));
+  createdTestDirs.push(dir);
+  return dir;
 }
 
 function createSessionFile(dir: string, entries: object[]): string {
@@ -390,6 +395,172 @@ describe("session.ts", () => {
         },
       };
       assert.equal(findLastAssistantMessage([msg] as any[]), null);
+    });
+
+    it("L-162: returns text when final assistant message carries text alongside subagent_done toolCall", () => {
+      // The fix requires the report text to be in the SAME message as the
+      // subagent_done tool call; extraction must not drop the text when a
+      // toolCall block is present in the same content array.
+      const msg = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Task complete: updated docs." },
+            { type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done" },
+          ],
+        },
+      };
+      assert.equal(findLastAssistantMessage([msg] as any[]), "Task complete: updated docs.");
+    });
+
+    it("L-162: returns null when final assistant message has only a subagent_done toolCall, so caller falls back to 'Sub-agent exited without output'", () => {
+      // muse-spark calls subagent_done with a thinking+toolCall message and no
+      // text block; the extractor must return nothing so the parent at
+      // index.ts:1813 falls back to the no-output wording.
+      const msg = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "done" },
+            { type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done" },
+          ],
+        },
+      };
+      const extracted = findLastAssistantMessage([msg] as any[]);
+      assert.equal(extracted, null);
+      // Replicates the fallback branch in pi-extension/subagents/index.ts
+      const fallback = extracted ?? "Sub-agent exited without output";
+      assert.equal(fallback, "Sub-agent exited without output");
+    });
+
+    it("L-162 phase2: same-message text wins over arguments.report", () => {
+      const msg = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Preferred same-message report" },
+            { type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done", arguments: { report: "Fallback report param" } },
+          ],
+        },
+      };
+      assert.equal(findLastAssistantMessage([msg] as any[]), "Preferred same-message report");
+    });
+
+    it("L-162 phase2: toolCall-only with non-empty report returns the report", () => {
+      const msg = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done", arguments: { report: "Report via arg" } }],
+        },
+      };
+      assert.equal(findLastAssistantMessage([msg] as any[]), "Report via arg");
+    });
+
+    it("L-162 phase2: handles report via name field and stringified JSON arguments", () => {
+      const viaName = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", name: "subagent_done", id: "tc-done", arguments: { report: "Via name field" } }],
+        },
+      };
+      assert.equal(findLastAssistantMessage([viaName] as any[]), "Via name field");
+
+      const viaJsonString = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done", arguments: JSON.stringify({ report: "Via JSON string" }) }],
+        },
+      };
+      assert.equal(findLastAssistantMessage([viaJsonString] as any[]), "Via JSON string");
+    });
+
+    it("L-162 phase2: toolCall-only without report falls back to earlier assistant text", () => {
+      const earlier = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "Earlier summary" }],
+        },
+      };
+      const final = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done", arguments: {} }],
+        },
+      };
+      assert.equal(findLastAssistantMessage([earlier, final] as any[]), "Earlier summary");
+    });
+
+    it("L-162 phase2: whitespace-only report is treated as empty and falls back to earlier text", () => {
+      const earlier = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "Earlier valid" }],
+        },
+      };
+      const final = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done", arguments: { report: "   " } }],
+        },
+      };
+      assert.equal(findLastAssistantMessage([earlier, final] as any[]), "Earlier valid");
+    });
+
+    it("L-162 phase2: no report + no earlier text → null (fallback wording)", () => {
+      const final = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done", arguments: {} }],
+        },
+      };
+      const extracted = findLastAssistantMessage([final] as any[]);
+      assert.equal(extracted, null);
+      const fallback = extracted ?? "Sub-agent exited without output";
+      assert.equal(fallback, "Sub-agent exited without output");
+    });
+
+    it("L-162 phase2: final error still beats stale earlier text (priority 3 > 4)", () => {
+      const earlierGood = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "Stale earlier text" }],
+        },
+      };
+      const errorFinal = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [],
+          stopReason: "error",
+          errorMessage: "provider failed",
+        },
+      };
+      assert.equal(findLastAssistantMessage([earlierGood, errorFinal] as any[]), "Subagent error: provider failed");
+    });
+
+    it("L-162 phase2: final report beats final error (priority 2 > 3)", () => {
+      const final = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done", arguments: { report: "Report wins over error" } }],
+          stopReason: "error",
+          errorMessage: "should be ignored",
+        },
+      };
+      assert.equal(findLastAssistantMessage([final] as any[]), "Report wins over error");
     });
   });
 
@@ -1542,7 +1713,7 @@ describe("subagent-done.ts", () => {
         const { api, eventHandlers } = createMockExtensionApi();
         subagentDoneExtension(api);
         let shutdowns = 0;
-        const ctx = { shutdown: () => { shutdowns += 1; } };
+        const ctx = { shutdown: () => { shutdowns += 1; }, ui: { notify() {} } };
         eventHandlers.get("agent_end")![0]({
           messages: [{ role: "assistant", stopReason: "aborted" }],
         }, ctx);
@@ -2014,6 +2185,46 @@ describe("completion.ts", () => {
     });
     controller.abort();
     await assert.rejects(completion, /Aborted while waiting for subagent to finish/);
+  });
+});
+
+describe("child launch hardening", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  it("reports a missing child extension with the absolute path and swap cause", () => {
+    const missingRoot = createTestDir();
+    const missingPath = join(missingRoot, "subagent-done.ts");
+
+    assert.throws(
+      () => testApi.preflightSubagentDonePath(missingRoot),
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        assert.match(message, new RegExp(missingPath.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")));
+        assert.match(message, /live.*package.*swap/i);
+        return true;
+      },
+    );
+  });
+
+  it("includes a wider pane tail in non-zero no-session failures", () => {
+    const sessionFile = join(createTestDir(), "child.jsonl");
+    let requestedLines: number | undefined;
+    const paneTail = 'Error: Failed to load extension "/missing/subagent-done.ts"\n';
+
+    const result = testApi.enrichNoSessionFailure(
+      { exitCode: 1 },
+      { sessionFile, surface: "pane-1" },
+      "Sub-agent exited with code 1",
+      (_surface: string, lines?: number) => {
+        requestedLines = lines;
+        return paneTail;
+      },
+    );
+
+    assert.equal(requestedLines, 20);
+    assert.match(result.summary, /Sub-agent exited with code 1/);
+    assert.match(result.summary, /Failed to load extension/);
+    assert.equal(result.error, paneTail);
   });
 });
 
