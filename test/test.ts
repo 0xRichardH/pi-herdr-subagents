@@ -56,6 +56,7 @@ import subagentDoneExtension, {
 } from "../pi-extension/subagents/subagent-done.ts";
 import { interpretExitSidecar, waitForCompletion } from "../pi-extension/subagents/completion.ts";
 import {
+  MISSING_PANE_DEBOUNCE_MS,
   createLifecycle,
   lifecycleTransition,
   markCompleted,
@@ -75,17 +76,22 @@ before(() => {
   delete process.env.PI_SUBAGENT_ID;
   delete process.env.PI_DENY_TOOLS;
 });
+const createdTestDirs: string[] = [];
+
 after(() => {
   if (inheritedSubagentId == null) delete process.env.PI_SUBAGENT_ID;
   else process.env.PI_SUBAGENT_ID = inheritedSubagentId;
   if (inheritedDenyTools == null) delete process.env.PI_DENY_TOOLS;
   else process.env.PI_DENY_TOOLS = inheritedDenyTools;
+  for (const dir of createdTestDirs) rmSync(dir, { recursive: true, force: true });
 });
 
 // --- Helpers ---
 
 function createTestDir(): string {
-  return mkdtempSync(join(tmpdir(), "subagents-test-"));
+  const dir = mkdtempSync(join(tmpdir(), "subagents-test-"));
+  createdTestDirs.push(dir);
+  return dir;
 }
 
 function createSessionFile(dir: string, entries: object[]): string {
@@ -390,6 +396,172 @@ describe("session.ts", () => {
         },
       };
       assert.equal(findLastAssistantMessage([msg] as any[]), null);
+    });
+
+    it("L-162: returns text when final assistant message carries text alongside subagent_done toolCall", () => {
+      // The fix requires the report text to be in the SAME message as the
+      // subagent_done tool call; extraction must not drop the text when a
+      // toolCall block is present in the same content array.
+      const msg = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Task complete: updated docs." },
+            { type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done" },
+          ],
+        },
+      };
+      assert.equal(findLastAssistantMessage([msg] as any[]), "Task complete: updated docs.");
+    });
+
+    it("L-162: returns null when final assistant message has only a subagent_done toolCall, so caller falls back to 'Sub-agent exited without output'", () => {
+      // muse-spark calls subagent_done with a thinking+toolCall message and no
+      // text block; the extractor must return nothing so the parent at
+      // index.ts:1813 falls back to the no-output wording.
+      const msg = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "done" },
+            { type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done" },
+          ],
+        },
+      };
+      const extracted = findLastAssistantMessage([msg] as any[]);
+      assert.equal(extracted, null);
+      // Replicates the fallback branch in pi-extension/subagents/index.ts
+      const fallback = extracted ?? "Sub-agent exited without output";
+      assert.equal(fallback, "Sub-agent exited without output");
+    });
+
+    it("L-162 phase2: same-message text wins over arguments.report", () => {
+      const msg = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Preferred same-message report" },
+            { type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done", arguments: { report: "Fallback report param" } },
+          ],
+        },
+      };
+      assert.equal(findLastAssistantMessage([msg] as any[]), "Preferred same-message report");
+    });
+
+    it("L-162 phase2: toolCall-only with non-empty report returns the report", () => {
+      const msg = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done", arguments: { report: "Report via arg" } }],
+        },
+      };
+      assert.equal(findLastAssistantMessage([msg] as any[]), "Report via arg");
+    });
+
+    it("L-162 phase2: handles report via name field and stringified JSON arguments", () => {
+      const viaName = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", name: "subagent_done", id: "tc-done", arguments: { report: "Via name field" } }],
+        },
+      };
+      assert.equal(findLastAssistantMessage([viaName] as any[]), "Via name field");
+
+      const viaJsonString = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done", arguments: JSON.stringify({ report: "Via JSON string" }) }],
+        },
+      };
+      assert.equal(findLastAssistantMessage([viaJsonString] as any[]), "Via JSON string");
+    });
+
+    it("L-162 phase2: toolCall-only without report falls back to earlier assistant text", () => {
+      const earlier = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "Earlier summary" }],
+        },
+      };
+      const final = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done", arguments: {} }],
+        },
+      };
+      assert.equal(findLastAssistantMessage([earlier, final] as any[]), "Earlier summary");
+    });
+
+    it("L-162 phase2: whitespace-only report is treated as empty and falls back to earlier text", () => {
+      const earlier = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "Earlier valid" }],
+        },
+      };
+      const final = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done", arguments: { report: "   " } }],
+        },
+      };
+      assert.equal(findLastAssistantMessage([earlier, final] as any[]), "Earlier valid");
+    });
+
+    it("L-162 phase2: no report + no earlier text → null (fallback wording)", () => {
+      const final = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done", arguments: {} }],
+        },
+      };
+      const extracted = findLastAssistantMessage([final] as any[]);
+      assert.equal(extracted, null);
+      const fallback = extracted ?? "Sub-agent exited without output";
+      assert.equal(fallback, "Sub-agent exited without output");
+    });
+
+    it("L-162 phase2: final error still beats stale earlier text (priority 3 > 4)", () => {
+      const earlierGood = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "Stale earlier text" }],
+        },
+      };
+      const errorFinal = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [],
+          stopReason: "error",
+          errorMessage: "provider failed",
+        },
+      };
+      assert.equal(findLastAssistantMessage([earlierGood, errorFinal] as any[]), "Subagent error: provider failed");
+    });
+
+    it("L-162 phase2: final report beats final error (priority 2 > 3)", () => {
+      const final = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done", arguments: { report: "Report wins over error" } }],
+          stopReason: "error",
+          errorMessage: "should be ignored",
+        },
+      };
+      assert.equal(findLastAssistantMessage([final] as any[]), "Report wins over error");
     });
   });
 
@@ -1489,6 +1661,11 @@ describe("subagent-done.ts", () => {
       assert.equal(shouldAutoExitOnAgentEnd(false, messages), false);
     });
 
+    it("stays open after a tool-use turn", () => {
+      const messages = [{ role: "assistant", stopReason: "toolUse" }];
+      assert.equal(shouldAutoExitOnAgentEnd(false, messages), false);
+    });
+
     it("still exits when the latest turn ended with stopReason=error", () => {
       // Auto-exit subagents must shut down on retry-exhaustion errors so the
       // parent is woken. The error sidecar (written separately) carries the
@@ -1542,7 +1719,7 @@ describe("subagent-done.ts", () => {
         const { api, eventHandlers } = createMockExtensionApi();
         subagentDoneExtension(api);
         let shutdowns = 0;
-        const ctx = { shutdown: () => { shutdowns += 1; } };
+        const ctx = { shutdown: () => { shutdowns += 1; }, ui: { notify() {} } };
         eventHandlers.get("agent_end")![0]({
           messages: [{ role: "assistant", stopReason: "aborted" }],
         }, ctx);
@@ -1736,6 +1913,58 @@ describe("lifecycle.ts", () => {
     assert.equal(lifecycle.process.kind, "running");
   });
 
+  it("fails a pane that remains missing after the debounce", () => {
+    let lifecycle = createLifecycle(1_000);
+    lifecycle = observePaneInspection(lifecycle, { kind: "present", observedAt: 2_000, agentStatus: "working" }, 2_000);
+    const firstMissingAt = 3_000;
+    lifecycle = observePaneInspection(
+      lifecycle,
+      { kind: "missing", error: "pane_not_found" },
+      firstMissingAt,
+    );
+    assert.equal(lifecycle.process.kind, "running", "one missing observation is a race, not failure");
+    assert.notEqual(
+      projectLifecycle(lifecycle, firstMissingAt + MISSING_PANE_DEBOUNCE_MS).kind,
+      "failed",
+      "one missing observation must not project failure",
+    );
+
+    lifecycle = observePaneInspection(
+      lifecycle,
+      { kind: "missing", error: "pane_not_found" },
+      firstMissingAt + MISSING_PANE_DEBOUNCE_MS,
+    );
+    assert.equal(lifecycle.process.kind, "failed");
+    assert.match(lifecycle.process.error, /pane disappeared before completion evidence/i);
+    assert.equal(projectLifecycle(lifecycle, firstMissingAt + MISSING_PANE_DEBOUNCE_MS).kind, "failed");
+  });
+
+  it("persists a terminal missing projection for result delivery", () => {
+    const testApi = (subagentsModule as any).__test__;
+    let lifecycle = createLifecycle(1_000);
+    lifecycle = observePaneInspection(lifecycle, { kind: "present", observedAt: 2_000, agentStatus: "working" }, 2_000);
+    lifecycle = observePaneInspection(lifecycle, { kind: "missing", error: "pane_not_found" }, 3_000);
+    lifecycle = observePaneInspection(lifecycle, { kind: "missing", error: "pane_not_found" }, 3_001);
+    const running = {
+      id: "missing-child",
+      name: "Worker",
+      task: "task",
+      surface: "pane-1",
+      startTime: 1_000,
+      sessionFile: "worker.jsonl",
+      interactive: false,
+      lifecycle,
+    };
+
+    const projection = testApi.reconcileProjectedFailure(
+      running,
+      projectLifecycle(lifecycle, 3_000 + MISSING_PANE_DEBOUNCE_MS),
+    );
+    assert.equal(projection.kind, "failed");
+    assert.equal(running.lifecycle.process.kind, "failed");
+    assert.match(running.lifecycle.process.error, /pane disappeared before completion evidence/i);
+  });
+
   it("preserves local interrupt over stale herdr statuses", () => {
     for (const agentStatus of ["working", "blocked", "idle", "done"] as const) {
       let lifecycle = createLifecycle(1_000);
@@ -1920,6 +2149,26 @@ describe("completion.ts", () => {
     });
   });
 
+  it("does not reap a single transient missing-pane observation", async () => {
+    let inspections = 0;
+    let reads = 0;
+    const result = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => {
+        reads += 1;
+        return reads >= 3 ? "__SUBAGENT_DONE_0__" : "";
+      },
+      inspectPane: async () => {
+        inspections += 1;
+        return inspections === 1
+          ? { kind: "missing", error: "pane_not_found" }
+          : { kind: "present", observedAt: Date.now(), agentStatus: "working" };
+      },
+    });
+    assert.deepEqual(result, { reason: "sentinel", exitCode: 0 });
+    assert.ok(inspections >= 2, "a transient miss must be followed by another inspection");
+  });
+
   it("lets a sidecar win the pane-disappearance race", async () => {
     const dir = mkdtempSync(join(tmpdir(), "completion-race-"));
     const sessionFile = join(dir, "child.jsonl");
@@ -2014,6 +2263,89 @@ describe("completion.ts", () => {
     });
     controller.abort();
     await assert.rejects(completion, /Aborted while waiting for subagent to finish/);
+  });
+});
+
+describe("resume completion sidecar", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  it("clears stale done or ping sidecars before the watcher can consume actual resumed output", async () => {
+    for (const [index, payload] of [
+      { type: "done" },
+      { type: "ping", name: "Worker", message: "needs help" },
+    ].entries()) {
+      const dir = createTestDir();
+      const sessionFile = createSessionFile(dir, [
+        { type: "session", id: `session-${index}`, cwd: dir },
+      ]);
+      const entryCountBefore = getNewEntries(sessionFile, 0).length;
+      const exitFile = `${sessionFile}.exit`;
+      writeFileSync(exitFile, JSON.stringify(payload));
+
+      assert.equal(typeof testApi.clearResumeExitSidecar, "function");
+      testApi.clearResumeExitSidecar(sessionFile);
+      assert.equal(existsSync(exitFile), false, "resume must remove stale completion evidence");
+
+      writeFileSync(
+        sessionFile,
+        JSON.stringify({
+          type: "message",
+          id: `message-${index}`,
+          message: { role: "assistant", content: [{ type: "text", text: "actual resumed child output" }] },
+        }) + "\n",
+        { flag: "a" },
+      );
+      const completion = await waitForCompletion(new AbortController().signal, {
+        intervalMs: 1,
+        sessionFile,
+        readTerminalTail: async () => "__SUBAGENT_DONE_0__",
+      });
+      assert.deepEqual(completion, { reason: "sentinel", exitCode: 0 });
+      assert.equal(
+        findLastAssistantMessage(getNewEntries(sessionFile, entryCountBefore)),
+        "actual resumed child output",
+      );
+    }
+  });
+});
+
+describe("child launch hardening", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  it("reports a missing child extension with the absolute path and swap cause", () => {
+    const missingRoot = createTestDir();
+    const missingPath = join(missingRoot, "subagent-done.ts");
+
+    assert.throws(
+      () => testApi.preflightSubagentDonePath(missingRoot),
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        assert.match(message, new RegExp(missingPath.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")));
+        assert.match(message, /live.*package.*swap/i);
+        return true;
+      },
+    );
+  });
+
+  it("includes a wider pane tail in non-zero no-session failures", () => {
+    const sessionFile = join(createTestDir(), "child.jsonl");
+    let requestedLines: number | undefined;
+    const paneTail = 'Error: Failed to load extension "/missing/subagent-done.ts"\n';
+
+    const result = testApi.enrichNoSessionFailure(
+      { exitCode: 1 },
+      { sessionFile, surface: "pane-1" },
+      "Sub-agent exited with code 1",
+      (_surface: string, lines?: number) => {
+        requestedLines = lines;
+        return paneTail;
+      },
+    );
+
+    assert.equal(requestedLines, 20);
+    assert.match(result.summary, /Sub-agent exited with code 1/);
+    assert.match(result.summary, /Failed to load extension/);
+    assert.equal(result.error, paneTail);
   });
 });
 
@@ -2258,6 +2590,17 @@ describe("subagent parent lifecycle", () => {
 
     assert.equal(selectCompletionApi(previous, current), current);
     assert.equal(selectCompletionApi(previous, undefined), previous);
+  });
+
+  it("does not let pane cleanup throw after a missing-pane result", () => {
+    const testApi = (subagentsModule as any).__test__;
+    let closeAttempts = 0;
+
+    assert.doesNotThrow(() => testApi.closePaneQuietly("pane-1", () => {
+      closeAttempts += 1;
+      throw new Error("pane_not_found");
+    }));
+    assert.equal(closeAttempts, 1);
   });
 });
 

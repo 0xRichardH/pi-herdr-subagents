@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, rmSync } from "node:fs";
+import { MISSING_PANE_DEBOUNCE_MS, MISSING_PANE_ERROR } from "./lifecycle.ts";
 
 const ABORT_MESSAGE = "Aborted while waiting for subagent to finish";
 const TERMINAL_SENTINEL = /__SUBAGENT_DONE_(\d+)__/;
@@ -6,6 +7,8 @@ const TERMINAL_SENTINEL = /__SUBAGENT_DONE_(\d+)__/;
 export interface CompletionResult {
   reason: "done" | "ping" | "sentinel" | "error";
   exitCode: number;
+  /** The child completed its one-shot report-only continuation after a time warning. */
+  wrapup?: boolean;
   ping?: { name: string; message: string };
   errorMessage?: string;
 }
@@ -31,6 +34,7 @@ export function interpretExitSidecar(data: unknown): CompletionResult {
     name?: unknown;
     message?: unknown;
     errorMessage?: unknown;
+    wrapup?: unknown;
   };
 
   if (payload?.type === "ping") {
@@ -52,7 +56,9 @@ export function interpretExitSidecar(data: unknown): CompletionResult {
     return { reason: "error", exitCode: 1, errorMessage };
   }
 
-  if (payload?.type === "done") return { reason: "done", exitCode: 0 };
+  if (payload?.type === "done") {
+    return { reason: "done", exitCode: 0, ...(payload.wrapup === true ? { wrapup: true } : {}) };
+  }
 
   return {
     reason: "error",
@@ -130,6 +136,7 @@ export async function waitForCompletion(
   options: CompletionOptions,
 ): Promise<CompletionResult> {
   const startedAt = Date.now();
+  let missingPaneDetectedAt: number | undefined;
 
   for (;;) {
     if (signal.aborted) throw new Error(ABORT_MESSAGE);
@@ -159,16 +166,28 @@ export async function waitForCompletion(
       const observedAt = Date.now();
       options.onPaneInspection?.(inspection, observedAt);
       if (inspection.kind === "missing") {
+        // A single pane_not_found can race Herdr's pane publication/update.
+        // Require the miss to persist briefly before declaring evidence lost.
+        missingPaneDetectedAt ??= observedAt;
+        const racedCompletion = completionArtifact(options);
+        if (racedCompletion) return racedCompletion;
+        if (observedAt - missingPaneDetectedAt < MISSING_PANE_DEBOUNCE_MS) {
+          options.onTick?.(Math.floor((Date.now() - startedAt) / 1000));
+          await abortableDelay(options.intervalMs, signal);
+          continue;
+        }
+
         // Pane closure and atomic artifact publication are separate operations.
         // Allow a short bounded grace window before declaring evidence lost.
-        const racedCompletion = await waitForDisappearanceArtifacts(signal, options);
-        if (racedCompletion) return racedCompletion;
+        const delayedCompletion = await waitForDisappearanceArtifacts(signal, options);
+        if (delayedCompletion) return delayedCompletion;
         return {
           reason: "error",
           exitCode: 1,
-          errorMessage: "Subagent pane disappeared before completion evidence was recorded.",
+          errorMessage: MISSING_PANE_ERROR,
         };
       }
+      missingPaneDetectedAt = undefined;
     }
 
     options.onTick?.(Math.floor((Date.now() - startedAt) / 1000));
