@@ -72,7 +72,13 @@ function readEntries(sessionFile: string): SessionEntry[] {
   return raw
     .split("\n")
     .filter((line) => line.trim())
-    .map((line) => JSON.parse(line) as SessionEntry);
+    .flatMap((line) => {
+      try {
+        return [JSON.parse(line) as SessionEntry];
+      } catch {
+        return [];
+      }
+    });
 }
 
 /**
@@ -89,7 +95,13 @@ export function getLeafId(sessionFile: string): string | null {
 export function getNewEntries(sessionFile: string, afterLine: number): SessionEntry[] {
   const raw = readFileSync(sessionFile, "utf8");
   const lines = raw.split("\n").filter((line) => line.trim());
-  return lines.slice(afterLine).map((line) => JSON.parse(line) as SessionEntry);
+  return lines.slice(afterLine).flatMap((line) => {
+    try {
+      return [JSON.parse(line) as SessionEntry];
+    } catch {
+      return [];
+    }
+  });
 }
 
 /**
@@ -124,31 +136,109 @@ export function findObservedSessionRuntime(entries: SessionEntry[]): ObservedSes
 }
 
 export function findLastAssistantMessage(entries: SessionEntry[]): string | null {
+  // Deep's L-162 phase 2 priority chain:
+  // (1) final same-message text; (2) final subagent_done arguments.report (non-empty);
+  // (3) final provider error; (4) most recent earlier assistant text; (5) null.
+  // This keeps Muse's text+toolCall impossibility from silencing the report,
+  // while error-over-stale-text remains intact for overload failures.
+  let lastIdx = -1;
   for (let i = entries.length - 1; i >= 0; i--) {
     const entry = entries[i];
     if (entry.type !== "message") continue;
     const msg = entry as MessageEntry;
     if (msg.message.role !== "assistant") continue;
-
-    const texts = msg.message.content
-      .filter(
-        (block) =>
-          block.type === "text" && typeof block.text === "string" && block.text.trim() !== "",
-      )
-      .map((block) => block.text as string);
-
-    if (texts.length > 0 && texts.join("").trim()) return texts.join("\n");
-
-    const stopReason = (msg.message as { stopReason?: unknown }).stopReason;
-    const errorMessage = (msg.message as { errorMessage?: unknown }).errorMessage;
-    if (
-      stopReason === "error" &&
-      typeof errorMessage === "string" &&
-      errorMessage.trim() !== ""
-    ) {
-      return `Subagent error: ${errorMessage.trim()}`;
-    }
+    lastIdx = i;
+    break;
   }
+  if (lastIdx === -1) return null;
+
+  const lastEntry = entries[lastIdx] as MessageEntry;
+  const lastMsg: any = lastEntry.message as any;
+  const lastContent: any[] = Array.isArray(lastMsg.content) ? lastMsg.content : [];
+
+  // (1) final same-message text
+  const lastTexts = lastContent
+    .filter((block: any) => block.type === "text" && typeof block.text === "string" && block.text.trim() !== "")
+    .map((block: any) => block.text as string);
+  if (lastTexts.length > 0 && lastTexts.join("").trim()) return lastTexts.join("\n");
+
+  // (2) final subagent_done toolCall arguments.report (non-empty string)
+  const extractReport = (blocks: any[]): string | null => {
+    for (const block of blocks) {
+      if (!block || typeof block !== "object") continue;
+      const type = (block as any).type;
+      const toolName = (block as any).name ?? (block as any).toolName ?? (block as any).tool ?? "";
+      // Only consider subagent_done tool calls; skip other tools even if they happen to have a report field.
+      if (toolName !== "subagent_done") {
+        if (type === "toolCall" || type === "tool_call" || type === "functionCall" || type === "function_call") continue;
+        continue;
+      }
+      let report: unknown;
+      const candidates = [
+        (block as any).arguments,
+        (block as any).args,
+        (block as any).input,
+        (block as any).parameters,
+        (block as any).params,
+      ];
+      for (const cand of candidates) {
+        if (cand == null) continue;
+        if (typeof cand === "object" && typeof (cand as any).report === "string") {
+          report = (cand as any).report;
+          break;
+        }
+        if (typeof cand === "string") {
+          try {
+            const parsed = JSON.parse(cand);
+            if (typeof parsed.report === "string") {
+              report = parsed.report;
+              break;
+            }
+          } catch {
+            // ignore malformed JSON in report argument; treat as no report
+            void 0;
+          }
+        }
+      }
+      if (report === undefined && typeof (block as any).report === "string") report = (block as any).report;
+      if (typeof report === "string" && report.trim() !== "") return report.trim();
+    }
+    return null;
+  };
+
+  const reportFromContent = extractReport(lastContent);
+  if (reportFromContent !== null) return reportFromContent;
+
+  // Also check alternative message-level tool-call arrays (defensive: some Pi builds store tool calls outside content).
+  const altArrays: any[] = [];
+  if (Array.isArray(lastMsg.toolCalls)) altArrays.push(...lastMsg.toolCalls);
+  if (Array.isArray(lastMsg.tool_calls)) altArrays.push(...lastMsg.tool_calls);
+  if (Array.isArray(lastMsg.toolCall)) altArrays.push(...lastMsg.toolCall);
+  if (altArrays.length > 0) {
+    const altReport = extractReport(altArrays);
+    if (altReport !== null) return altReport;
+  }
+
+  // (3) final provider error (stopReason: "error" with errorMessage)
+  const stopReason = (lastMsg as { stopReason?: unknown }).stopReason;
+  const errorMessage = (lastMsg as { errorMessage?: unknown }).errorMessage;
+  if (stopReason === "error" && typeof errorMessage === "string" && errorMessage.trim() !== "") {
+    return `Subagent error: ${errorMessage.trim()}`;
+  }
+
+  // (4) most recent earlier assistant text (fallback)
+  for (let i = lastIdx - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (entry.type !== "message") continue;
+    const msg = entry as MessageEntry;
+    if (msg.message.role !== "assistant") continue;
+    const texts = (msg.message.content || [])
+      .filter((block: any) => block.type === "text" && typeof block.text === "string" && block.text.trim() !== "")
+      .map((block: any) => block.text as string);
+    if (texts.length > 0 && texts.join("").trim()) return texts.join("\n");
+  }
+
+  // (5) null → caller falls back to "Sub-agent exited without output"
   return null;
 }
 

@@ -14,7 +14,7 @@
   "type": "module",
   "scripts": {
     "lint": "oxlint pi-extension test",
-    "test": "node --test test/test.ts test/runtime-routing.test.ts test/release-workflow.test.ts test/harness-drivers.test.ts",
+    "test": "node --test test/test.ts test/subagent-done-autoexit.test.ts test/f108-interrupted-resume.test.ts test/runtime-routing.test.ts test/release-workflow.test.ts test/harness-drivers.test.ts test/spawn-grants.test.ts test/recovery-ladder.test.ts test/time-limits.test.ts test/stale-active-stall.test.ts test/orphan-discovery.test.ts test/f111-restore-flow.test.ts",
     "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts"
   },
   "peerDependencies": {

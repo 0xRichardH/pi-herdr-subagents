@@ -253,6 +253,47 @@ export function sendHerdrEscape(surface: string): void {
   herdrExec(["pane", "send-keys", surface, "Escape"]);
 }
 
+export interface HerdrPaneSessionReference {
+  paneId: string;
+  sessionPath: string;
+}
+
+/** Read persisted agent session paths without making them restore targets. */
+export function listHerdrPaneSessions(): HerdrPaneSessionReference[] {
+  try {
+    const output = execFileSync("herdr", ["pane", "list"], {
+      encoding: "utf8",
+      timeout: 2_000,
+    });
+    const parsed = parseHerdrJson(output) as {
+      result?: { panes?: unknown };
+    } | null;
+    if (!Array.isArray(parsed?.result?.panes)) return [];
+
+    return parsed.result.panes.flatMap((rawPane) => {
+      if (!rawPane || typeof rawPane !== "object") return [];
+      const pane = rawPane as {
+        pane_id?: unknown;
+        agent_session?: unknown;
+        agent_session_path?: unknown;
+      };
+      const paneId = typeof pane.pane_id === "string" && pane.pane_id ? pane.pane_id : undefined;
+      if (!paneId) return [];
+      const session = pane.agent_session;
+      const sessionPath = session && typeof session === "object"
+        ? (session as { kind?: unknown; value?: unknown }).kind === "path" &&
+          typeof (session as { value?: unknown }).value === "string"
+          ? (session as { value: string }).value
+          : undefined
+        : typeof pane.agent_session_path === "string" ? pane.agent_session_path : undefined;
+      return sessionPath ? [{ paneId, sessionPath }] : [];
+    });
+  } catch {
+    // Discovery is best-effort when herdr is unavailable or is restarting.
+    return [];
+  }
+}
+
 export function closeHerdrSurface(surface: string): void {
   herdrExec(["pane", "close", surface]);
 }
@@ -299,6 +340,7 @@ export function reportHerdrPaneTask(
 }
 
 export const __herdrTest__ = {
+  clearCommandAvailability: () => commandAvailability.clear(),
   buildTabCreateArgs,
   buildPaneReportTaskArgs,
   parseHerdrJson,
@@ -306,4 +348,5 @@ export const __herdrTest__ = {
   extractHerdrRootPaneId,
   parsePaneGetOutput,
   parsePaneGetError,
+  listHerdrPaneSessions,
 };

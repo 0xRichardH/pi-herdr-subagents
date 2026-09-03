@@ -14,6 +14,8 @@ import {
   reportHerdrPaneTask,
   sendHerdrCommand,
   sendHerdrEscape,
+  listHerdrPaneSessions,
+  type HerdrPaneSessionReference,
 } from "./herdr.ts";
 
 export type PaneId = string;
@@ -116,6 +118,11 @@ export async function inspectPane(paneId: PaneId): Promise<import("./lifecycle.t
 export function closePane(paneId: PaneId): void {
   assertTerminalAvailable();
   closeHerdrSurface(paneId);
+}
+
+export function listPaneSessionReferences(): HerdrPaneSessionReference[] {
+  if (!isTerminalAvailable()) return [];
+  return listHerdrPaneSessions();
 }
 
 export function setPaneTask(paneId: PaneId, task: string): void {

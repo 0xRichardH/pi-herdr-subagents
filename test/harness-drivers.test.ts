@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -134,7 +134,64 @@ describe("Pi Harness Driver", () => {
     assert.ok(built.command.includes("pi --session '/tmp/sessions/subagent.jsonl'"));
     assert.ok(built.command.includes("--model 'anthropic/claude-sonnet-4-5'"));
     assert.ok(built.command.includes("--thinking 'high'"));
+    assert.ok(
+      built.command.includes("PI_SUBAGENT_ACTIVITY_FILE='/tmp/artifacts/subagent-activity/abc12345.json'"),
+      "the child and parent must use the same activity file for idle-timeout supervision",
+    );
     assert.ok(built.command.includes("echo '__SUBAGENT_DONE_'$?'__'"));
+  });
+
+  it("keeps task and system-prompt artifacts unique per spawn", () => {
+    const artifactDir = mkdtempSync(join(tmpdir(), "f113-artifacts-"));
+    try {
+      const taskA = driver.buildCommand(createMockLaunchContext({
+        artifactDir,
+        taskDelivery: "artifact",
+        params: { id: "a1111111", name: "backend", task: "BRIEF A" },
+      }));
+      const taskB = driver.buildCommand(createMockLaunchContext({
+        artifactDir,
+        taskDelivery: "artifact",
+        params: { id: "b2222222", name: "backend", task: "BRIEF B" },
+      }));
+      const taskPathA = taskA.command.match(/'@([^']+\/context\/[^']+\.md)'/)?.[1];
+      const taskPathB = taskB.command.match(/'@([^']+\/context\/[^']+\.md)'/)?.[1];
+
+      assert.ok(taskPathA);
+      assert.ok(taskPathB);
+      assert.notEqual(taskPathA, taskPathB);
+      assert.equal(existsSync(taskPathA), true);
+      assert.equal(existsSync(taskPathB), true);
+      assert.match(readFileSync(taskPathA, "utf8"), /BRIEF A/);
+      assert.match(readFileSync(taskPathB, "utf8"), /BRIEF B/);
+
+      const systemPromptA = driver.buildCommand(createMockLaunchContext({
+        artifactDir,
+        taskDelivery: "artifact",
+        identity: "IDENTITY A",
+        identityInSystemPrompt: true,
+        params: { id: "c3333333", name: "backend", task: "BRIEF C" },
+      }));
+      const systemPromptB = driver.buildCommand(createMockLaunchContext({
+        artifactDir,
+        taskDelivery: "artifact",
+        identity: "IDENTITY B",
+        identityInSystemPrompt: true,
+        params: { id: "d4444444", name: "backend", task: "BRIEF D" },
+      }));
+      const systemPromptPathA = systemPromptA.command.match(/--(?:append-)?system-prompt '([^']+\/context\/[^']+\.md)'/)?.[1];
+      const systemPromptPathB = systemPromptB.command.match(/--(?:append-)?system-prompt '([^']+\/context\/[^']+\.md)'/)?.[1];
+
+      assert.ok(systemPromptPathA);
+      assert.ok(systemPromptPathB);
+      assert.notEqual(systemPromptPathA, systemPromptPathB);
+      assert.equal(existsSync(systemPromptPathA), true);
+      assert.equal(existsSync(systemPromptPathB), true);
+      assert.equal(readFileSync(systemPromptPathA, "utf8"), "IDENTITY A");
+      assert.equal(readFileSync(systemPromptPathB, "utf8"), "IDENTITY B");
+    } finally {
+      rmSync(artifactDir, { recursive: true, force: true });
+    }
   });
 });
 
