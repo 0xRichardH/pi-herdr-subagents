@@ -1,15 +1,25 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { keyHint } from "@earendil-works/pi-coding-agent";
+import { CompletionDelivery } from "./completion-delivery.ts";
 import { Type, type Static } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { randomUUID, createHash } from "node:crypto";
 import {
   readdirSync,
   readFileSync,
   writeFileSync,
   existsSync,
   mkdirSync,
+  renameSync,
+  unlinkSync,
+  openSync,
+  readSync,
+  closeSync,
+  statSync,
+  accessSync,
+  constants as fsConstants,
 } from "node:fs";
 import { homedir } from "node:os";
 import {
@@ -24,8 +34,10 @@ import {
   readPaneAsync,
   inspectPane,
   setPaneTask,
+  listPaneSessionReferences,
 } from "./terminal.ts";
 import { waitForCompletion } from "./completion.ts";
+import type { HerdrReadSource } from "./herdr.ts";
 import {
   buildAuthenticatedModelCatalog,
   resolveRuntimePlan,
@@ -39,11 +51,14 @@ import {
   buildSubagentToolAllowlist,
   buildPiPromptArgs,
 } from "./harness/index.ts";
+import { isPaneAbsenceSummary } from "./harness/pane-summary.ts";
 import { loadModelConfig, resolveModelDefault, type ModelConfig } from "./model-config.ts";
 
 import {
+  classifyRuntimeObservation,
+  classifySessionFailure,
   findLastAssistantMessage,
-  findObservedSessionRuntime,
+  findTerminalReport,
   getNewEntries,
   seedSubagentSessionFile,
 } from "./session.ts";
@@ -58,6 +73,7 @@ import {
 import {
   getSubagentActivityFile,
   readSubagentActivityFile,
+  resetSubagentActivityFile,
   type ActivityReadResult,
   type SubagentActivityState,
 } from "./activity.ts";
@@ -69,6 +85,8 @@ import {
   markCompletionDetected,
   markDelivery,
   markFailed,
+  MISSING_PANE_DEBOUNCE_MS,
+  MISSING_PANE_ERROR,
   markInterruptRequested,
   markProcessRunning,
   observeActivity,
@@ -78,9 +96,50 @@ import {
   type SubagentLifecycle,
   type PaneInspection,
 } from "./lifecycle.ts";
+import {
+  advanceRecoveryLadder,
+  formatRecoveryKillError,
+  parseActiveToolStallMs,
+  parseRecoveryDelays,
+  type RecoveryDelays,
+  type RecoveryState,
+} from "./recovery.ts";
+import {
+  cleanupWrapupDirective,
+  evalTimeLimit,
+  formatTimeLimitError,
+  getTimeLimitDeadlineAt,
+  parsePositiveIntegerSeconds,
+  parseTimeoutWarnThreshold,
+  writeWrapupDirective,
+  type TimeLimitConfig,
+} from "./time-limits.ts";
+import {
+  discoverOrphanedSubagents,
+  formatOrphanRestoreReport,
+  isActionableOrphan,
+  isRestorableOrphan,
+  resumeOrphanedSubagents,
+  type DiscoveredOrphan,
+  type OrphanResumeOutcome,
+  type SpawnMetadataRecord,
+} from "./orphan-discovery.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
+
+function preflightSubagentDonePath(subagentsDir = SUBAGENTS_DIR): string {
+  const subagentDonePath = join(subagentsDir, "subagent-done.ts");
+  try {
+    accessSync(subagentDonePath, fsConstants.R_OK);
+  } catch {
+    throw new Error(
+      `Cannot launch subagent: child extension "${subagentDonePath}" is missing or unreadable. ` +
+      "Likely cause: a live-package-swap (pi install/remove) while the parent session was running.",
+    );
+  }
+  return subagentDonePath;
+}
 
 // Survive /reload: replace presentation timers while keeping active completion
 // watchers and their registry alive. Old module closures continue watching the
@@ -189,6 +248,9 @@ interface AgentDefaults {
   spawning?: boolean;
   autoExit?: boolean;
   interactive?: boolean;
+  timeLimitSeconds?: number;
+  idleTimeoutSeconds?: number;
+  timeoutWarnThreshold?: number;
   systemPromptMode?: "append" | "replace";
   sessionMode?: SubagentSessionMode;
   cwd?: string;
@@ -210,7 +272,7 @@ interface ListedAgentDefinition extends AgentDefinition {
   source: AgentSource;
 }
 
-/** Tools that are gated by `spawning: false` */
+/** Tools gated behind an explicit frontmatter spawn grant (`spawning: true`) */
 const SPAWNING_TOOLS = new Set([
   "subagent",
   "subagent_interrupt",
@@ -219,21 +281,51 @@ const SPAWNING_TOOLS = new Set([
 ]);
 
 /**
- * Resolve the effective set of denied tool names from agent defaults.
- * `spawning: false` expands to all SPAWNING_TOOLS.
- * `deny-tools` adds individual tool names on top.
+ * Parse PI_SUBAGENT_SPAWN_DEPTH into a child-spawning allowance.
+ * Unset/blank/unparsable/negative → null (unlimited; a frontmatter grant is
+ * still required). A non-negative integer is the generation ceiling granted
+ * to this process's direct children.
  */
-function resolveDenyTools(agentDefs: AgentDefaults | null): Set<string> {
-  const denied = new Set<string>();
-  if (!agentDefs) return denied;
+function parseSpawnDepth(raw: string | undefined | null): number | null {
+  if (raw == null) return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const parsed = Number.parseInt(trimmed, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) return null;
+  return parsed;
+}
 
-  // spawning: false → deny all spawning tools
-  if (agentDefs.spawning === false) {
+/**
+ * Depth handed down to the next generation: decrements by one per
+ * generation, never rises, clamps at zero. Unlimited stays unlimited.
+ */
+function decrementSpawnDepth(allowance: number | null): number | null {
+  return allowance === null ? null : Math.max(0, allowance - 1);
+}
+
+/**
+ * Resolve the effective set of denied tool names from agent defaults.
+ *
+ * Spawning is deny-by-default: all SPAWNING_TOOLS are denied unless the
+ * agent frontmatter explicitly grants `spawning: true` AND depth remains
+ * (`spawnAllowance > 0`, or null = unlimited).
+ * `deny-tools` additions stack on top either way.
+ */
+function resolveDenyTools(
+  agentDefs: AgentDefaults | null,
+  spawnAllowance: number | null = null,
+): Set<string> {
+  const denied = new Set<string>();
+
+  // Deny-by-default: only spawning:true + remaining depth keeps the tools.
+  const spawnGranted =
+    agentDefs?.spawning === true && (spawnAllowance === null || spawnAllowance > 0);
+  if (!spawnGranted) {
     for (const t of SPAWNING_TOOLS) denied.add(t);
   }
 
-  // deny-tools: explicit list
-  if (agentDefs.denyTools) {
+  // deny-tools: explicit list stacks on top of the default denial
+  if (agentDefs?.denyTools) {
     for (const t of agentDefs.denyTools
       .split(",")
       .map((s) => s.trim())
@@ -243,6 +335,133 @@ function resolveDenyTools(agentDefs: AgentDefaults | null): Set<string> {
   }
 
   return denied;
+}
+
+/**
+ * Resume clamp: first-launch metadata is authoritative. The resumed session
+ * never receives more spawning allowance than its first launch recorded —
+ * min(recorded, requested). Missing/corrupt metadata resolves to 0 (deny).
+ */
+function clampResumeSpawn(
+  recorded: { allowance?: unknown } | null | undefined,
+  requestedAllowance: number | null,
+): { maySpawn: boolean; childEnvDepth: number | null } {
+  const capRaw = recorded?.allowance;
+  if (capRaw !== null && (typeof capRaw !== "number" || !Number.isFinite(capRaw) || capRaw < 0)) {
+    return { maySpawn: false, childEnvDepth: 0 };
+  }
+  const cap = capRaw === null ? null : Math.floor(capRaw);
+  const effective =
+    cap === null
+      ? requestedAllowance
+      : requestedAllowance === null
+        ? cap
+        : Math.min(cap, requestedAllowance);
+  const maySpawn = effective === null || effective > 0;
+  return { maySpawn, childEnvDepth: decrementSpawnDepth(effective) };
+}
+
+/**
+ * Read the first-launch spawn metadata sidecar written next to a subagent
+ * session file. Any failure (missing file, corrupt JSON) → null, which the
+ * clamp treats as zero allowance.
+ */
+function readSpawnMetadata(sessionFile: string): SpawnMetadataRecord | null {
+  try {
+    return JSON.parse(readFileSync(`${sessionFile}.spawn.json`, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+/** Write one complete spawn record without exposing a partially-written JSON. */
+function writeSpawnMetadata(sessionFile: string, metadata: SpawnMetadataRecord): void {
+  const target = `${sessionFile}.spawn.json`;
+  const temporary = join(
+    dirname(target),
+    `.${basename(target)}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  try {
+    writeFileSync(temporary, JSON.stringify(metadata), { flag: "wx", mode: 0o600 });
+    renameSync(temporary, target);
+  } finally {
+    try {
+      unlinkSync(temporary);
+    } catch {
+      // The rename succeeded, or the temporary file was never created.
+    }
+  }
+}
+
+type ResumeSessionCwdResult =
+  | { ok: true; healed: boolean }
+  | { ok: false; error: string };
+
+/** Ensure a resumed session has a cwd that pi can open without prompting. */
+function ensureResumeSessionCwd(sessionFile: string, resumingCwd: string): ResumeSessionCwdResult {
+  let raw: Buffer;
+  try {
+    raw = readFileSync(sessionFile);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    return { ok: false, error: `Unable to read session file: ${reason}` };
+  }
+
+  const firstLineEnd = raw.indexOf(0x0a);
+  const firstLine = raw
+    .subarray(0, firstLineEnd === -1 ? raw.length : firstLineEnd)
+    .toString("utf8");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(firstLine);
+  } catch {
+    return { ok: false, error: "Unable to parse the session header JSON" };
+  }
+  if (
+    parsed === null ||
+    typeof parsed !== "object" ||
+    Array.isArray(parsed) ||
+    typeof (parsed as { cwd?: unknown }).cwd !== "string"
+  ) {
+    return { ok: false, error: "Session header has no valid cwd" };
+  }
+
+  const header = parsed as Record<string, unknown>;
+  if (existsSync(header.cwd as string)) return { ok: true, healed: false };
+
+  const lineEndingStart =
+    firstLineEnd !== -1 && firstLineEnd > 0 && raw[firstLineEnd - 1] === 0x0d
+      ? firstLineEnd - 1
+      : firstLineEnd === -1
+        ? raw.length
+        : firstLineEnd;
+  const rewritten = Buffer.concat([
+    Buffer.from(JSON.stringify({ ...header, cwd: resumingCwd }), "utf8"),
+    raw.subarray(lineEndingStart),
+  ]);
+  const tempFile = join(
+    dirname(sessionFile),
+    `.${basename(sessionFile)}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  try {
+    writeFileSync(tempFile, rewritten, { flag: "wx", mode: 0o600 });
+    renameSync(tempFile, sessionFile);
+  } catch (error) {
+    try {
+      unlinkSync(tempFile);
+    } catch {
+      // Keep the original failure as the block reason.
+    }
+    const reason = error instanceof Error ? error.message : String(error);
+    return { ok: false, error: `Unable to repair missing session cwd: ${reason}` };
+  }
+
+  return { ok: true, healed: true };
+}
+
+/** Same-agent respawn guard: an agent never spawns another instance of itself. */
+function blockedSelfSpawn(requestedAgent: string | undefined, currentAgent: string | undefined): boolean {
+  return !!requestedAgent && !!currentAgent && requestedAgent === currentAgent;
 }
 
 /** Resolve the global agent config directory, respecting PI_CODING_AGENT_DIR. */
@@ -303,6 +522,11 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
     spawning: parseOptionalBoolean(getFrontmatterValue(frontmatter, "spawning")),
     autoExit: parseOptionalBoolean(getFrontmatterValue(frontmatter, "auto-exit")),
     interactive: parseOptionalBoolean(getFrontmatterValue(frontmatter, "interactive")),
+    timeLimitSeconds: parsePositiveIntegerSeconds(getFrontmatterValue(frontmatter, "time-limit")),
+    idleTimeoutSeconds: parsePositiveIntegerSeconds(getFrontmatterValue(frontmatter, "idle-timeout")),
+    timeoutWarnThreshold: parseTimeoutWarnThreshold(
+      getFrontmatterValue(frontmatter, "timeout-warn-threshold"),
+    ),
     sessionMode: parseSessionMode(getFrontmatterValue(frontmatter, "session-mode")),
     cwd: getFrontmatterValue(frontmatter, "cwd"),
     cli: getFrontmatterValue(frontmatter, "cli"),
@@ -464,6 +688,20 @@ function resolveEffectiveInteractive(
   return !resolveEffectiveAutoExit(params, agentDefs);
 }
 
+function resolveTimeLimitConfig(
+  agentDefs: AgentDefaults | null,
+  interactive: boolean,
+  supportsWrapup = true,
+): TimeLimitConfig | undefined {
+  if (interactive || !agentDefs) return undefined;
+  const config: TimeLimitConfig = {
+    timeLimitSeconds: agentDefs.timeLimitSeconds,
+    idleTimeoutSeconds: agentDefs.idleTimeoutSeconds,
+    timeoutWarnThreshold: supportsWrapup ? agentDefs.timeoutWarnThreshold : undefined,
+  };
+  return config.timeLimitSeconds || config.idleTimeoutSeconds ? config : undefined;
+}
+
 function loadAgentDefaults(agentName: string): AgentDefaults | null {
   // Resolve through the same name-keyed map discoverAgentDefinitions() builds
   // for the tool-guidance catalog, so a name advertised there always resolves
@@ -490,6 +728,22 @@ function getShellReadyDelayMs(): number {
   const raw = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS?.trim();
   const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500;
+}
+
+export const DEFAULT_INTERRUPT_GRACE_MS = 5_000;
+const INTERRUPTED_EXIT_CODE = 130;
+const INTERRUPTED_ERROR = "Subagent interrupted by parent after the grace period.";
+
+/** Parse PI_SUBAGENT_INTERRUPT_GRACE_MS; invalid values use five seconds. */
+function parseInterruptGraceMs(raw: string | undefined): number {
+  const trimmed = raw?.trim();
+  if (!trimmed) return DEFAULT_INTERRUPT_GRACE_MS;
+  const value = Number(trimmed);
+  return Number.isSafeInteger(value) && value >= 0 ? value : DEFAULT_INTERRUPT_GRACE_MS;
+}
+
+function getInterruptGraceMs(): number {
+  return parseInterruptGraceMs(process.env.PI_SUBAGENT_INTERRUPT_GRACE_MS);
 }
 
 function muxUnavailableResult() {
@@ -520,13 +774,97 @@ const modelConfig = loadModelConfig();
 function resolveResultPresentation(
   result: Pick<
     SubagentResult,
-    "exitCode" | "elapsed" | "summary" | "sessionFile" | "errorMessage"
+    "exitCode" | "elapsed" | "summary" | "sessionFile" | "errorMessage" | "failureKind" | "partial" | "timeout" | "stderr"
+  >,
+  name: string,
+): string {
+  return resolveResultPresentationCore(result, name) + formatStderrCapture(result.stderr);
+}
+
+function formatStderrCapture(stderr: StderrCapture | undefined): string {
+  if (!stderr) return "";
+  if (stderr.tail && stderr.tail.trim()) {
+    return `\n\nChild stderr (last ${STDERR_TAIL_BYTES} bytes):\n${stderr.tail}`;
+  }
+  return `\n\nstderr not captured: ${stderr.reason ?? "reason unavailable"}`;
+}
+
+function resolveResultPresentationCore(
+  result: Pick<
+    SubagentResult,
+    "exitCode" | "elapsed" | "summary" | "sessionFile" | "errorMessage" | "failureKind" | "partial" | "timeout"
   >,
   name: string,
 ): string {
   const sessionRef = result.sessionFile
     ? `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`
     : "";
+
+  // TASK-326 AC5: an explicit/parent interrupt is a parent-owned lifecycle
+  // stop. It carries no provider errorMessage, so without this branch it fell
+  // through to the bare exit-code wording ("failed (exit code 130)"). It is
+  // rendered as interrupted and never as a provider failure.
+  if (result.failureKind === "interrupted") {
+    return (
+      `Sub-agent "${name}" was interrupted after ${formatElapsed(result.elapsed)}.\n\n` +
+      `The session remains on disk and can be resumed with subagent_resume.${sessionRef}`
+    );
+  }
+
+  // TASK-326 AC6: a hard time-limit stop is a parent-initiated lifecycle stop
+  // that likewise carries no provider errorMessage; name it as such.
+  if (result.failureKind === "time-limit") {
+    return (
+      `Sub-agent "${name}" was stopped at its hard time limit after ` +
+      `${formatElapsed(result.elapsed)}.\n\n${result.summary}${sessionRef}`
+    );
+  }
+
+  // TASK-337: an exit-0 completion with no terminal report is not a success.
+  // Name the absence and point at recovery instead of the generic
+  // "exited without output" fallback, which is no longer admitted as completed.
+  if (result.failureKind === "reportless") {
+    return (
+      `Sub-agent "${name}" exited without a terminal report after ${formatElapsed(result.elapsed)}.\n\n` +
+      `${result.summary}\n\n` +
+      `The subagent exited successfully but reported nothing. You can retry by ` +
+      `spawning a new subagent or resume the session with subagent_resume.${sessionRef}`
+    );
+  }
+
+  // TASK-326: classify what actually happened. Only genuine
+  // provider/transport failures keep the provider wording verbatim;
+  // operator interrupts/closes and no-result exits render distinctly so the
+  // orchestrator does not retry a closed pane or misread an empty crash.
+  if (result.errorMessage && result.failureKind === "operator") {
+    return (
+      `Sub-agent "${name}" was closed by the operator after ${formatElapsed(result.elapsed)}.\n\n` +
+      `Error: ${result.errorMessage}\n\n` +
+      `The session remains on disk and can be resumed with subagent_resume.${sessionRef}`
+    );
+  }
+
+  if (result.errorMessage && result.failureKind === "no-result") {
+    return (
+      `Sub-agent "${name}" exited without producing a result after ${formatElapsed(result.elapsed)}.\n\n` +
+      `Error: ${result.errorMessage}\n\n` +
+      `The subagent did not produce a result. You can retry by spawning a new ` +
+      `subagent or resume the session with subagent_resume.${sessionRef}`
+    );
+  }
+
+  // TASK-326 AC6: a recovery/watchdog kill is a parent-initiated lifecycle
+  // stop, not a provider outage. Without this branch it rendered as
+  // "provider/agent error — auto-retry exhausted", the exact misleading
+  // report this task exists to remove.
+  if (result.errorMessage && result.failureKind === "watchdog") {
+    return (
+      `Sub-agent "${name}" was killed by the recovery watchdog after ${formatElapsed(result.elapsed)}.\n\n` +
+      `Error: ${result.errorMessage}\n\n` +
+      `The subagent did not produce a result. You can retry by spawning a new ` +
+      `subagent or resume the session with subagent_resume.${sessionRef}`
+    );
+  }
 
   if (result.errorMessage) {
     // Auto-retry exhausted or other agent-loop error. The subagent did not
@@ -542,9 +880,118 @@ function resolveResultPresentation(
     );
   }
 
+  if (result.partial) {
+    return (
+      `Sub-agent "${name}" delivered a partial report under its time limit ` +
+      `(${formatElapsed(result.elapsed)}).\n\n${result.summary}${sessionRef}`
+    );
+  }
+
   return result.exitCode !== 0
     ? `Sub-agent "${name}" failed (exit code ${result.exitCode}).\n\n${result.summary}${sessionRef}`
     : `Sub-agent "${name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${sessionRef}`;
+}
+
+function buildResultTimeoutDetails(result: Pick<SubagentResult, "partial" | "timeout">) {
+  return {
+    ...(result.partial ? { partial: true } : {}),
+    ...(result.timeout ? { timeout: result.timeout } : {}),
+  };
+}
+
+export type SubagentFailureKind =
+  | "provider"
+  | "operator"
+  | "interrupted"
+  | "no-result"
+  | "reportless"
+  | "watchdog"
+  | "time-limit";
+
+/**
+ * TASK-337: the absence-naming summary for a completion that exited 0 but
+ * carried no terminal report (no assistant final text and no `subagent_done`
+ * report argument). Exit code alone never admits a completion.
+ */
+export const REPORTLESS_COMPLETION_SUMMARY =
+  "Sub-agent exited successfully but produced no terminal report " +
+  "(no assistant final text and no subagent_done report argument).";
+
+/**
+ * TASK-337: exit code alone never admits a completion. A clean exit (0) with
+ * no provider error, no ping, and no terminal report in the supplied
+ * transcript is `reportless`. Shared by the first-run watcher and the
+ * resumed-session delivery so both apply one admission rule; callers pass only
+ * the entries that belong to the run being admitted.
+ */
+function isReportlessCompletion(
+  entries: ReturnType<typeof getNewEntries>,
+  result: Pick<SubagentResult, "exitCode" | "errorMessage" | "ping">,
+): boolean {
+  return (
+    result.exitCode === 0 &&
+    !result.errorMessage &&
+    !result.ping &&
+    findTerminalReport(entries) === null
+  );
+}
+
+/**
+ * TASK-337: classify a resumed run's completion from only the entries written
+ * after the resume. The pre-resume transcript must never supply terminal
+ * evidence, so a resume that exits 0 without a new terminal report is
+ * `reportless` rather than `completed`.
+ */
+function classifyResumeCompletion(
+  newEntries: ReturnType<typeof getNewEntries>,
+  result: Pick<SubagentResult, "exitCode" | "errorMessage" | "failureKind" | "ping">,
+): { failureKind: SubagentFailureKind | undefined; summary: string } {
+  if (isReportlessCompletion(newEntries, result)) {
+    return { failureKind: "reportless", summary: REPORTLESS_COMPLETION_SUMMARY };
+  }
+  return {
+    failureKind: result.failureKind ?? classifySessionFailure(newEntries),
+    summary:
+      findLastAssistantMessage(newEntries) ??
+      (result.errorMessage
+        ? `Subagent error: ${result.errorMessage}`
+        : result.exitCode !== 0
+          ? `Resumed session exited with code ${result.exitCode}`
+          : "Resumed session exited without new output"),
+  };
+}
+
+/**
+ * Bounded child-stderr evidence attached to process-start / no-result
+ * failures. `tail` is the last captured bytes; `reason` explains why nothing
+ * could be captured so the parent report never silently omits the evidence.
+ */
+export interface StderrCapture {
+  tail?: string;
+  reason?: string;
+}
+
+const STDERR_TAIL_BYTES = 4096;
+
+/** Read the last >=4 KiB of a child's captured stderr, or name why not. */
+export function captureStderrTail(stderrFile: string | undefined): StderrCapture {
+  if (!stderrFile) return { reason: "no stderr file was configured for this run" };
+  try {
+    if (!existsSync(stderrFile)) return { reason: `stderr file not found at ${stderrFile}` };
+    const size = statSync(stderrFile).size;
+    if (size === 0) return { reason: `stderr file is empty at ${stderrFile}` };
+    const start = Math.max(0, size - STDERR_TAIL_BYTES);
+    const fd = openSync(stderrFile, "r");
+    try {
+      const buffer = Buffer.alloc(size - start);
+      const bytesRead = readSync(fd, buffer, 0, buffer.length, start);
+      return { tail: buffer.subarray(0, bytesRead).toString("utf8") };
+    } finally {
+      closeSync(fd);
+    }
+  } catch (error) {
+    return { reason: `stderr read failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
 }
 
 /**
@@ -559,9 +1006,22 @@ interface SubagentResult {
   exitCode: number;
   elapsed: number;
   error?: string;
-  /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
+  /** Provider/agent error message (provider overloads, crash sidecars, watchdog kills). */
   errorMessage?: string;
+  /**
+   * What actually happened (TASK-326). Only genuine provider/transport
+   * failures are "provider"; operator interrupts/closes are "operator";
+   * exits that produced nothing (crash without stopReason, worker-died,
+   * missing pane, sentinel loss) are "no-result". Unset = pre-classification
+   * errorMessage path, rendered with the legacy provider wording.
+   */
+  failureKind?: SubagentFailureKind;
+  /** A normal completion produced by the one-shot time-limit report continuation. */
+  partial?: boolean;
+  timeout?: "warned-wrapup" | "hard-stop";
   ping?: { name: string; message: string };
+  /** Child stderr evidence on process-start / no-result failures (TASK-330). */
+  stderr?: StderrCapture;
 }
 
 /**
@@ -584,6 +1044,19 @@ interface RunningSubagent {
     error?: string;
   };
   abortController?: AbortController;
+  /** Timer waiting for an interrupted autonomous child to become terminal. */
+  interruptGraceTimer?: ReturnType<typeof setTimeout>;
+  /** Synthetic terminal result after the parent-owned interrupt grace expires. */
+  interrupted?: { errorMessage: string; interruptedAt: number };
+  recovery?: RecoveryState;
+  recoveryKilled?: { errorMessage: string; killedAt: number };
+  timeLimit?: TimeLimitConfig;
+  timeLimitWarned?: boolean;
+  /** The deadline fixed at warning time so fresh report activity cannot extend an idle limit. */
+  timeLimitDeadlineAt?: number;
+  timeLimitStopped?: { errorMessage: string; stoppedAt: number };
+  /** A report-only continuation has been requested and awaits its normal completion. */
+  wrapupPending?: boolean;
   cli?: string;
   sentinelFile?: string;
   /**
@@ -603,11 +1076,44 @@ interface RunningSubagent {
   interactive: boolean;
   /** Parent-resolved model/thinking selection and provenance. */
   runtimePlan: ResolvedRuntimePlan | undefined;
+  /** Per-run file receiving the child's stderr for truthful failure reports. */
+  stderrFile?: string;
+  /**
+   * Artifact root for this run. The pane tail is snapshotted here before the
+   * pane closes so the only copy of a startup death survives the close
+   * (herdr returns `pane_not_found` once a pane is gone).
+   */
+  artifactDir?: string;
+  /** Reference to the persisted pre-close scrollback, when one was written. */
+  paneScrollback?: PaneScrollbackRef;
 }
+
+interface RecoveryPaneOperations {
+  interruptPane: (surface: string) => void;
+  closePane: (surface: string) => void;
+  abortWatcher: (controller: AbortController | undefined) => void;
+}
+
+const DEFAULT_RECOVERY_PANE_OPERATIONS: RecoveryPaneOperations = {
+  interruptPane,
+  closePane,
+  abortWatcher: (controller) => controller?.abort(),
+};
+
+interface TimeLimitPaneOperations extends RecoveryPaneOperations {
+  writeWrapup: (sessionFile: string) => void;
+  removeWrapup: (sessionFile: string) => void;
+}
+
+const DEFAULT_TIME_LIMIT_PANE_OPERATIONS: TimeLimitPaneOperations = {
+  ...DEFAULT_RECOVERY_PANE_OPERATIONS,
+  writeWrapup: writeWrapupDirective,
+  removeWrapup: cleanupWrapupDirective,
+};
 
 interface SubagentRuntime {
   runningSubagents: Map<string, RunningSubagent>;
-  pi?: ExtensionAPI;
+  delivery?: CompletionDelivery<ExtensionAPI>;
   latestCtx?: ExtensionContext;
   modelCatalog?: string;
   agentCatalog?: string;
@@ -622,6 +1128,46 @@ const runtime: SubagentRuntime =
   (globalThis as any)[RUNTIME_KEY] ??
   ((globalThis as any)[RUNTIME_KEY] = createSubagentRuntime());
 const runningSubagents = runtime.runningSubagents;
+const completionDelivery = runtime.delivery ??= new CompletionDelivery<ExtensionAPI>();
+
+/**
+ * Sessions reserved by an in-flight subagent_resume, closed synchronously
+ * before the first await so two resume calls can never both spawn a pi on one
+ * session file (TASK-330 death 2). Released once the running registry owns the
+ * reservation, or when the launch fails.
+ */
+const resumeClaims = new Set<string>();
+
+export interface ActiveSessionRun {
+  id: string;
+  name: string;
+}
+
+/**
+ * The active run (if any) currently owning a session file. Considers both the
+ * running registry and the synchronous resume reservation.
+ */
+export function findActiveSessionRun(
+  sessionFile: string,
+  agents: Map<string, Pick<RunningSubagent, "id" | "name" | "sessionFile">> = runningSubagents,
+  claims: Set<string> = resumeClaims,
+): ActiveSessionRun | undefined {
+  for (const agent of agents.values()) {
+    if (agent.sessionFile === sessionFile) return { id: agent.id, name: agent.name };
+  }
+  if (claims.has(sessionFile)) return { id: "(pending)", name: "resume" };
+  return undefined;
+}
+
+function claimResumeSession(sessionFile: string): boolean {
+  if (resumeClaims.has(sessionFile)) return false;
+  resumeClaims.add(sessionFile);
+  return true;
+}
+
+function releaseResumeSession(sessionFile: string): void {
+  resumeClaims.delete(sessionFile);
+}
 
 export function shouldPreserveSubagentsOnShutdown(reason: unknown): boolean {
   return reason === "reload";
@@ -629,11 +1175,15 @@ export function shouldPreserveSubagentsOnShutdown(reason: unknown): boolean {
 
 export function cleanupSubagentsForShutdown(
   reason: unknown,
-  agents: Map<string, Pick<RunningSubagent, "abortController" | "lifecycle">>,
+  agents: Map<string, Pick<RunningSubagent, "abortController" | "lifecycle" | "interruptGraceTimer">>,
 ): void {
   if (shouldPreserveSubagentsOnShutdown(reason)) return;
 
   for (const agent of agents.values()) {
+    if (agent.interruptGraceTimer != null) {
+      clearTimeout(agent.interruptGraceTimer);
+      agent.interruptGraceTimer = undefined;
+    }
     if (agent.lifecycle) {
       agent.lifecycle = markDelivery(agent.lifecycle, "suppressed");
     }
@@ -760,7 +1310,12 @@ function formatLifecycleWidgetLabel(
 
 function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): string[] {
   const now = Date.now();
-  const rendered = agents.map((agent) => ({ agent, projection: projectLifecycle(ensureLifecycle(agent), now) }));
+  const rendered = agents.map((agent) => ({
+    agent,
+    projection: projectLifecycle(ensureLifecycle(agent), now, {
+      activeToolStallMs: parseActiveToolStallMs(process.env.PI_SUBAGENT_ACTIVE_TOOL_STALL_MS),
+    }),
+  }));
   const activeCount = rendered.filter(({ projection }) =>
     projection.kind === "active" ||
     projection.kind === "starting" ||
@@ -888,15 +1443,19 @@ function ensureLifecycle(running: RunningSubagent): SubagentLifecycle {
   return lifecycle;
 }
 
-function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now()) {
+function observeRunningSubagent(
+  running: RunningSubagent,
+  observedAt = Date.now(),
+  suppliedRead?: ActivityReadResult,
+) {
   ensureLifecycle(running);
   const driver = getHarnessDriver(running.cli);
   if (!driver.hasActivitySnapshots) return;
 
   const activityFile = running.activityFile;
-  const read: ActivityReadResult = activityFile
+  const read: ActivityReadResult = suppliedRead ?? (activityFile
     ? readSubagentActivityFile(activityFile, running.id)
-    : { ok: false, reason: "missing" };
+    : { ok: false, reason: "missing" });
 
   running.activityRead = read.ok
     ? { ok: true }
@@ -946,9 +1505,312 @@ function requestSubagentInterrupt(
   }
 }
 
+function isTerminalLifecycle(lifecycle: SubagentLifecycle): boolean {
+  return lifecycle.process.kind === "completed" || lifecycle.process.kind === "failed";
+}
+
+/** Ignore a race where the pane disappeared before normal cleanup ran. */
+function closePaneQuietly(
+  surface: string,
+  closePaneKey: (surface: string) => void = closePane,
+): void {
+  try {
+    closePaneKey(surface);
+  } catch {
+    // Pane cleanup is best effort; a pane that is already gone is not an error.
+  }
+}
+
+/** Persist a terminal projection so result delivery can remove its widget row. */
+function reconcileProjectedFailure(running: RunningSubagent, projection: LifecycleProjection): LifecycleProjection {
+  const lifecycle = ensureLifecycle(running);
+  if (
+    projection.kind !== "failed" ||
+    lifecycle.pane.kind !== "missing" ||
+    isTerminalLifecycle(lifecycle)
+  ) {
+    return projection;
+  }
+
+  const terminalAt = lifecycle.pane.detectedAt + MISSING_PANE_DEBOUNCE_MS;
+  running.lifecycle = markFailed(
+    lifecycle,
+    projection.label ?? MISSING_PANE_ERROR,
+    terminalAt,
+    1,
+  );
+  return projectLifecycle(running.lifecycle, terminalAt);
+}
+
+function clearInterruptGraceTimer(running: RunningSubagent): void {
+  if (running.interruptGraceTimer == null) return;
+  clearTimeout(running.interruptGraceTimer);
+  running.interruptGraceTimer = undefined;
+}
+
+/**
+ * Finish a parent-requested interrupt without asking the child to publish a
+ * completion sidecar. Escape intentionally disarms child auto-exit; the
+ * parent owns the bounded terminal transition and preserves the JSONL.
+ */
+function finalizeInterruptedSubagent(
+  running: RunningSubagent,
+  now: number,
+  operations: Pick<RecoveryPaneOperations, "closePane" | "abortWatcher"> = DEFAULT_RECOVERY_PANE_OPERATIONS,
+): boolean {
+  const lifecycle = ensureLifecycle(running);
+  if (
+    lifecycle.process.kind === "finalizing" ||
+    isTerminalLifecycle(lifecycle) ||
+    lifecycle.delivery !== "pending"
+  ) {
+    return false;
+  }
+
+  running.interrupted = { errorMessage: INTERRUPTED_ERROR, interruptedAt: now };
+  running.lifecycle = markFailed(lifecycle, INTERRUPTED_ERROR, now, INTERRUPTED_EXIT_CODE);
+  persistPaneTailBeforeClose(running);
+  try {
+    operations.closePane(running.surface);
+  } catch {
+    // Best-effort teardown after the interrupt grace expired.
+  }
+  try {
+    operations.abortWatcher(running.abortController);
+  } catch {
+    // Best-effort watcher stop after the interrupt grace expired.
+  }
+  return true;
+}
+
+function scheduleInterruptedFinalization(
+  running: RunningSubagent,
+  graceMs = getInterruptGraceMs(),
+  operations: Pick<RecoveryPaneOperations, "closePane" | "abortWatcher"> = DEFAULT_RECOVERY_PANE_OPERATIONS,
+): boolean {
+  if (
+    running.interactive ||
+    running.interruptGraceTimer != null ||
+    running.interrupted != null ||
+    isTerminalLifecycle(ensureLifecycle(running))
+  ) {
+    return false;
+  }
+
+  const delay = Math.max(0, Math.floor(graceMs));
+  const timer = setTimeout(() => {
+    running.interruptGraceTimer = undefined;
+    if (finalizeInterruptedSubagent(running, Date.now(), operations)) updateWidget();
+  }, delay);
+  timer.unref?.();
+  running.interruptGraceTimer = timer;
+  return true;
+}
+
+/** Idempotent failure teardown shared with future hard-stop paths. */
+function failAndTeardownSubagent(
+  running: RunningSubagent,
+  error: string,
+  now: number,
+  operations: Pick<RecoveryPaneOperations, "closePane" | "abortWatcher"> = DEFAULT_RECOVERY_PANE_OPERATIONS,
+  beforeAbort?: () => void,
+): boolean {
+  const lifecycle = ensureLifecycle(running);
+  if (isTerminalLifecycle(lifecycle)) return false;
+
+  beforeAbort?.();
+  running.lifecycle = markFailed(lifecycle, error, now, 1);
+  persistPaneTailBeforeClose(running);
+  try {
+    operations.closePane(running.surface);
+  } catch {
+    // Best-effort teardown of a failed run.
+  }
+  try {
+    operations.abortWatcher(running.abortController);
+  } catch {
+    // Best-effort watcher stop of a failed run.
+  }
+  return true;
+}
+
+function advanceRunningRecovery(
+  running: RunningSubagent,
+  projection: LifecycleProjection,
+  now: number,
+  delays: RecoveryDelays,
+  operations: RecoveryPaneOperations = DEFAULT_RECOVERY_PANE_OPERATIONS,
+) {
+  const advance = advanceRecoveryLadder(running.recovery, {
+    now,
+    stalled: projection.kind === "stalled",
+    exempt:
+      running.interactive ||
+      running.wrapupPending === true ||
+      running.timeLimitStopped != null,
+    delays,
+  });
+  running.recovery = advance.state;
+
+  if (advance.action === "nudge") {
+    requestSubagentInterrupt(running, operations.interruptPane);
+  } else if (advance.action === "kill") {
+    const error = formatRecoveryKillError(now - running.startTime);
+    failAndTeardownSubagent(running, error, now, operations, () => {
+      // The watcher observes its abort asynchronously, so set this first.
+      running.recoveryKilled = { errorMessage: error, killedAt: now };
+    });
+  }
+
+  return advance;
+}
+
+function buildRecoveryKilledResult(running: RunningSubagent, now: number): SubagentResult | null {
+  const recoveryKilled = running.recoveryKilled;
+  if (!recoveryKilled) return null;
+  return {
+    name: running.name,
+    task: running.task,
+    summary: withPaneScrollbackRef(`Subagent error: ${recoveryKilled.errorMessage}`, running),
+    sessionFile: running.sessionFile,
+    exitCode: 1,
+    elapsed: Math.floor(Math.max(0, now - running.startTime) / 1000),
+    error: recoveryKilled.errorMessage,
+    errorMessage: recoveryKilled.errorMessage,
+    // TASK-326 AC6: a recovery/watchdog kill is a parent lifecycle stop, not
+    // a provider failure; assigned here because this result is returned before
+    // the transcript classification runs.
+    failureKind: "watchdog",
+  };
+}
+
+function buildInterruptedResult(running: RunningSubagent, now: number): SubagentResult | null {
+  const interrupted = running.interrupted;
+  if (!interrupted) return null;
+  return {
+    name: running.name,
+    task: running.task,
+    summary: withPaneScrollbackRef(
+      `${interrupted.errorMessage}\n\nThe session remains on disk and can be resumed with subagent_resume.`,
+      running,
+    ),
+    sessionFile: running.sessionFile,
+    exitCode: INTERRUPTED_EXIT_CODE,
+    elapsed: Math.floor(Math.max(0, now - running.startTime) / 1000),
+    error: "interrupted",
+    // TASK-326 AC5: assigned at construction so every early return of this
+    // result is classified without depending on a later code path.
+    failureKind: "interrupted",
+  };
+}
+
+function advanceRunningTimeLimit(
+  running: RunningSubagent,
+  now: number,
+  operations: TimeLimitPaneOperations = DEFAULT_TIME_LIMIT_PANE_OPERATIONS,
+): { action: "warn" | "hard-stop" | null } {
+  if (
+    running.interactive ||
+    !running.timeLimit ||
+    running.recoveryKilled ||
+    running.timeLimitStopped
+  ) {
+    return { action: null };
+  }
+
+  const lastActivityAt = running.activity?.updatedAt;
+  const action = running.timeLimitDeadlineAt != null
+    ? now >= running.timeLimitDeadlineAt ? "hard-stop" : "none"
+    : evalTimeLimit(
+      now,
+      running.startTime,
+      lastActivityAt,
+      running.timeLimit,
+      running.timeLimitWarned === true,
+    );
+
+  if (action === "warn") {
+    try {
+      operations.writeWrapup(running.sessionFile);
+    } catch {
+      return { action: null };
+    }
+    const interruption = requestSubagentInterrupt(running, operations.interruptPane);
+    if ("error" in interruption) {
+      try {
+        operations.removeWrapup(running.sessionFile);
+      } catch {
+        // The wrap-up directive may already be gone; not an error.
+      }
+      return { action: null };
+    }
+
+    running.timeLimitWarned = true;
+    running.wrapupPending = true;
+    running.timeLimitDeadlineAt = getTimeLimitDeadlineAt(
+      running.startTime,
+      lastActivityAt,
+      running.timeLimit,
+    );
+    running.lifecycle = markInterruptRequested(ensureLifecycle(running), now);
+    return { action: "warn" };
+  }
+
+  if (action === "hard-stop") {
+    const error = formatTimeLimitError(now - running.startTime);
+    const stopped = failAndTeardownSubagent(running, error, now, operations, () => {
+      running.timeLimitStopped = { errorMessage: error, stoppedAt: now };
+      running.wrapupPending = false;
+      try {
+        operations.removeWrapup(running.sessionFile);
+      } catch {
+        // The wrap-up directive may already be gone; not an error.
+      }
+    });
+    return { action: stopped ? "hard-stop" : null };
+  }
+
+  return { action: null };
+}
+
+function buildTimeLimitStoppedResult(running: RunningSubagent, now: number): SubagentResult | null {
+  const stopped = running.timeLimitStopped;
+  if (!stopped) return null;
+
+  let tail: string | null = null;
+  try {
+    if (existsSync(running.sessionFile)) {
+      tail = findLastAssistantMessage(getNewEntries(running.sessionFile, 0));
+    }
+  } catch {
+    // The session tail is optional enrichment; a read failure is not fatal.
+  }
+
+  return {
+    name: running.name,
+    task: running.task,
+    summary: withPaneScrollbackRef(
+      `${stopped.errorMessage}${tail ? `\n\nLast session output:\n${tail}` : ""}`,
+      running,
+    ),
+    sessionFile: running.sessionFile,
+    exitCode: 1,
+    elapsed: Math.floor(Math.max(0, now - running.startTime) / 1_000),
+    error: stopped.errorMessage,
+    timeout: "hard-stop",
+    // TASK-326 AC6: hard time-limit stop, assigned at construction.
+    failureKind: "time-limit",
+  };
+}
+
 function handleSubagentInterrupt(
   params: { id?: string; name?: string },
   interruptPaneKey: (surface: string) => void = interruptPane,
+  options: {
+    closePane?: (surface: string) => void;
+    abortWatcher?: (controller: AbortController | undefined) => void;
+    graceMs?: number;
+  } = {},
 ) {
   const resolved = resolveInterruptTarget(params);
   if ("error" in resolved) {
@@ -987,6 +1849,16 @@ function handleSubagentInterrupt(
   }
 
   running.lifecycle = markInterruptRequested(ensureLifecycle(running), now);
+  if (!running.interactive && running.abortController) {
+    scheduleInterruptedFinalization(
+      running,
+      options.graceMs ?? getInterruptGraceMs(),
+      {
+        closePane: options.closePane ?? closePane,
+        abortWatcher: options.abortWatcher ?? DEFAULT_RECOVERY_PANE_OPERATIONS.abortWatcher,
+      },
+    );
+  }
   updateWidget();
 
   return {
@@ -997,6 +1869,8 @@ function handleSubagentInterrupt(
 
 function startStatusRefresh(pi: ExtensionAPI) {
   if (!statusConfig.enabled || statusInterval) return;
+  const recoveryDelays = parseRecoveryDelays(process.env.PI_SUBAGENT_RECOVERY_DELAYS_MS);
+  const activeToolStallMs = parseActiveToolStallMs(process.env.PI_SUBAGENT_ACTIVE_TOOL_STALL_MS);
 
   statusInterval = setInterval(() => {
     if (runningSubagents.size === 0) {
@@ -1015,7 +1889,12 @@ function startStatusRefresh(pi: ExtensionAPI) {
     for (const running of runningSubagents.values()) {
       // Dual-writes lifecycle + statusState for reload hydration; steers use lifecycle only.
       observeRunningSubagent(running, now);
-      const projection = projectLifecycle(ensureLifecycle(running), now);
+      const projection = reconcileProjectedFailure(
+        running,
+        projectLifecycle(ensureLifecycle(running), now, { activeToolStallMs }),
+      );
+      const recovery = advanceRunningRecovery(running, projection, now, recoveryDelays);
+      if (recovery.action) shouldRefreshWidget = true;
       const transition = lifecycleTransition(running.lastProjectedKind, projection.kind);
       if (running.lastProjectedKind !== projection.kind) {
         shouldRefreshWidget = true;
@@ -1059,10 +1938,34 @@ function startStatusRefresh(pi: ExtensionAPI) {
   (globalThis as any)[STATUS_INTERVAL_KEY] = statusInterval;
 }
 
+function clearResumeExitSidecar(sessionFile: string): void {
+  try {
+    unlinkSync(`${sessionFile}.exit`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+}
+
 function resolveResumeLaunchBehavior(params: { autoExit?: boolean }): { autoExit: boolean; interactive: boolean } {
   const autoExit = params.autoExit ?? true;
   return { autoExit, interactive: !autoExit };
 }
+
+function buildResumeAutoExitEnv(params: { autoExit: boolean; hasMessage: boolean }): string[] {
+  if (!params.autoExit) return [];
+  return [
+    "PI_SUBAGENT_AUTO_EXIT=1",
+    // A resumed session is a fresh autonomous run even when its JSONL ends in
+    // an operator Escape. The child consumes this one-shot re-arm on settle.
+    "PI_SUBAGENT_AUTO_EXIT_REARM=1",
+    ...(params.hasMessage ? ["PI_SUBAGENT_RESUME_INPUT=1"] : []),
+  ];
+}
+
+/** TASK-332 scrollback read source, requested line count, and persisted cap. */
+const PANE_SCROLLBACK_SOURCE: HerdrReadSource = "recent-unwrapped";
+const PANE_SCROLLBACK_READ_LINES = 10_000;
+const PANE_SCROLLBACK_MAX_BYTES = 256 * 1024;
 
 export const __test__ = {
   borderLine,
@@ -1075,16 +1978,61 @@ export const __test__ = {
   resolveLaunchBehavior,
   resolveEffectiveAutoExit,
   resolveEffectiveInteractive,
+  resolveTimeLimitConfig,
+  parseAgentDefinition,
   buildSubagentToolAllowlist,
   buildPiPromptArgs,
   observeRunningSubagent,
   resolveDenyTools,
+  parseSpawnDepth,
+  decrementSpawnDepth,
+  clampResumeSpawn,
+  readSpawnMetadata,
+  ensureResumeSessionCwd,
+  blockedSelfSpawn,
+  SPAWNING_TOOLS,
   resolveInterruptTarget,
   requestSubagentInterrupt,
+  reconcileProjectedFailure,
+  closePaneQuietly,
+  failAndTeardownSubagent,
+  advanceRunningRecovery,
+  buildRecoveryKilledResult,
+  advanceRunningTimeLimit,
+  buildTimeLimitStoppedResult,
+  buildResultTimeoutDetails,
+  buildInterruptedResult,
+  parseInterruptGraceMs,
+  getInterruptGraceMs,
+  DEFAULT_INTERRUPT_GRACE_MS,
+  scheduleInterruptedFinalization,
+  finalizeInterruptedSubagent,
+  buildResumeAutoExitEnv,
   handleSubagentInterrupt,
   resolveResultPresentation,
+  isReportlessCompletion,
+  classifyResumeCompletion,
+  watchSubagent,
   resolveResumeLaunchBehavior,
+  clearResumeExitSidecar,
+  preflightSubagentDonePath,
+  enrichNoSessionFailure,
+  persistPaneScrollback,
+  persistPaneTailBeforeClose,
+  formatPaneScrollbackRef,
+  withPaneScrollbackRef,
+  PANE_SCROLLBACK_READ_LINES,
+  PANE_SCROLLBACK_MAX_BYTES,
+  PANE_SCROLLBACK_SOURCE,
+  writeSpawnMetadata,
+  discoverOrphanedSubagents,
+  formatOrphanRestoreReport,
+  isActionableOrphan,
+  isRestorableOrphan,
+  resumeOrphanedSubagents,
   runningSubagents,
+  findActiveSessionRun,
+  captureStderrTail,
   formatElapsed,
 };
 
@@ -1108,6 +2056,7 @@ async function launchSubagent(
   ctx: {
     sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string };
     cwd: string;
+    isProjectTrusted?: () => boolean;
     model?: { provider: string; id: string };
     modelRegistry: {
       find(provider: string, modelId: string): any;
@@ -1119,6 +2068,7 @@ async function launchSubagent(
   parentThinking: ThinkingLevel,
   options?: { surface?: string },
 ): Promise<RunningSubagent> {
+  preflightSubagentDonePath();
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
 
@@ -1136,6 +2086,9 @@ async function launchSubagent(
   const effectiveThinking = runtimePlan.thinking;
   const effectiveAutoExit = resolveEffectiveAutoExit(params, agentDefs);
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
+  const cliId = agentDefs?.cli ?? "pi";
+  const driver = getHarnessDriver(cliId);
+  const timeLimit = resolveTimeLimitConfig(agentDefs, effectiveInteractive, driver.id === "pi");
 
   const sessionFile = ctx.sessionManager.getSessionFile();
   if (!sessionFile) throw new Error("No session file");
@@ -1158,8 +2111,6 @@ async function launchSubagent(
   ].join("-");
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
 
-  const cliId = agentDefs?.cli ?? "pi";
-  const driver = getHarnessDriver(cliId);
   driver.validateRuntimePlan?.(runtimePlan, parentThinking);
 
   const surfacePreCreated = !!options?.surface;
@@ -1185,7 +2136,10 @@ async function launchSubagent(
   const activityFile = getSubagentActivityFile(artifactDir, id);
   if (driver.hasActivitySnapshots) {
     mkdirSync(dirname(activityFile), { recursive: true });
+    resetSubagentActivityFile(activityFile);
   }
+  const stderrFile = join(artifactDir, "subagent-stderr", `${id}.log`);
+  mkdirSync(dirname(stderrFile), { recursive: true });
   const { inheritsConversationContext } = launchBehavior;
 
   // Build the task message
@@ -1197,7 +2151,12 @@ async function launchSubagent(
   const summaryInstruction = effectiveAutoExit
     ? "Your FINAL assistant message should summarize what you accomplished."
     : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
-  const denySet = resolveDenyTools(agentDefs);
+  // Spawn grant + depth: this process's PI_SUBAGENT_SPAWN_DEPTH is the
+  // generation ceiling for our direct children; they receive one less so
+  // mutual spawning terminates.
+  const launcherAllowance = parseSpawnDepth(process.env.PI_SUBAGENT_SPAWN_DEPTH);
+  const spawnGranted = agentDefs?.spawning === true;
+  const denySet = resolveDenyTools(agentDefs, launcherAllowance);
   const identity = agentDefs?.body ?? params.systemPrompt ?? null;
   const systemPromptMode = agentDefs?.systemPromptMode;
   const identityInSystemPrompt = systemPromptMode && identity;
@@ -1216,12 +2175,15 @@ async function launchSubagent(
     sessionDir,
     subagentSessionFile,
     effectiveCwd,
+    parentCwd: ctx.cwd,
+    parentTrusted: typeof ctx.isProjectTrusted === "function" ? ctx.isProjectTrusted() : undefined,
     localAgentDir,
     effectiveAutoExit,
     effectiveInteractive,
     inheritsConversationContext,
     taskDelivery: launchBehavior.taskDelivery,
     denySet,
+    childSpawnDepth: decrementSpawnDepth(launcherAllowance),
     identity,
     identityInSystemPrompt: Boolean(identityInSystemPrompt),
     systemPromptMode,
@@ -1240,15 +2202,6 @@ async function launchSubagent(
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
 
-  runScriptInPane(surface, built.command, {
-    scriptPath: launchScriptFile,
-    scriptPreamble: (built.launchScriptPreamble ?? [
-      `# Subagent launch script for ${params.name}`,
-      `# Generated: ${new Date().toISOString()}`,
-      `# Surface: ${surface}`,
-    ]).join("\n"),
-  });
-
   const running: RunningSubagent = {
     id,
     name: params.name,
@@ -1263,13 +2216,185 @@ async function launchSubagent(
     interactive: effectiveInteractive,
     runtimePlan,
     activityFile: driver.hasActivitySnapshots ? activityFile : undefined,
+    stderrFile,
+    artifactDir,
+    timeLimit,
     lifecycle: !driver.hasActivitySnapshots
       ? markProcessRunning(createLifecycle(startTime), Date.now())
       : createLifecycle(startTime),
   };
 
+  // First-launch spawn metadata is durable lineage as well as the authoritative
+  // cap for later subagent_resume. Write it before the command enters the pane
+  // so a crash between pane creation and the first child message leaves a
+  // discoverable phantom rather than an invisible launch.
+  try {
+    writeSpawnMetadata(running.sessionFile, {
+      allowance: spawnGranted ? launcherAllowance ?? null : 0,
+      parentSessionFile: sessionFile,
+      parentSessionId: sessionId,
+      childSessionFile: running.sessionFile,
+      name: params.name,
+      agent: params.agent ?? null,
+      task: params.task,
+      launchedAt: new Date(startTime).toISOString(),
+    });
+  } catch {
+    // Unwritable sidecar ⇒ resume conservatively denies spawning, as before.
+  }
+
+  runScriptInPane(surface, built.command, {
+    scriptPath: launchScriptFile,
+    stderrFile,
+    scriptPreamble: (built.launchScriptPreamble ?? [
+      `# Subagent launch script for ${params.name}`,
+      `# Generated: ${new Date().toISOString()}`,
+      `# Surface: ${surface}`,
+    ]).join("\n"),
+  });
+
   runningSubagents.set(id, running);
   return running;
+}
+
+const FAILURE_PANE_TAIL_LINES = 20;
+
+/** Persisted pre-close snapshot of a child pane (TASK-332). */
+export interface PaneScrollbackRef {
+  path: string;
+  bytes: number;
+  sha256: string;
+  source: HerdrReadSource;
+  readLines: number;
+  truncated: boolean;
+}
+
+/**
+ * TASK-332: the pane is where a process-start death is rendered, and herdr
+ * drops the scrollback when the pane closes (a later read returns
+ * `pane_not_found`). Snapshot the scrollback — not the viewport — to the run's
+ * artifact directory before any close, so the failure report can point at a
+ * durable copy.
+ *
+ * The read/cap constants are declared above `__test__` (module-init order).
+ */
+function sanitizeSurfaceForPath(surface: string): string {
+  return surface.replace(/[^A-Za-z0-9._-]+/g, "_");
+}
+
+function persistPaneScrollback(
+  running: { id?: string; surface: string; artifactDir?: string },
+  readPaneFn: typeof readPane = readPane,
+): PaneScrollbackRef | undefined {
+  if (!running.artifactDir) return undefined;
+
+  let raw: string;
+  try {
+    raw = readPaneFn(running.surface, PANE_SCROLLBACK_READ_LINES, PANE_SCROLLBACK_SOURCE);
+  } catch {
+    return undefined;
+  }
+  if (!raw.trim()) return undefined;
+
+  let bytes = Buffer.from(raw, "utf8");
+  const truncated = bytes.byteLength > PANE_SCROLLBACK_MAX_BYTES;
+  if (truncated) {
+    // Keep the tail: startup errors render last.
+    bytes = bytes.subarray(bytes.byteLength - PANE_SCROLLBACK_MAX_BYTES);
+    // Do not start the file mid-UTF-8-sequence.
+    let offset = 0;
+    while (offset < 3 && offset < bytes.byteLength && (bytes[offset] & 0xc0) === 0x80) offset++;
+    bytes = bytes.subarray(offset);
+  }
+
+  const dir = join(running.artifactDir, "pane-scrollback");
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, `${running.id ?? "unknown-run"}-${sanitizeSurfaceForPath(running.surface)}.log`);
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  writeFileSync(file, bytes);
+  writeFileSync(
+    `${file}.meta.json`,
+    `${JSON.stringify(
+      {
+        runId: running.id ?? null,
+        surface: running.surface,
+        persistedAt: new Date().toISOString(),
+        bytes: bytes.byteLength,
+        sha256,
+        source: PANE_SCROLLBACK_SOURCE,
+        readLines: PANE_SCROLLBACK_READ_LINES,
+        truncated,
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  return {
+    path: file,
+    bytes: bytes.byteLength,
+    sha256,
+    source: PANE_SCROLLBACK_SOURCE,
+    readLines: PANE_SCROLLBACK_READ_LINES,
+    truncated,
+  };
+}
+
+/** Human/agent-readable report line naming the persisted artifact by path. */
+function formatPaneScrollbackRef(ref: PaneScrollbackRef): string {
+  return `Pane scrollback persisted: ${ref.path} (${ref.bytes} bytes, sha256:${ref.sha256})`;
+}
+
+/**
+ * Snapshot the pane tail once per run, immediately before a close that would
+ * otherwise discard it. Idempotent: a run that already has a snapshot (e.g.
+ * the enrich path ran first) is left alone.
+ */
+function persistPaneTailBeforeClose(
+  running: Pick<RunningSubagent, "id" | "surface" | "artifactDir" | "paneScrollback">,
+): void {
+  if (running.paneScrollback || !running.artifactDir) return;
+  const ref = persistPaneScrollback(running);
+  if (ref) running.paneScrollback = ref;
+}
+
+/** Append the persisted-tail reference to a failure summary when one exists. */
+function withPaneScrollbackRef(
+  summary: string,
+  running: { paneScrollback?: PaneScrollbackRef },
+): string {
+  return running.paneScrollback
+    ? `${summary}\n\n${formatPaneScrollbackRef(running.paneScrollback)}`
+    : summary;
+}
+
+function enrichNoSessionFailure(
+  result: Pick<import("./completion.ts").CompletionResult, "exitCode">,
+  running: Pick<RunningSubagent, "sessionFile" | "surface"> & {
+    id?: string;
+    artifactDir?: string;
+    paneScrollback?: PaneScrollbackRef;
+  },
+  summary: string,
+  readPaneFn: typeof readPane = readPane,
+): { summary: string; error?: string } {
+  if (result.exitCode === 0 || existsSync(running.sessionFile)) return { summary };
+
+  const scrollback = running.paneScrollback ?? persistPaneScrollback(running, readPaneFn);
+  if (scrollback) running.paneScrollback = scrollback;
+  const scrollbackNote = scrollback ? `\n\n${formatPaneScrollbackRef(scrollback)}` : "";
+
+  let paneTail: string;
+  try {
+    paneTail = readPaneFn(running.surface, FAILURE_PANE_TAIL_LINES);
+  } catch {
+    return { summary: `${summary}${scrollbackNote}` };
+  }
+  if (!paneTail.trim()) return { summary: `${summary}${scrollbackNote}` };
+
+  return {
+    summary: `${summary}\n\nChild pane output:\n${paneTail}${scrollbackNote}`,
+    error: paneTail,
+  };
 }
 
 /**
@@ -1280,6 +2405,10 @@ async function launchSubagent(
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
+  // TASK-337: a resumed run shares its session file with the pre-resume
+  // transcript. Only entries after this offset belong to the run being
+  // admitted; the pre-resume report must never satisfy the admission rule.
+  resumeFromEntryCount = 0,
 ): Promise<SubagentResult> {
   const { name, task, surface, startTime, sessionFile } = running;
 
@@ -1288,19 +2417,43 @@ async function watchSubagent(
       intervalMs: 1000,
       sessionFile,
       sentinelFile: running.sentinelFile,
+      expectedSidecarWriter: { runId: running.id },
       readTerminalTail: () => readPaneAsync(surface, 5),
       inspectPane: async () => inspectPane(surface),
+      readWorkerActivity: running.activityFile
+        ? () => readSubagentActivityFile(running.activityFile!, running.id)
+        : undefined,
+      onWorkerActivity: (read: ActivityReadResult, observedAt: number) => {
+        observeRunningSubagent(running, observedAt, read);
+      },
       onPaneInspection: (inspection: PaneInspection, observedAt: number) => {
         ensureLifecycle(running);
         running.lifecycle = observePaneInspection(running.lifecycle, inspection, observedAt);
         updateWidget();
       },
       onTick() {
-        observeRunningSubagent(running);
+        const now = Date.now();
+        observeRunningSubagent(running, now);
+        if (advanceRunningTimeLimit(running, now).action) updateWidget();
       },
     });
 
     const detectedAt = Date.now();
+    const interruptedResult = buildInterruptedResult(running, detectedAt);
+    if (interruptedResult) {
+      updateWidget();
+      return interruptedResult;
+    }
+    const timeLimitResult = buildTimeLimitStoppedResult(running, detectedAt);
+    if (timeLimitResult) {
+      updateWidget();
+      return timeLimitResult;
+    }
+    const recoveryResult = buildRecoveryKilledResult(running, detectedAt);
+    if (recoveryResult) {
+      updateWidget();
+      return recoveryResult;
+    }
     running.lifecycle = markCompletionDetected(running.lifecycle, result, detectedAt);
     updateWidget();
     const elapsed = Math.floor((detectedAt - startTime) / 1000);
@@ -1317,18 +2470,43 @@ async function watchSubagent(
       });
 
       if (extracted) {
-        closePane(surface);
-        running.lifecycle = result.exitCode === 0
-          ? markCompleted(running.lifecycle, Date.now())
-          : markFailed(running.lifecycle, result.errorMessage ?? extracted.summary, Date.now(), result.exitCode);
+        // TASK-337: an external driver that exits 0 with no provider error, no
+        // ping, and only the synthesized pane-absence summary carries no
+        // terminal report. Treat that synthesized literal as null evidence and
+        // reuse the Pi admission rule instead of admitting `completed` on the
+        // exit code alone. `extractPaneSummary` keeps synthesizing the absence
+        // (non-zero exits and display still need it); classification happens
+        // here, at the single point where a driver result is finalized.
+        const reportless =
+          isReportlessCompletion([], result) &&
+          isPaneAbsenceSummary(extracted.summary, driver.name, result.exitCode);
+        // Keep the driver's own absence naming in the parent-visible summary
+        // and add the canonical reportless statement used by the Pi path.
+        const baseSummary = reportless
+          ? `${REPORTLESS_COMPLETION_SUMMARY}\n\n${extracted.summary}`
+          : extracted.summary;
+        const enriched = enrichNoSessionFailure(result, running, baseSummary);
+        if (reportless) persistPaneTailBeforeClose(running);
+        const finalSummary = reportless ? withPaneScrollbackRef(enriched.summary, running) : enriched.summary;
+        const stderr = reportless ? captureStderrTail(running.stderrFile) : undefined;
+        if (!result.preservePane) closePaneQuietly(surface);
+        running.lifecycle = reportless
+          ? markFailed(running.lifecycle, finalSummary, Date.now(), result.exitCode)
+          : result.exitCode === 0
+            ? markCompleted(running.lifecycle, Date.now())
+            : markFailed(running.lifecycle, result.errorMessage ?? enriched.summary, Date.now(), result.exitCode);
 
         return {
           name,
           task,
-          summary: extracted.summary,
+          summary: finalSummary,
           exitCode: result.exitCode,
           elapsed,
+          ...(stderr ? { stderr } : {}),
+          ...(reportless ? { failureKind: "reportless" as const } : {}),
+          ...(enriched.error ? { error: enriched.error } : {}),
           ...(extracted.sessionId ? { claudeSessionId: extracted.sessionId } : {}),
+          ...(!reportless && result.wrapup ? { partial: true, timeout: "warned-wrapup" as const } : {}),
           ...extracted.details,
         };
       }
@@ -1336,32 +2514,51 @@ async function watchSubagent(
 
     // Pi subagent result extraction
     let summary: string;
+    // TASK-326: classify what actually happened from the child's own session
+    // transcript before rendering. A genuine provider failure is the only
+    // outcome that carries stopReason "error"; an aborted or mid-turn cut-off
+    // is an interrupt/close; no assistant turn at all produced no result.
+    let failureKind: SubagentFailureKind;
+    // TASK-337: the entries that may supply terminal evidence for this run.
+    // Empty when the child session file never appeared; the admission rule then
+    // treats a clean exit as reportless rather than completed.
+    let admissionEntries: ReturnType<typeof getNewEntries> = [];
     if (existsSync(sessionFile)) {
-      const allEntries = getNewEntries(sessionFile, 0);
-      const observed = findObservedSessionRuntime(allEntries);
-      if (running.runtimePlan && observed.provider && observed.modelId) {
-        const observedModel = `${observed.provider}/${observed.modelId}`;
+      const allEntries = getNewEntries(sessionFile, resumeFromEntryCount);
+      admissionEntries = allEntries;
+      failureKind = classifySessionFailure(allEntries);
+      if (running.runtimePlan) {
+        const observation = classifyRuntimeObservation(allEntries, running.runtimePlan.model);
         const observedThinking =
-          observed.thinking === "off" ||
-          observed.thinking === "minimal" ||
-          observed.thinking === "low" ||
-          observed.thinking === "medium" ||
-          observed.thinking === "high" ||
-          observed.thinking === "xhigh" ||
-          observed.thinking === "max"
-            ? observed.thinking
+          observation.observed.thinking === "off" ||
+          observation.observed.thinking === "minimal" ||
+          observation.observed.thinking === "low" ||
+          observation.observed.thinking === "medium" ||
+          observation.observed.thinking === "high" ||
+          observation.observed.thinking === "xhigh" ||
+          observation.observed.thinking === "max"
+            ? observation.observed.thinking
             : undefined;
-        const mismatch = observedModel !== running.runtimePlan.model
-          ? `Resolved model ${running.runtimePlan.model} but child reported ${observedModel}`
-          : undefined;
+        // Prefer the model that actually served the final turn; fall back to the
+        // last declared change only when no assistant turn served a model.
+        const observedModel = observation.served
+          ? `${observation.served.provider}/${observation.served.modelId}`
+          : observation.observed.provider && observation.observed.modelId
+            ? `${observation.observed.provider}/${observation.observed.modelId}`
+            : undefined;
         running.runtimePlan = {
           ...running.runtimePlan,
           ...(observedThinking ? { thinking: observedThinking } : {}),
-          observed: {
-            model: observedModel,
-            ...(observedThinking ? { thinking: observedThinking } : {}),
-          },
-          ...(mismatch ? { runtimeMismatch: mismatch } : {}),
+          ...(observedModel
+            ? {
+                observed: {
+                  model: observedModel,
+                  ...(observedThinking ? { thinking: observedThinking } : {}),
+                },
+              }
+            : {}),
+          ...(observation.runtimeMismatch ? { runtimeMismatch: observation.runtimeMismatch } : {}),
+          ...(observation.runtimeFallback ? { runtimeFallback: observation.runtimeFallback } : {}),
         };
       }
       summary =
@@ -1372,6 +2569,7 @@ async function watchSubagent(
             ? `Sub-agent exited with code ${result.exitCode}`
             : "Sub-agent exited without output");
     } else {
+      failureKind = "no-result";
       summary = result.errorMessage
         ? `Subagent error: ${result.errorMessage}`
         : result.exitCode !== 0
@@ -1379,29 +2577,76 @@ async function watchSubagent(
           : "Sub-agent exited without output";
     }
 
-    closePane(surface);
-    running.lifecycle = result.exitCode === 0
-      ? markCompleted(running.lifecycle, Date.now())
-      : markFailed(running.lifecycle, result.errorMessage ?? summary, Date.now(), result.exitCode);
+    // TASK-337: a clean exit (0) with no terminal report is NOT a completion,
+    // whether or not the child session file survives. Pings are not
+    // completions and are delivered separately, so they keep their own path.
+    const reportless = isReportlessCompletion(admissionEntries, result);
+    if (reportless) {
+      failureKind = "reportless";
+      summary = REPORTLESS_COMPLETION_SUMMARY;
+    }
+
+    const enriched = enrichNoSessionFailure(result, running, summary);
+    // TASK-337: a reportless failure should be as diagnosable as the no-result
+    // family — attach the captured stderr tail and, before the pane closes, a
+    // durable pane-scrollback reference when available.
+    if (reportless) persistPaneTailBeforeClose(running);
+    const finalSummary = reportless ? withPaneScrollbackRef(enriched.summary, running) : enriched.summary;
+    const stderr = !existsSync(sessionFile) || failureKind === "no-result" || failureKind === "reportless"
+      ? captureStderrTail(running.stderrFile)
+      : undefined;
+    if (!result.preservePane) closePaneQuietly(surface);
+    running.lifecycle = reportless
+      ? markFailed(running.lifecycle, finalSummary, Date.now(), result.exitCode)
+      : result.exitCode === 0
+        ? markCompleted(running.lifecycle, Date.now())
+        : markFailed(running.lifecycle, result.errorMessage ?? finalSummary, Date.now(), result.exitCode);
 
     return {
       name,
       task,
-      summary,
+      summary: finalSummary,
       sessionFile,
       exitCode: result.exitCode,
       elapsed,
       ping: result.ping,
-      ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+      ...(enriched.error ? { error: enriched.error } : {}),
+      ...(stderr ? { stderr } : {}),
+      ...(reportless ? { failureKind } : {}),
+      ...(!reportless && result.wrapup ? { partial: true, timeout: "warned-wrapup" as const } : {}),
+      ...(result.errorMessage
+        ? { errorMessage: result.errorMessage, failureKind }
+        : {}),
     };
   } catch (err: any) {
+    const now = Date.now();
+    const timeLimitResult = buildTimeLimitStoppedResult(running, now);
+    if (timeLimitResult) {
+      updateWidget();
+      return timeLimitResult;
+    }
+    const recoveryResult = buildRecoveryKilledResult(running, now);
+    if (recoveryResult) {
+      running.lifecycle = markFailed(running.lifecycle, recoveryResult.errorMessage!, now, 1);
+      updateWidget();
+      return recoveryResult;
+    }
+    const interruptedResult = buildInterruptedResult(running, now);
+    if (interruptedResult) {
+      updateWidget();
+      return interruptedResult;
+    }
+
+    persistPaneTailBeforeClose(running);
     try {
       closePane(surface);
-    } catch {}
+    } catch {
+      // Best-effort pane close on the watcher error path.
+    }
     running.lifecycle = markFailed(
       running.lifecycle,
       signal.aborted ? "Subagent cancelled." : err?.message ?? String(err),
-      Date.now(),
+      now,
       1,
     );
     updateWidget();
@@ -1410,9 +2655,9 @@ async function watchSubagent(
       return {
         name,
         task,
-        summary: "Subagent cancelled.",
+        summary: withPaneScrollbackRef("Subagent cancelled.", running),
         exitCode: 1,
-        elapsed: Math.floor((Date.now() - startTime) / 1000),
+        elapsed: Math.floor((now - startTime) / 1000),
         error: "cancelled",
         sessionFile,
       };
@@ -1420,16 +2665,193 @@ async function watchSubagent(
     return {
       name,
       task,
-      summary: `Subagent error: ${err?.message ?? String(err)}`,
+      summary: withPaneScrollbackRef(`Subagent error: ${err?.message ?? String(err)}`, running),
       exitCode: 1,
-      elapsed: Math.floor((Date.now() - startTime) / 1000),
+      elapsed: Math.floor((now - startTime) / 1000),
       error: err?.message ?? String(err),
     };
+  } finally {
+    clearInterruptGraceTimer(running);
+    cleanupWrapupDirective(sessionFile);
   }
 }
 
+type RegisteredToolExecutor = (...args: any[]) => Promise<any>;
+
 export default function subagentsExtension(pi: ExtensionAPI) {
-  runtime.pi = pi;
+  // Bind delivery only after session_start, never to factory-time API stubs.
+  let spawnToolExecutor: RegisteredToolExecutor | undefined;
+  let resumeToolExecutor: RegisteredToolExecutor | undefined;
+  let restoreInFlight = false;
+
+  function currentSessionFile(ctx: any): string | null {
+    try {
+      const file = ctx?.sessionManager?.getSessionFile?.();
+      return typeof file === "string" && file.trim() ? file : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function discoverCurrentOrphans(ctx: any): DiscoveredOrphan[] {
+    const sessionFile = currentSessionFile(ctx);
+    if (!sessionFile) return [];
+    let sessionId: string | undefined;
+    try {
+      const id = ctx?.sessionManager?.getSessionId?.();
+      if (typeof id === "string" && id.trim()) sessionId = id;
+    } catch {
+      // A damaged/ephemeral session cannot provide an artifact namespace.
+    }
+
+    let paneSessions: ReturnType<typeof listPaneSessionReferences> = [];
+    try {
+      paneSessions = listPaneSessionReferences();
+    } catch {
+      // Herdr may be restarting during parent restore; disk discovery remains useful.
+    }
+    return discoverOrphanedSubagents(sessionFile, {
+      ...(sessionId ? { parentSessionId: sessionId } : {}),
+      paneSessions,
+    });
+  }
+
+  function appendRestoreHandled(child: DiscoveredOrphan, action: "resume" | "relaunch" | "report"): void {
+    const appendEntry = (pi as any).appendEntry;
+    if (typeof appendEntry !== "function") return;
+    try {
+      appendEntry("subagent_restore_handled", {
+        childSessionFile: child.sessionFile,
+        classification: child.classification,
+        action,
+        handledAt: new Date().toISOString(),
+      });
+    } catch {
+      // Completion delivery remains authoritative when the marker cannot be persisted.
+    }
+  }
+
+  function reportOrphansAtSessionStart(ctx: any): void {
+    // A child inherits the parent session directory and must not try to restore
+    // its parent's siblings when its own extension starts.
+    if (process.env.PI_SUBAGENT_ID) return;
+    const children = discoverCurrentOrphans(ctx);
+    const pending = children.filter(isActionableOrphan);
+    const content = formatOrphanRestoreReport(pending);
+    if (!content) return;
+
+    const reportedChildren = pending
+      .filter((child) => child.classification === "completed-undelivered")
+      .map((child) => ({ childSessionFile: child.sessionFile }));
+    try {
+      pi.sendMessage(
+        {
+          customType: "subagent_restore_report",
+          content,
+          display: true,
+          details: {
+            children: pending.map((child) => ({
+              childSessionFile: child.sessionFile,
+              name: child.name,
+              classification: child.classification,
+            })),
+            reportedChildren,
+          },
+        },
+        // Keep startup passive: the report is context for the next user turn,
+        // not an instruction to resume children before the user asks.
+        { triggerTurn: false, deliverAs: "steer" },
+      );
+      for (const child of pending) {
+        if (child.classification === "completed-undelivered") appendRestoreHandled(child, "report");
+      }
+    } catch {
+      // A session can be torn down while startup hooks are still draining.
+    }
+  }
+
+  function isStartedToolResult(result: any): boolean {
+    return result?.details?.status === "started";
+  }
+
+  async function restoreOnResume(ctx: any): Promise<boolean> {
+    if (restoreInFlight) return true;
+    const children = discoverCurrentOrphans(ctx);
+    const pending = children.filter(isRestorableOrphan);
+    if (pending.length === 0) return false;
+    if (!resumeToolExecutor && pending.some((child) => child.classification !== "phantom")) {
+      ctx?.ui?.notify?.("Cannot resume orphaned subagents: subagent_resume is unavailable.", "error");
+      return true;
+    }
+    if (!spawnToolExecutor && pending.some((child) => child.classification === "phantom")) {
+      ctx?.ui?.notify?.("Cannot relaunch phantom subagents: subagent is unavailable.", "error");
+      return true;
+    }
+
+    restoreInFlight = true;
+    try {
+      const outcomes: OrphanResumeOutcome[] = await resumeOrphanedSubagents(pending, {
+        closePane: (paneId) => closePane(paneId),
+        resume: async (child) => {
+          if (!resumeToolExecutor) throw new Error("subagent_resume is unavailable");
+          const result = await resumeToolExecutor(
+            `restore-resume-${child.name}`,
+            {
+              sessionPath: child.sessionFile,
+              name: `Resume ${child.name}`,
+              message: "Re-orient from your existing session, continue the interrupted task, and finish it. Return a concise final report when done.",
+              autoExit: true,
+            },
+            undefined,
+            undefined,
+            ctx,
+          );
+          if (!isStartedToolResult(result)) {
+            throw new Error(result?.content?.[0]?.text ?? "subagent_resume did not start");
+          }
+          // Persist the handled marker before moving to the next child so a
+          // shutdown during a multi-child restore cannot replay this resume.
+          appendRestoreHandled(child, "resume");
+          return result;
+        },
+        relaunch: async (child) => {
+          if (!spawnToolExecutor) throw new Error("subagent is unavailable");
+          const result = await spawnToolExecutor(
+            `restore-relaunch-${child.name}`,
+            {
+              name: child.name,
+              task: child.task,
+              ...(child.agent ? { agent: child.agent } : {}),
+              interactive: false,
+            },
+            undefined,
+            undefined,
+            ctx,
+          );
+          if (!isStartedToolResult(result)) {
+            throw new Error(result?.content?.[0]?.text ?? "subagent did not start");
+          }
+          appendRestoreHandled(child, "relaunch");
+          return result;
+        },
+      });
+      const failed = outcomes.filter((outcome) => !outcome.ok);
+      if (failed.length > 0) {
+        ctx?.ui?.notify?.(
+          `Restore started ${outcomes.length - failed.length} subagent${outcomes.length - failed.length === 1 ? "" : "s"}; ${failed.length} failed to start.`,
+          "warning",
+        );
+      } else {
+        ctx?.ui?.notify?.(
+          `Restore started ${outcomes.length} orphaned subagent${outcomes.length === 1 ? "" : "s"}.`,
+          "info",
+        );
+      }
+      return true;
+    } finally {
+      restoreInFlight = false;
+    }
+  }
 
   // Capture the UI context for widget updates and restore presentation for
   // subagents whose watchers survived a reload.
@@ -1449,10 +2871,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       startStatusRefresh(pi);
       updateWidget();
     }
+    completionDelivery.bind(pi);
+    reportOrphansAtSessionStart(ctx);
   });
 
   // Clean up on session shutdown
   pi.on("session_shutdown", (event, _ctx) => {
+    // Watchers survive reload, but the old context does not. Poll callbacks can
+    // run between teardown and session_start; skip UI until the new ctx binds.
+    runtime.latestCtx = undefined;
+    completionDelivery.detach(shouldPreserveSubagentsOnShutdown((event as any).reason));
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
@@ -1478,8 +2906,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   const shouldRegister = (name: string) => !deniedTools.has(name);
 
   // ── subagent tool ──
-  if (shouldRegister("subagent"))
-    pi.registerTool({
+  if (shouldRegister("subagent")) {
+    const subagentTool = {
       name: "subagent",
       label: "Subagent",
       description:
@@ -1501,8 +2929,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         // Prevent self-spawning (e.g. planner spawning another planner)
+        // Non-empty here is guaranteed by blockedSelfSpawn requiring both args
+        // truthy and equal, so the message always renders a real identity.
         const currentAgent = process.env.PI_SUBAGENT_AGENT;
-        if (params.agent && currentAgent && params.agent === currentAgent) {
+        if (blockedSelfSpawn(params.agent, currentAgent)) {
           return {
             content: [
               {
@@ -1557,7 +2987,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Fire-and-forget: start watching in background
         watchSubagent(running, watcherAbort.signal)
-          .then((result) => {
+          .then((result) => completionDelivery.enqueue((completionApi) => {
             if (!shouldDeliverSubagentCompletion(running)) {
               running.lifecycle = markDelivery(running.lifecycle, "suppressed");
               runningSubagents.delete(running.id);
@@ -1567,7 +2997,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             running.lifecycle = markDelivery(running.lifecycle, "delivered");
             runningSubagents.delete(running.id);
             updateWidget();
-            const completionApi = selectCompletionApi(pi, runtime.pi);
 
             if (result.ping) {
               // Subagent is requesting help — steer a ping message with session path for resume
@@ -1590,8 +3019,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             }
 
             const basePresentation = resolveResultPresentation(result, running.name);
-            const presentation = running.runtimePlan?.runtimeMismatch
-              ? `${basePresentation}\n\nRuntime warning: ${running.runtimePlan.runtimeMismatch}`
+            const runtimeNote = running.runtimePlan?.runtimeMismatch
+              ? `Runtime warning: ${running.runtimePlan.runtimeMismatch}`
+              : running.runtimePlan?.runtimeFallback
+                ? `Runtime note: ${running.runtimePlan.runtimeFallback}`
+                : undefined;
+            const presentation = runtimeNote
+              ? `${basePresentation}\n\n${runtimeNote}`
               : basePresentation;
 
             completionApi.sendMessage(
@@ -1606,15 +3040,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   exitCode: result.exitCode,
                   elapsed: result.elapsed,
                   sessionFile: result.sessionFile,
+                  ...buildResultTimeoutDetails(result),
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+                  ...(result.failureKind ? { failureKind: result.failureKind } : {}),
                   ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
                   ...(running.runtimePlan ? { runtimePlan: running.runtimePlan } : {}),
                 },
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
-          })
-          .catch((err) => {
+          }))
+          .catch((err) => completionDelivery.enqueue((completionApi) => {
             if (!shouldDeliverSubagentCompletion(running)) {
               running.lifecycle = markDelivery(running.lifecycle, "suppressed");
               runningSubagents.delete(running.id);
@@ -1624,7 +3060,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             running.lifecycle = markDelivery(running.lifecycle, "delivered");
             runningSubagents.delete(running.id);
             updateWidget();
-            selectCompletionApi(pi, runtime.pi).sendMessage(
+            completionApi.sendMessage(
               {
                 customType: "subagent_result",
                 content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
@@ -1633,7 +3069,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
-          });
+          }))
+          .catch(() => { /* Error delivery is best-effort; never reject a detached watcher. */ });
 
         // Return immediately
         return {
@@ -1719,7 +3156,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
         return new Text(theme.fg("dim", text), 0, 0);
       },
-    });
+    };
+    spawnToolExecutor = subagentTool.execute;
+    pi.registerTool(subagentTool);
+  }
 
   // ── subagent_interrupt tool ──
   if (shouldRegister("subagent_interrupt"))
@@ -1727,13 +3167,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent_interrupt",
       label: "Interrupt Subagent",
       description:
-        "Send Escape to the active turn of a currently running Pi-backed subagent. " +
-        "The child pane, session, watcher, and running entry remain alive; this returns only a local acknowledgement " +
-        "and does not emit a subagent_result solely because of this request.",
+        "Interrupt the active turn of a running Pi-backed subagent. " +
+        "Interactive children remain open for operator takeover; autonomous one-shot children " +
+        "close after a bounded grace while their session stays resumable, and the parent delivers " +
+        "a terminal interrupt result.",
       promptSnippet:
-        "Send Escape to the active turn of a currently running Pi-backed subagent. " +
-        "The child pane, session, watcher, and running entry remain alive; this returns only a local acknowledgement " +
-        "and does not emit a subagent_result solely because of this request.",
+        "Interrupt the active turn of a running Pi-backed subagent. " +
+        "Interactive children remain open for operator takeover; autonomous one-shot children " +
+        "close after a bounded grace while their session stays resumable, and the parent delivers " +
+        "a terminal interrupt result.",
       parameters: Type.Object({
         id: Type.Optional(Type.String({ description: "Exact running subagent id" })),
         name: Type.Optional(Type.String({ description: "Exact running subagent display name" })),
@@ -1830,8 +3272,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
 
   // ── subagent_resume tool ──
-  if (shouldRegister("subagent_resume"))
-    pi.registerTool({
+  if (shouldRegister("subagent_resume")) {
+    const subagentResumeTool = {
       name: "subagent_resume",
       label: "Resume Subagent",
       description:
@@ -1896,6 +3338,29 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        // TASK-330 AC1: never put a second pi process on a session that already
+        // has an active run — the two runs would share one ${session}.exit
+        // consumer path and cross-attribute their outcomes (death 2).
+        const active = findActiveSessionRun(params.sessionPath);
+        if (active) {
+          return {
+            content: [{
+              type: "text",
+              text:
+                `Refused to resume ${params.sessionPath}: an active run is already on that ` +
+                `session (id ${active.id}, "${active.name}"). A second pi on one session ` +
+                `would conflate the two runs' exit sidecars. Wait for it to finish or ` +
+                `interrupt it first.`,
+            }],
+            details: {
+              error: "session already active",
+              status: "refused",
+              sessionPath: params.sessionPath,
+              activeRunId: active.id,
+              activeRunName: active.name,
+            },
+          };
+        }
         const name = params.name ?? "Resume";
         const { autoExit, interactive } = resolveResumeLaunchBehavior(params);
         const startTime = Date.now();
@@ -1914,26 +3379,62 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
+        const resumeCwd = ensureResumeSessionCwd(params.sessionPath, ctx.cwd);
+        if (!resumeCwd.ok) {
+          return {
+            content: [{ type: "text", text: `Error: ${resumeCwd.error}` }],
+            details: { error: resumeCwd.error },
+          };
+        }
+
+        // A prior run may have left completion evidence behind after its watcher
+        // consumed the original sidecar. It belongs to the old run, not this one.
+        clearResumeExitSidecar(params.sessionPath);
+
         // Record entry count before resuming so we can extract new messages
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
+        const subagentDonePath = preflightSubagentDonePath();
         const surface = createSubagentPane(name);
         if (params.message) {
           setPaneTask(surface, params.message);
         }
+        // Reserve the session across the only await before registration. No
+        // other await runs between here and runningSubagents.set, so releasing
+        // immediately after the delay leaves no window for a second pi.
+        if (!claimResumeSession(params.sessionPath)) {
+          // TASK-332: best-effort snapshot even on a refusal; a pane that never
+          // ran the child usually has no scrollback, so this is normally a no-op.
+          persistPaneScrollback({
+            id,
+            surface,
+            artifactDir: getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId()),
+          });
+          closePaneQuietly(surface);
+          return {
+            content: [{
+              type: "text",
+              text: `Refused to resume ${params.sessionPath}: a resume is already starting.`,
+            }],
+            details: { error: "session already active", status: "refused", sessionPath: params.sessionPath },
+          };
+        }
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+        releaseResumeSession(params.sessionPath);
 
         // Build pi resume command
         const parts = ["pi", "--session", shellQuote(params.sessionPath)];
 
         // Load subagent-done extension so the agent can self-terminate if needed
-        const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
         parts.push("-e", shellQuote(subagentDonePath));
 
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
         const activityFile = getSubagentActivityFile(artifactDir, id);
         mkdirSync(dirname(activityFile), { recursive: true });
+        resetSubagentActivityFile(activityFile);
+        const stderrFile = join(artifactDir, "subagent-stderr", `${id}.log`);
+        mkdirSync(dirname(stderrFile), { recursive: true });
 
         let resumeMsgFile: string | undefined;
         if (params.message) {
@@ -1953,17 +3454,39 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           parts.push(shellQuote(`@${resumeMsgFile}`));
         }
 
+        // First-launch lineage: identity travels with the session, so everything
+        // keyed on the agent profile (strict profiles, fallback chains) keeps
+        // working across every resume. Missing/corrupt metadata ⇒ no agent env,
+        // exactly the pre-fix resume behavior.
+        const spawnMetadata = readSpawnMetadata(params.sessionPath);
+
         // Build env prefix — propagate PI_CODING_AGENT_DIR for config isolation
         const resumeEnvParts: string[] = [];
         if (process.env.PI_CODING_AGENT_DIR) {
           resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellQuote(process.env.PI_CODING_AGENT_DIR)}`);
         }
         resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellQuote(name)}`);
+        if (typeof spawnMetadata?.agent === "string" && spawnMetadata.agent.trim()) {
+          resumeEnvParts.push(`PI_SUBAGENT_AGENT=${shellQuote(spawnMetadata.agent)}`);
+        }
         resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellQuote(params.sessionPath)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ID=${shellQuote(id)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
-        if (autoExit) {
-          resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
+        resumeEnvParts.push(...buildResumeAutoExitEnv({
+          autoExit,
+          hasMessage: Boolean(params.message),
+        }));
+        // Spawn rights on resume are clamped to what the first launch recorded:
+        // missing metadata ⇒ 0 (deny); never larger than first launch.
+        const resumeSpawn = clampResumeSpawn(
+          spawnMetadata,
+          parseSpawnDepth(process.env.PI_SUBAGENT_SPAWN_DEPTH),
+        );
+        if (!resumeSpawn.maySpawn) {
+          resumeEnvParts.push(`PI_DENY_TOOLS=${shellQuote([...SPAWNING_TOOLS].join(","))}`);
+        }
+        if (resumeSpawn.childEnvDepth !== null) {
+          resumeEnvParts.push(`PI_SUBAGENT_SPAWN_DEPTH=${resumeSpawn.childEnvDepth}`);
         }
         const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
 
@@ -1980,6 +3503,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         );
         runScriptInPane(surface, command, {
           scriptPath: launchScriptFile,
+          stderrFile,
           scriptPreamble: [
             `# Subagent resume script for ${name}`,
             `# Generated: ${new Date().toISOString()}`,
@@ -1999,6 +3523,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           sessionFile: params.sessionPath,
           launchScriptFile,
           activityFile,
+          stderrFile,
+          artifactDir,
           interactive,
           runtimePlan: undefined,
           lifecycle: createLifecycle(startTime),
@@ -2011,8 +3537,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const watcherAbort = new AbortController();
         running.abortController = watcherAbort;
 
-        watchSubagent(running, watcherAbort.signal)
-          .then((result) => {
+        watchSubagent(running, watcherAbort.signal, entryCountBefore)
+          .then((result) => completionDelivery.enqueue((completionApi) => {
             if (!shouldDeliverSubagentCompletion(running)) {
               running.lifecycle = markDelivery(running.lifecycle, "suppressed");
               runningSubagents.delete(running.id);
@@ -2022,7 +3548,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             running.lifecycle = markDelivery(running.lifecycle, "delivered");
             runningSubagents.delete(running.id);
             updateWidget();
-            const completionApi = selectCompletionApi(pi, runtime.pi);
 
             if (result.ping) {
               const sessionRef = `\n\nSession: ${params.sessionPath}\nResume: pi --session ${params.sessionPath}`;
@@ -2042,19 +3567,25 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               return;
             }
 
-            const allEntries = getNewEntries(params.sessionPath, entryCountBefore);
-            const summary = findLastAssistantMessage(allEntries) ??
-              (result.errorMessage
-                ? `Subagent error: ${result.errorMessage}`
-                : result.exitCode !== 0
-                  ? `Resumed session exited with code ${result.exitCode}`
-                  : "Resumed session exited without new output");
+            const newEntries = getNewEntries(params.sessionPath, entryCountBefore);
+            // TASK-337: only entries written after the resume may supply
+            // terminal evidence. A resumed run that exits 0 with no new
+            // terminal report is reportless, not completed — the pre-resume
+            // transcript must never stand in for this run's report. Kinds the
+            // watcher's lifecycle builders already assigned (interrupt,
+            // watchdog, time-limit) survive.
+            const { failureKind, summary } = classifyResumeCompletion(newEntries, result);
             const basePresentation = resolveResultPresentation(
-              { ...result, summary, sessionFile: params.sessionPath },
+              { ...result, summary, sessionFile: params.sessionPath, failureKind },
               name,
             );
-            const presentation = running.runtimePlan?.runtimeMismatch
-              ? `${basePresentation}\n\nRuntime warning: ${running.runtimePlan.runtimeMismatch}`
+            const runtimeNote = running.runtimePlan?.runtimeMismatch
+              ? `Runtime warning: ${running.runtimePlan.runtimeMismatch}`
+              : running.runtimePlan?.runtimeFallback
+                ? `Runtime note: ${running.runtimePlan.runtimeFallback}`
+                : undefined;
+            const presentation = runtimeNote
+              ? `${basePresentation}\n\n${runtimeNote}`
               : basePresentation;
 
             completionApi.sendMessage(
@@ -2068,14 +3599,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   exitCode: result.exitCode,
                   elapsed: result.elapsed,
                   sessionFile: params.sessionPath,
+                  ...buildResultTimeoutDetails(result),
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+                  ...(failureKind ? { failureKind } : {}),
                   ...(running.runtimePlan ? { runtimePlan: running.runtimePlan } : {}),
                 },
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
-          })
-          .catch((err) => {
+          }))
+          .catch((err) => completionDelivery.enqueue((completionApi) => {
             if (!shouldDeliverSubagentCompletion(running)) {
               running.lifecycle = markDelivery(running.lifecycle, "suppressed");
               runningSubagents.delete(running.id);
@@ -2085,7 +3618,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             running.lifecycle = markDelivery(running.lifecycle, "delivered");
             runningSubagents.delete(running.id);
             updateWidget();
-            selectCompletionApi(pi, runtime.pi).sendMessage(
+            completionApi.sendMessage(
               {
                 customType: "subagent_result",
                 content: `Resume error: ${err?.message ?? String(err)}`,
@@ -2094,7 +3627,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
-          });
+          }))
+          .catch(() => { /* Error delivery is best-effort; never reject a detached watcher. */ });
 
         return {
           content: [{ type: "text", text: `Session "${name}" resumed.` }],
@@ -2107,7 +3641,22 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           },
         };
       },
-    });
+    };
+    resumeToolExecutor = subagentResumeTool.execute;
+    pi.registerTool(subagentResumeTool);
+  }
+
+  // "resume" is intentionally handled only when durable restore work exists;
+  // normal /resume session switching is dispatched before this input hook.
+  pi.on("input", async (event, ctx) => {
+    if (process.env.PI_SUBAGENT_ID) return { action: "continue" as const };
+    const text = typeof (event as any)?.text === "string" ? (event as any).text.trim() : "";
+    if ((event as any)?.source === "extension" || text.toLowerCase() !== "resume") {
+      return { action: "continue" as const };
+    }
+    const restored = await restoreOnResume(ctx);
+    return restored ? { action: "handled" as const } : { action: "continue" as const };
+  });
 
   // /iterate command — fork the session into a subagent
   pi.registerCommand("iterate", {
@@ -2161,19 +3710,53 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const name = details.name ?? "subagent";
         const exitCode = details.exitCode ?? 0;
         const errorMessage = typeof details.errorMessage === "string" ? details.errorMessage : "";
-        const failed = exitCode !== 0 || !!errorMessage;
+        const failureKind = typeof details.failureKind === "string" ? details.failureKind : "";
+        // TASK-337: a reportless exit-0 completion is a failure, not a success.
+        const failed = exitCode !== 0 || !!errorMessage || failureKind === "reportless";
+        const partial = !failed && (details.partial === true || details.timeout === "warned-wrapup");
         const elapsed = details.elapsed != null ? formatElapsed(details.elapsed) : "?";
         const bgFn = failed
           ? (text: string) => theme.bg("toolErrorBg", text)
-          : (text: string) => theme.bg("toolSuccessBg", text);
+          : partial
+            ? (text: string) => theme.bg("customMessageBg", text)
+            : (text: string) => theme.bg("toolSuccessBg", text);
         const icon = failed
           ? theme.fg("error", "✗")
-          : theme.fg("success", "✓");
-        const status = errorMessage
-          ? "failed (provider/agent error)"
+          : partial
+            ? theme.fg("warning", "⚠")
+            : theme.fg("success", "✓");
+        // TASK-326: a known failure kind owns the label whether or not an
+        // errorMessage is present (interrupts and hard time-limit stops carry
+        // none). Legacy errorMessages with no kind keep the provider wording.
+        const knownKind =
+          failureKind === "provider" ||
+          failureKind === "operator" ||
+          failureKind === "interrupted" ||
+          failureKind === "no-result" ||
+          failureKind === "reportless" ||
+          failureKind === "watchdog" ||
+          failureKind === "time-limit";
+        const kindStatus =
+          failureKind === "operator"
+            ? "interrupted (closed)"
+            : failureKind === "interrupted"
+              ? "interrupted"
+              : failureKind === "no-result"
+                ? "failed (no result)"
+                : failureKind === "reportless"
+                  ? "failed (no report)"
+                  : failureKind === "watchdog"
+                    ? "killed (recovery watchdog)"
+                    : failureKind === "time-limit"
+                      ? "stopped (time limit)"
+                      : "failed (provider/agent error)";
+        const status = errorMessage || knownKind
+          ? kindStatus
           : failed
             ? `failed (exit ${exitCode})`
-            : "completed";
+            : partial
+              ? "partial report (time limit)"
+              : "completed";
         const agentTag = details.agent ? theme.fg("dim", ` (${details.agent})`) : "";
 
         const header = `${icon} ${theme.fg("toolTitle", theme.bold(name))}${agentTag} ${theme.fg("dim", "—")} ${status} ${theme.fg("dim", `(${elapsed})`)}`;

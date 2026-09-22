@@ -6,6 +6,8 @@ import type {
   BuiltHarnessCommand,
 } from "../types.ts";
 import type { ResolvedRuntimePlan } from "../../runtime-routing.ts";
+import { getSubagentActivityFile } from "../../activity.ts";
+import { resolveSpawnTrustFlag } from "../../spawn-trust.ts";
 
 const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
 
@@ -66,10 +68,13 @@ export class PiHarnessDriver implements HarnessDriver {
       artifactDir,
       subagentSessionFile,
       effectiveCwd,
+      parentCwd,
+      parentTrusted,
       localAgentDir,
       effectiveAutoExit,
       taskDelivery,
       denySet,
+      childSpawnDepth,
       identity,
       identityInSystemPrompt,
       systemPromptMode,
@@ -92,6 +97,16 @@ export class PiHarnessDriver implements HarnessDriver {
     if (effectiveThinking) {
       parts.push("--thinking", shellQuote(effectiveThinking));
     }
+
+    // A one-shot child must never fall through to pi's interactive
+    // project-trust selector: pass the resolved decision explicitly. Without
+    // this, a child in a folder with project-local pi resources and no
+    // trust-store entry blocks at startup forever (B12).
+    parts.push(resolveSpawnTrustFlag({
+      childCwd: effectiveCwd,
+      parentCwd,
+      parentTrusted,
+    }));
 
     if (identityInSystemPrompt && identity) {
       const flag = systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt";
@@ -124,6 +139,9 @@ export class PiHarnessDriver implements HarnessDriver {
     if (denySet && denySet.size > 0) {
       envParts.push(`PI_DENY_TOOLS=${shellQuote([...denySet].join(","))}`);
     }
+    if (childSpawnDepth != null) {
+      envParts.push(`PI_SUBAGENT_SPAWN_DEPTH=${childSpawnDepth}`);
+    }
     envParts.push(`PI_SUBAGENT_NAME=${shellQuote(params.name)}`);
     if (params.agent) {
       envParts.push(`PI_SUBAGENT_AGENT=${shellQuote(params.agent)}`);
@@ -133,7 +151,7 @@ export class PiHarnessDriver implements HarnessDriver {
     }
     envParts.push(`PI_SUBAGENT_SESSION=${shellQuote(subagentSessionFile)}`);
     envParts.push(`PI_SUBAGENT_ID=${shellQuote(params.id)}`);
-    const activityFile = join(artifactDir, `subagent-activity-${params.id}.json`);
+    const activityFile = getSubagentActivityFile(artifactDir, params.id);
     envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
     envParts.push(`PI_SUBAGENT_SURFACE=${shellQuote(surface)}`);
 

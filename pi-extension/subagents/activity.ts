@@ -1,7 +1,17 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 export type SubagentActivityPhase = "starting" | "active" | "waiting" | "done";
+
+export interface SubagentProcessIdentity {
+  pid: number;
+  startTime: number;
+}
+
+export type ProcessStatReadResult =
+  | { kind: "present"; identity: SubagentProcessIdentity; state: string }
+  | { kind: "missing" }
+  | { kind: "unknown"; error?: string };
 export type SubagentActivityScope = "agent" | "turn" | "provider" | "streaming" | "tool";
 
 export type SubagentActivityEvent =
@@ -45,6 +55,9 @@ export interface SubagentActivityState {
   toolName?: string;
   toolStartedAt?: number;
   toolEndedAt?: number;
+  /** Exact child process identity for crash detection. */
+  workerPid?: number;
+  workerStartTime?: number;
 }
 
 export type ActivityReadResult =
@@ -73,6 +86,12 @@ export interface SubagentActivityRecorder {
   callerPing(): void;
   subagentDone(): void;
   sessionShutdown(reason: SubagentShutdownReason): void;
+  /**
+   * Last known lifecycle phase, for stamping truthful exit sidecars. The
+   * noop recorder (no activity file configured) reports undefined so the
+   * sidecar carries no fabricated phase.
+   */
+  currentPhase(): SubagentActivityPhase | undefined;
 }
 
 const ACTIVITY_UPDATE_THROTTLE_MS = 500;
@@ -100,9 +119,73 @@ const KNOWN_EVENTS = new Set<SubagentActivityEvent>([
   "session_shutdown",
 ]);
 const MAX_ACTIVITY_STRING_LENGTH = 200;
+const KNOWN_PROCESS_STATES = new Set(["R", "S", "D", "T", "t", "Z", "X", "x", "K", "W", "P", "I"]);
 
 export function getSubagentActivityFile(artifactDir: string, runningChildId: string): string {
   return join(artifactDir, "subagent-activity", `${runningChildId}.json`);
+}
+
+export function resetSubagentActivityFile(activityFile: string): void {
+  try {
+    unlinkSync(activityFile);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+}
+
+function unknownProcessRead(error?: unknown): ProcessStatReadResult {
+  return {
+    kind: "unknown",
+    ...(error == null ? {} : { error: error instanceof Error ? error.message : String(error) }),
+  };
+}
+
+export function parseProcStat(value: string, expectedPid: number): ProcessStatReadResult {
+  if (!Number.isSafeInteger(expectedPid) || expectedPid <= 0) return unknownProcessRead("invalid process id");
+
+  const openParen = value.indexOf("(");
+  const closeParen = value.lastIndexOf(")");
+  if (openParen <= 0 || closeParen <= openParen) return unknownProcessRead("malformed process stat");
+
+  const parsedPid = Number(value.slice(0, openParen).trim());
+  if (!Number.isSafeInteger(parsedPid) || parsedPid !== expectedPid) {
+    return unknownProcessRead("process id mismatch");
+  }
+
+  const fields = value.slice(closeParen + 1).trim().split(/\s+/);
+  const state = fields[0];
+  const startTime = Number(fields[19]);
+  if (
+    typeof state !== "string" || !KNOWN_PROCESS_STATES.has(state) ||
+    !Number.isSafeInteger(startTime) || startTime <= 0
+  ) {
+    return unknownProcessRead("malformed process stat fields");
+  }
+
+  return { kind: "present", identity: { pid: parsedPid, startTime }, state };
+}
+
+export function readProcessStat(pid: number): ProcessStatReadResult {
+  if (process.platform !== "linux") return unknownProcessRead("process stat is unavailable");
+
+  try {
+    statSync("/proc");
+  } catch (error) {
+    return unknownProcessRead(error);
+  }
+
+  try {
+    return parseProcStat(readFileSync(`/proc/${pid}/stat`, "utf8"), pid);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException)?.code;
+    if (code === "ENOENT" || code === "ESRCH") return { kind: "missing" };
+    return unknownProcessRead(error);
+  }
+}
+
+export function readCurrentProcessIdentity(): SubagentProcessIdentity | undefined {
+  const result = readProcessStat(process.pid);
+  return result.kind === "present" ? result.identity : undefined;
 }
 
 function requireObject(value: unknown): Record<string, unknown> | null {
@@ -126,6 +209,13 @@ function validateInteger(object: Record<string, unknown>, fieldName: string): st
 function validateOptionalInteger(object: Record<string, unknown>, fieldName: string): string | null {
   const value = object[fieldName];
   return value == null || Number.isInteger(value) ? null : `${fieldName} must be an integer when present`;
+}
+
+function validateOptionalPositiveInteger(object: Record<string, unknown>, fieldName: string): string | null {
+  const value = object[fieldName];
+  return value == null || (Number.isSafeInteger(value) && value > 0)
+    ? null
+    : `${fieldName} must be a positive safe integer when present`;
 }
 
 function validateBoolean(object: Record<string, unknown>, fieldName: string): string | null {
@@ -163,6 +253,12 @@ function validateActivity(value: unknown, expectedRunningChildId: string): Activ
     return invalidActivity("unknown activeScope");
   }
 
+  const workerPidProvided = object.workerPid !== undefined;
+  const workerStartTimeProvided = object.workerStartTime !== undefined;
+  if (workerPidProvided !== workerStartTimeProvided) {
+    return invalidActivity("worker identity must include workerPid and workerStartTime together");
+  }
+
   const validationError = [
     validateFiniteNumber(object, "createdAt"),
     validateFiniteNumber(object, "updatedAt"),
@@ -176,12 +272,16 @@ function validateActivity(value: unknown, expectedRunningChildId: string): Activ
     validateOptionalInteger(object, "turnIndex"),
     validateOptionalFiniteNumber(object, "toolStartedAt"),
     validateOptionalFiniteNumber(object, "toolEndedAt"),
+    validateOptionalPositiveInteger(object, "workerPid"),
+    validateOptionalPositiveInteger(object, "workerStartTime"),
     validateOptionalActivityString(object, "messageEventType"),
     validateOptionalActivityString(object, "toolCallId"),
     validateOptionalActivityString(object, "toolName"),
   ].find((error) => error != null);
   if (validationError) return invalidActivity(validationError);
 
+  // SAFETY: every field was validated above against the SubagentActivityState
+  // schema; TypeScript cannot narrow the dynamic Record<string, unknown>.
   return { ok: true, activity: object as unknown as SubagentActivityState };
 }
 
@@ -242,6 +342,7 @@ function createNoopRecorder(): SubagentActivityRecorder {
     callerPing() {},
     subagentDone() {},
     sessionShutdown() {},
+    currentPhase() { return undefined; },
   };
 }
 
@@ -302,6 +403,7 @@ export function createSubagentActivityRecorder(params: {
 
   const now = params.now ?? (() => Date.now());
   const createdAt = now();
+  const workerIdentity = readCurrentProcessIdentity();
   const activity: SubagentActivityState = {
     version: 1,
     runningChildId,
@@ -314,6 +416,10 @@ export function createSubagentActivityRecorder(params: {
     turnActive: false,
     providerActive: false,
     toolActive: false,
+    ...(workerIdentity ? {
+      workerPid: workerIdentity.pid,
+      workerStartTime: workerIdentity.startTime,
+    } : {}),
   };
 
   let disabled = false;
@@ -506,6 +612,9 @@ export function createSubagentActivityRecorder(params: {
     sessionShutdown(reason) {
       if (reason === "quit") markDone("session_shutdown");
       else disable();
+    },
+    currentPhase() {
+      return activity.phase;
     },
   };
 }

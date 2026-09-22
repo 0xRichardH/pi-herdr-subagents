@@ -14,6 +14,9 @@ import {
   reportHerdrPaneTask,
   sendHerdrCommand,
   sendHerdrEscape,
+  listHerdrPaneSessions,
+  type HerdrPaneSessionReference,
+  type HerdrReadSource,
 } from "./herdr.ts";
 
 export type PaneId = string;
@@ -72,7 +75,7 @@ export function interruptPane(paneId: PaneId): void {
 export function runScriptInPane(
   paneId: PaneId,
   command: string,
-  options?: { scriptPath?: string; scriptPreamble?: string },
+  options?: { scriptPath?: string; scriptPreamble?: string; stderrFile?: string },
 ): string {
   const scriptPath =
     options?.scriptPath ??
@@ -85,6 +88,12 @@ export function runScriptInPane(
 
   const scriptLines = ["#!/bin/bash"];
   if (options?.scriptPreamble) scriptLines.push(options.scriptPreamble.trimEnd());
+  // Capture the child's stderr to a per-run file while still showing it in the
+  // pane (tee). TASK-330 AC3: a process-start death otherwise leaves only the
+  // pane scrollback, which herdr does not persist past close.
+  if (options?.stderrFile) {
+    scriptLines.push(`exec 2> >(tee -a ${shellQuote(options.stderrFile)} >&2)`);
+  }
   scriptLines.push(command);
   writeFileSync(scriptPath, `${scriptLines.join("\n")}\n`, { mode: 0o755 });
 
@@ -92,14 +101,22 @@ export function runScriptInPane(
   return scriptPath;
 }
 
-export function readPane(paneId: PaneId, lines = 50): string {
+export function readPane(
+  paneId: PaneId,
+  lines = 50,
+  source: HerdrReadSource = "visible",
+): string {
   assertTerminalAvailable();
-  return readHerdrScreen(paneId, lines);
+  return readHerdrScreen(paneId, lines, source);
 }
 
-export async function readPaneAsync(paneId: PaneId, lines = 50): Promise<string> {
+export async function readPaneAsync(
+  paneId: PaneId,
+  lines = 50,
+  source: HerdrReadSource = "visible",
+): Promise<string> {
   assertTerminalAvailable();
-  return readHerdrScreenAsync(paneId, lines);
+  return readHerdrScreenAsync(paneId, lines, source);
 }
 
 export type { PaneInspection, HerdrAgentStatus } from "./lifecycle.ts";
@@ -108,7 +125,7 @@ export async function inspectPane(paneId: PaneId): Promise<import("./lifecycle.t
   assertTerminalAvailable();
   const result = await inspectHerdrPane(paneId);
   if (result.kind === "present") {
-    return { kind: "present", observedAt: Date.now(), ...result };
+    return { ...result, observedAt: Date.now() };
   }
   return result;
 }
@@ -116,6 +133,11 @@ export async function inspectPane(paneId: PaneId): Promise<import("./lifecycle.t
 export function closePane(paneId: PaneId): void {
   assertTerminalAvailable();
   closeHerdrSurface(paneId);
+}
+
+export function listPaneSessionReferences(): HerdrPaneSessionReference[] {
+  if (!isTerminalAvailable()) return [];
+  return listHerdrPaneSessions();
 }
 
 export function setPaneTask(paneId: PaneId, task: string): void {

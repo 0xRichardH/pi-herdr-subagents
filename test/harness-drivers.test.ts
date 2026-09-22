@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { describe, it } from "node:test";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { describe, it, beforeEach, afterEach } from "node:test";
+import { mkdtempSync, mkdirSync, realpathSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -16,6 +16,7 @@ import {
 } from "../pi-extension/subagents/harness/index.ts";
 import type { ResolvedRuntimePlan } from "../pi-extension/subagents/runtime-routing.ts";
 import type { SubagentResultContext } from "../pi-extension/subagents/harness/types.ts";
+import { resolveSpawnTrustFlag } from "../pi-extension/subagents/spawn-trust.ts";
 
 function createMockLaunchContext(overrides?: Partial<SubagentLaunchContext>): SubagentLaunchContext {
   const runtimePlan: ResolvedRuntimePlan = {
@@ -134,6 +135,10 @@ describe("Pi Harness Driver", () => {
     assert.ok(built.command.includes("pi --session '/tmp/sessions/subagent.jsonl'"));
     assert.ok(built.command.includes("--model 'anthropic/claude-sonnet-4-5'"));
     assert.ok(built.command.includes("--thinking 'high'"));
+    assert.ok(
+      built.command.includes("PI_SUBAGENT_ACTIVITY_FILE='/tmp/artifacts/subagent-activity/abc12345.json'"),
+      "the child and parent must use the same activity file for idle-timeout supervision",
+    );
     assert.ok(built.command.includes("echo '__SUBAGENT_DONE_'$?'__'"));
   });
 });
@@ -389,5 +394,135 @@ describe("Generic Harness Driver & Templates", () => {
     }));
     assert.ok(result);
     assert.equal(result.summary, "aider exited with code 1");
+  });
+});
+
+// B12 - spawned pi children must never fall through to pi's interactive
+// project-trust selector. One explicit trust flag is resolved at build time.
+describe("Spawn project-trust flag (B12)", () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "b12-trust-"));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function canonical(path: string): string {
+    mkdirSync(path, { recursive: true });
+    return realpathSync(path);
+  }
+
+  function writeStore(entries: Record<string, unknown> | string): string {
+    const path = join(dir, "trust.json");
+    writeFileSync(path, typeof entries === "string" ? entries : JSON.stringify(entries));
+    return path;
+  }
+
+  it("inherits the parent's decision when the child runs in the parent's folder", () => {
+    const cwd = canonical(join(dir, "same-folder"));
+    assert.equal(
+      resolveSpawnTrustFlag({ childCwd: cwd, parentCwd: cwd, parentTrusted: true }),
+      "--approve",
+    );
+    assert.equal(
+      resolveSpawnTrustFlag({ childCwd: cwd, parentCwd: cwd, parentTrusted: false }),
+      "--no-approve",
+    );
+  });
+
+  it("resolves true and false from the nearest trust-store ancestor", () => {
+    const parent = canonical(join(dir, "repo"));
+    const child = canonical(join(parent, "packages", "app"));
+    assert.equal(
+      resolveSpawnTrustFlag({
+        childCwd: child,
+        trustStorePath: writeStore({ [parent]: true }),
+      }),
+      "--approve",
+    );
+    assert.equal(
+      resolveSpawnTrustFlag({
+        childCwd: child,
+        trustStorePath: writeStore({ [parent]: false }),
+      }),
+      "--no-approve",
+    );
+  });
+
+  it("the nearest decision wins over a farther one", () => {
+    const outer = canonical(join(dir, "outer"));
+    const inner = canonical(join(outer, "inner"));
+    const child = canonical(join(inner, "child"));
+    assert.equal(
+      resolveSpawnTrustFlag({
+        childCwd: child,
+        trustStorePath: writeStore({ [outer]: true, [inner]: false }),
+      }),
+      "--no-approve",
+    );
+  });
+
+  it("falls through to the store when the parent's decision is unknown", () => {
+    const cwd = canonical(join(dir, "repo"));
+    const path = writeStore({ [cwd]: true });
+    assert.equal(
+      resolveSpawnTrustFlag({ childCwd: cwd, parentCwd: cwd, trustStorePath: path }),
+      "--approve",
+    );
+  });
+
+  it("never grants trust when the store is absent, malformed or non-object", () => {
+    const cwd = canonical(join(dir, "repo"));
+    assert.equal(
+      resolveSpawnTrustFlag({ childCwd: cwd, trustStorePath: join(dir, "missing.json") }),
+      "--no-approve",
+    );
+    assert.equal(
+      resolveSpawnTrustFlag({ childCwd: cwd, trustStorePath: writeStore("{ not json") }),
+      "--no-approve",
+    );
+    assert.equal(
+      resolveSpawnTrustFlag({ childCwd: cwd, trustStorePath: writeStore("[true]") }),
+      "--no-approve",
+    );
+  });
+
+  it("built pi command carries exactly one explicit trust flag (store decision)", () => {
+    const driver = new PiHarnessDriver();
+    const agentDir = canonical(join(dir, "agent"));
+    const childCwd = canonical(join(dir, "project"));
+    writeFileSync(join(agentDir, "trust.json"), JSON.stringify({ [childCwd]: true }));
+    const previous = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    try {
+      const built = driver.buildCommand(createMockLaunchContext({ effectiveCwd: childCwd }));
+      const flags = built.command.match(/--no-approve|--approve/g) ?? [];
+      assert.equal(flags.length, 1, `exactly one trust flag in: ${built.command}`);
+      assert.equal(flags[0], "--approve");
+    } finally {
+      if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previous;
+    }
+  });
+
+  it("built pi command resolves --no-approve when nothing grants trust", () => {
+    const driver = new PiHarnessDriver();
+    const agentDir = canonical(join(dir, "agent"));
+    const childCwd = canonical(join(dir, "project"));
+    writeFileSync(join(agentDir, "trust.json"), JSON.stringify({ [childCwd]: false }));
+    const previous = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    try {
+      const built = driver.buildCommand(createMockLaunchContext({ effectiveCwd: childCwd }));
+      const flags = built.command.match(/--no-approve|--approve/g) ?? [];
+      assert.equal(flags.length, 1, `exactly one trust flag in: ${built.command}`);
+      assert.equal(flags[0], "--no-approve");
+    } finally {
+      if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previous;
+    }
   });
 });

@@ -1,7 +1,8 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@earendil-works/pi-tui";
@@ -18,6 +19,9 @@ import {
   getNewEntries,
   findLastAssistantMessage,
   findObservedSessionRuntime,
+  findServedSessionRuntime,
+  findSessionFallbackRecord,
+  classifyRuntimeObservation,
   appendBranchSummary,
   copySessionFile,
   mergeNewEntries,
@@ -46,6 +50,7 @@ import {
 import {
   createSubagentActivityRecorder,
   getSubagentActivityFile,
+  readCurrentProcessIdentity,
   readSubagentActivityFile,
 } from "../pi-extension/subagents/activity.ts";
 import subagentDoneExtension, {
@@ -53,9 +58,13 @@ import subagentDoneExtension, {
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
   buildCompletionSidecar,
+  isSubagentSessionHost,
+  shouldRegisterCrashHooks,
+  buildCrashSidecar,
 } from "../pi-extension/subagents/subagent-done.ts";
-import { interpretExitSidecar, waitForCompletion } from "../pi-extension/subagents/completion.ts";
+import { interpretExitSidecar, waitForCompletion, isForeignSidecarIdentity } from "../pi-extension/subagents/completion.ts";
 import {
+  MISSING_PANE_DEBOUNCE_MS,
   createLifecycle,
   lifecycleTransition,
   markCompleted,
@@ -71,21 +80,41 @@ import {
 // Isolate the unit suite from inherited parent/child capability variables.
 const inheritedSubagentId = process.env.PI_SUBAGENT_ID;
 const inheritedDenyTools = process.env.PI_DENY_TOOLS;
+const inheritedActivityFile = process.env.PI_SUBAGENT_ACTIVITY_FILE;
 before(() => {
   delete process.env.PI_SUBAGENT_ID;
   delete process.env.PI_DENY_TOOLS;
+  delete process.env.PI_SUBAGENT_ACTIVITY_FILE;
 });
+const createdTestDirs: string[] = [];
+
+// Deterministic process identity for the sidecar-shape assertions; the
+// extension captures the same value at instantiation.
+const TEST_PROCESS_IDENTITY = readCurrentProcessIdentity();
+
+/** Expected run-identity fields on every sidecar written by this test process. */
+function stampedIdentity(): Record<string, unknown> {
+  return TEST_PROCESS_IDENTITY
+    ? { workerPid: TEST_PROCESS_IDENTITY.pid, workerStartTime: TEST_PROCESS_IDENTITY.startTime }
+    : {};
+}
+
 after(() => {
   if (inheritedSubagentId == null) delete process.env.PI_SUBAGENT_ID;
   else process.env.PI_SUBAGENT_ID = inheritedSubagentId;
   if (inheritedDenyTools == null) delete process.env.PI_DENY_TOOLS;
   else process.env.PI_DENY_TOOLS = inheritedDenyTools;
+  if (inheritedActivityFile == null) delete process.env.PI_SUBAGENT_ACTIVITY_FILE;
+  else process.env.PI_SUBAGENT_ACTIVITY_FILE = inheritedActivityFile;
+  for (const dir of createdTestDirs) rmSync(dir, { recursive: true, force: true });
 });
 
 // --- Helpers ---
 
 function createTestDir(): string {
-  return mkdtempSync(join(tmpdir(), "subagents-test-"));
+  const dir = mkdtempSync(join(tmpdir(), "subagents-test-"));
+  createdTestDirs.push(dir);
+  return dir;
 }
 
 function createSessionFile(dir: string, entries: object[]): string {
@@ -250,6 +279,29 @@ const TOOL_RESULT = {
 
 // --- Tests ---
 
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+
+describe("repository pi configuration", () => {
+  it("declares bundled extensions exactly once across package.json and .pi/settings.json", () => {
+    const packageJson = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8")) as {
+      pi?: { extensions?: string[] };
+    };
+    const projectSettings = JSON.parse(readFileSync(join(REPO_ROOT, ".pi", "settings.json"), "utf8")) as {
+      extensions?: string[];
+    };
+    const packageExtensions = (packageJson.pi?.extensions ?? []).map((entry) => resolve(REPO_ROOT, entry));
+    const projectExtensions = (projectSettings.extensions ?? []).map((entry) =>
+      resolve(REPO_ROOT, ".pi", entry),
+    );
+    const duplicates = projectExtensions.filter((entry) => packageExtensions.includes(entry));
+    assert.deepEqual(
+      duplicates,
+      [],
+      `.pi/settings.json must not re-declare a package extension; the duplicate registration is fatal: ${duplicates.join(", ")}`,
+    );
+  });
+});
+
 describe("session.ts", () => {
   let dir: string;
 
@@ -391,6 +443,172 @@ describe("session.ts", () => {
       };
       assert.equal(findLastAssistantMessage([msg] as any[]), null);
     });
+
+    it("L-162: returns text when final assistant message carries text alongside subagent_done toolCall", () => {
+      // The fix requires the report text to be in the SAME message as the
+      // subagent_done tool call; extraction must not drop the text when a
+      // toolCall block is present in the same content array.
+      const msg = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Task complete: updated docs." },
+            { type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done" },
+          ],
+        },
+      };
+      assert.equal(findLastAssistantMessage([msg] as any[]), "Task complete: updated docs.");
+    });
+
+    it("L-162: returns null when final assistant message has only a subagent_done toolCall, so caller falls back to 'Sub-agent exited without output'", () => {
+      // muse-spark calls subagent_done with a thinking+toolCall message and no
+      // text block; the extractor must return nothing so the parent at
+      // index.ts:1813 falls back to the no-output wording.
+      const msg = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "done" },
+            { type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done" },
+          ],
+        },
+      };
+      const extracted = findLastAssistantMessage([msg] as any[]);
+      assert.equal(extracted, null);
+      // Replicates the fallback branch in pi-extension/subagents/index.ts
+      const fallback = extracted ?? "Sub-agent exited without output";
+      assert.equal(fallback, "Sub-agent exited without output");
+    });
+
+    it("L-162 phase2: same-message text wins over arguments.report", () => {
+      const msg = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Preferred same-message report" },
+            { type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done", arguments: { report: "Fallback report param" } },
+          ],
+        },
+      };
+      assert.equal(findLastAssistantMessage([msg] as any[]), "Preferred same-message report");
+    });
+
+    it("L-162 phase2: toolCall-only with non-empty report returns the report", () => {
+      const msg = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done", arguments: { report: "Report via arg" } }],
+        },
+      };
+      assert.equal(findLastAssistantMessage([msg] as any[]), "Report via arg");
+    });
+
+    it("L-162 phase2: handles report via name field and stringified JSON arguments", () => {
+      const viaName = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", name: "subagent_done", id: "tc-done", arguments: { report: "Via name field" } }],
+        },
+      };
+      assert.equal(findLastAssistantMessage([viaName] as any[]), "Via name field");
+
+      const viaJsonString = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done", arguments: JSON.stringify({ report: "Via JSON string" }) }],
+        },
+      };
+      assert.equal(findLastAssistantMessage([viaJsonString] as any[]), "Via JSON string");
+    });
+
+    it("L-162 phase2: toolCall-only without report falls back to earlier assistant text", () => {
+      const earlier = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "Earlier summary" }],
+        },
+      };
+      const final = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done", arguments: {} }],
+        },
+      };
+      assert.equal(findLastAssistantMessage([earlier, final] as any[]), "Earlier summary");
+    });
+
+    it("L-162 phase2: whitespace-only report is treated as empty and falls back to earlier text", () => {
+      const earlier = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "Earlier valid" }],
+        },
+      };
+      const final = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done", arguments: { report: "   " } }],
+        },
+      };
+      assert.equal(findLastAssistantMessage([earlier, final] as any[]), "Earlier valid");
+    });
+
+    it("L-162 phase2: no report + no earlier text → null (fallback wording)", () => {
+      const final = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done", arguments: {} }],
+        },
+      };
+      const extracted = findLastAssistantMessage([final] as any[]);
+      assert.equal(extracted, null);
+      const fallback = extracted ?? "Sub-agent exited without output";
+      assert.equal(fallback, "Sub-agent exited without output");
+    });
+
+    it("L-162 phase2: final error still beats stale earlier text (priority 3 > 4)", () => {
+      const earlierGood = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "Stale earlier text" }],
+        },
+      };
+      const errorFinal = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [],
+          stopReason: "error",
+          errorMessage: "provider failed",
+        },
+      };
+      assert.equal(findLastAssistantMessage([earlierGood, errorFinal] as any[]), "Subagent error: provider failed");
+    });
+
+    it("L-162 phase2: final report beats final error (priority 2 > 3)", () => {
+      const final = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done", arguments: { report: "Report wins over error" } }],
+          stopReason: "error",
+          errorMessage: "should be ignored",
+        },
+      };
+      assert.equal(findLastAssistantMessage([final] as any[]), "Report wins over error");
+    });
   });
 
   describe("findObservedSessionRuntime", () => {
@@ -403,6 +621,189 @@ describe("session.ts", () => {
         ]),
         { provider: "other", modelId: "new", thinking: "medium" },
       );
+    });
+  });
+
+  // TASK-336: the runtime-mismatch check must compare against the model that
+  // actually SERVED the final assistant turn, and must distinguish a declared
+  // fallback from an unexplained substitution. Fixtures are exact session
+  // shapes recovered in TASK-334 under
+  // /home/kris/projects/sade/.artifacts/model-identity-forensics/ — each is
+  // written to a real session file and read back through the production
+  // getNewEntries() reader before classification runs.
+  describe("classifyRuntimeObservation (TASK-336 served-model comparison)", () => {
+    function served(provider: string, model: string, stopReason: string) {
+      return {
+        type: "message",
+        id: `served-${provider}-${model}`,
+        message: {
+          role: "assistant",
+          provider,
+          model,
+          api: "openai-completions",
+          content: [],
+          stopReason,
+        },
+      };
+    }
+
+    // Occurrence #12 (deep 0c2a703d, TASK-330) for agent-fallback; the
+    // 2026-09-17 acbf4ae0 lane for provider-failover. Both are declared
+    // fallbacks that served the final turn.
+    it("AC3a: a declared fallback that serves yields an informational note, never a mismatch", () => {
+      withTempDir((dir) => {
+        const agentFallbackFile = createSessionFile(dir, [
+          { type: "session", id: "s" },
+          { type: "model_change", id: "m1", provider: "openai-codex", modelId: "gpt-6-astra" },
+          { type: "thinking_level_change", id: "t1", thinkingLevel: "low" },
+          served("openai-codex", "gpt-6-astra", "error"),
+          { type: "model_change", id: "m2", provider: "opencode-go", modelId: "deepseek-v4.1-flash" },
+          { type: "thinking_level_change", id: "t2", thinkingLevel: "max" },
+          { type: "thinking_level_change", id: "t3", thinkingLevel: "high" },
+          {
+            type: "custom",
+            id: "f1",
+            customType: "agent-fallback",
+            data: {
+              from: "openai-codex/gpt-6-astra",
+              to: "opencode-go/deepseek-v4.1-flash",
+              reason: "provider-limit",
+              status: "continuation-requested",
+            },
+          },
+          served("opencode-go", "deepseek-v4.1-flash", "toolUse"),
+        ]);
+        const agentEntries = getNewEntries(agentFallbackFile, 0);
+        assert.equal(findServedSessionRuntime(agentEntries).modelId, "deepseek-v4.1-flash");
+        assert.equal(
+          findSessionFallbackRecord(agentEntries)?.to,
+          "opencode-go/deepseek-v4.1-flash",
+        );
+        const agentObservation = classifyRuntimeObservation(
+          agentEntries,
+          "openai-codex/gpt-6-astra",
+        );
+        assert.equal(agentObservation.runtimeMismatch, undefined);
+        const note = agentObservation.runtimeFallback ?? "";
+        assert.match(note, /Resolved model openai-codex\/gpt-6-astra/);
+        assert.match(note, /fell back to opencode-go\/deepseek-v4\.1-flash/);
+        assert.match(note, /\(provider-limit\)/);
+        assert.equal(agentObservation.served?.modelId, "deepseek-v4.1-flash");
+
+        const providerFailoverFile = createSessionFile(dir, [
+          { type: "session", id: "s2" },
+          { type: "model_change", id: "p1", provider: "openai-codex", modelId: "gpt-5.6-luna" },
+          { type: "model_change", id: "p2", provider: "zai", modelId: "glm-5.3-flash" },
+          {
+            type: "custom",
+            id: "pf1",
+            customType: "provider-failover",
+            data: {
+              from: "openai-codex/gpt-5.6-luna",
+              to: "zai/glm-5.3-flash",
+              reason: "assistant error: Codex error: The usage limit has been reached",
+            },
+          },
+          served("zai", "glm-5.3-flash", "toolUse"),
+        ]);
+        const failoverObservation = classifyRuntimeObservation(
+          getNewEntries(providerFailoverFile, 0),
+          "openai-codex/gpt-5.6-luna",
+        );
+        assert.equal(failoverObservation.runtimeMismatch, undefined);
+        assert.match(failoverObservation.runtimeFallback ?? "", /fell back to zai\/glm-5\.3-flash/);
+      });
+    });
+
+    // Occurrence #17 (Halo fab8ec27): the child declared a fallback model in a
+    // model_change but the only turn it ever served was the primary error. The
+    // check must not report the child as having run the declared model.
+    it("AC3b: a declared fallback that never served (error-terminated) reports no foreign model", () => {
+      withTempDir((dir) => {
+        const file = createSessionFile(dir, [
+          { type: "session", id: "s" },
+          { type: "model_change", id: "m1", provider: "openai-codex", modelId: "gpt-6-astra" },
+          { type: "thinking_level_change", id: "t1", thinkingLevel: "low" },
+          {
+            type: "message",
+            id: "err",
+            message: {
+              role: "assistant",
+              provider: "openai-codex",
+              model: "gpt-6-astra",
+              api: "openai-codex-responses",
+              content: [],
+              stopReason: "error",
+              errorMessage: "Codex error: The usage limit has been reached",
+            },
+          },
+          { type: "model_change", id: "m2", provider: "deepseek", modelId: "deepseek-flash" },
+          { type: "thinking_level_change", id: "t2", thinkingLevel: "max" },
+          { type: "thinking_level_change", id: "t3", thinkingLevel: "high" },
+          {
+            type: "custom",
+            id: "f1",
+            customType: "agent-fallback",
+            data: {
+              from: "openai-codex/gpt-6-astra",
+              to: "deepseek/deepseek-flash",
+              reason: "provider-limit",
+              status: "continuation-requested",
+            },
+          },
+        ]);
+        const observation = classifyRuntimeObservation(
+          getNewEntries(file, 0),
+          "openai-codex/gpt-6-astra",
+        );
+        assert.equal(observation.runtimeMismatch, undefined);
+        assert.equal(observation.runtimeFallback, undefined);
+        assert.equal(observation.served?.modelId, "gpt-6-astra");
+      });
+    });
+
+    // Occurrences #18 f04cbe16 / #19 cea24d91 / #21 80b35c56: the final turn
+    // was served by a different model with no fallback entry anywhere.
+    it("AC3c: an unrecorded served-model substitution warns, naming the served model", () => {
+      withTempDir((dir) => {
+        const file = createSessionFile(dir, [
+          { type: "session", id: "s" },
+          { type: "model_change", id: "m1", provider: "zai", modelId: "glm-5.3-flash" },
+          { type: "thinking_level_change", id: "t1", thinkingLevel: "high" },
+          served("zai", "glm-5.3-flash", "toolUse"),
+          { type: "model_change", id: "m2", provider: "deepseek", modelId: "deepseek-flash" },
+          { type: "thinking_level_change", id: "t2", thinkingLevel: "max" },
+          served("deepseek", "deepseek-flash", "toolUse"),
+        ]);
+        const observation = classifyRuntimeObservation(
+          getNewEntries(file, 0),
+          "zai/glm-5.3-flash",
+        );
+        const mismatch = observation.runtimeMismatch ?? "";
+        assert.match(mismatch, /Resolved model zai\/glm-5\.3-flash/);
+        assert.match(mismatch, /but child served deepseek\/deepseek-flash/);
+        assert.ok(!mismatch.includes("child reported"), "must name the SERVED model, not the declared one");
+        assert.equal(observation.runtimeFallback, undefined);
+      });
+    });
+
+    // A trailing declared change that never served must not fabricate a
+    // mismatch now that the check follows the served turn.
+    it("AC3d: identical resolved/served emits neither a mismatch nor a fallback note", () => {
+      withTempDir((dir) => {
+        const file = createSessionFile(dir, [
+          { type: "session", id: "s" },
+          { type: "model_change", id: "m1", provider: "openai-codex", modelId: "gpt-6-astra" },
+          served("openai-codex", "gpt-6-astra", "toolUse"),
+          { type: "model_change", id: "m2", provider: "deepseek", modelId: "deepseek-flash" },
+        ]);
+        const observation = classifyRuntimeObservation(
+          getNewEntries(file, 0),
+          "openai-codex/gpt-6-astra",
+        );
+        assert.equal(observation.runtimeMismatch, undefined);
+        assert.equal(observation.runtimeFallback, undefined);
+      });
     });
   });
 
@@ -1489,6 +1890,11 @@ describe("subagent-done.ts", () => {
       assert.equal(shouldAutoExitOnAgentEnd(false, messages), false);
     });
 
+    it("stays open after a tool-use turn", () => {
+      const messages = [{ role: "assistant", stopReason: "toolUse" }];
+      assert.equal(shouldAutoExitOnAgentEnd(false, messages), false);
+    });
+
     it("still exits when the latest turn ended with stopReason=error", () => {
       // Auto-exit subagents must shut down on retry-exhaustion errors so the
       // parent is woken. The error sidecar (written separately) carries the
@@ -1503,6 +1909,8 @@ describe("subagent-done.ts", () => {
       withTempDir((dir) => {
         const previousAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
         const previousSession = process.env.PI_SUBAGENT_SESSION;
+        const priorExitHandlers = process.listeners("exit");
+        const priorUncaughtHandlers = process.listeners("uncaughtException");
         const sessionFile = join(dir, "child.jsonl");
         process.env.PI_SUBAGENT_AUTO_EXIT = "1";
         process.env.PI_SUBAGENT_SESSION = sessionFile;
@@ -1527,8 +1935,19 @@ describe("subagent-done.ts", () => {
             type: "error",
             errorMessage: "latest failure",
             stopReason: "error",
+            exitCode: 1,
+            message: "latest failure",
+            ...stampedIdentity(),
           });
         } finally {
+          for (const handler of process.listeners("exit")) {
+            if (!priorExitHandlers.includes(handler)) process.off("exit", handler as () => void);
+          }
+          for (const handler of process.listeners("uncaughtException")) {
+            if (!priorUncaughtHandlers.includes(handler)) {
+              process.off("uncaughtException", handler as (error: Error) => void);
+            }
+          }
           restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
           restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
         }
@@ -1537,19 +1956,172 @@ describe("subagent-done.ts", () => {
 
     it("preserves an aborted worker after agent_settled", () => {
       const previousAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
+      const priorExitHandlers = process.listeners("exit");
+      const priorUncaughtHandlers = process.listeners("uncaughtException");
       process.env.PI_SUBAGENT_AUTO_EXIT = "1";
       try {
         const { api, eventHandlers } = createMockExtensionApi();
         subagentDoneExtension(api);
         let shutdowns = 0;
-        const ctx = { shutdown: () => { shutdowns += 1; } };
+        const ctx = { shutdown: () => { shutdowns += 1; }, ui: { notify() {} } };
         eventHandlers.get("agent_end")![0]({
           messages: [{ role: "assistant", stopReason: "aborted" }],
         }, ctx);
         eventHandlers.get("agent_settled")![0]({ type: "agent_settled" }, ctx);
         assert.equal(shutdowns, 0);
       } finally {
+        for (const handler of process.listeners("exit")) {
+          if (!priorExitHandlers.includes(handler)) process.off("exit", handler as () => void);
+        }
+        for (const handler of process.listeners("uncaughtException")) {
+          if (!priorUncaughtHandlers.includes(handler)) {
+            process.off("uncaughtException", handler as (error: Error) => void);
+          }
+        }
         restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
+      }
+    });
+  });
+
+  // TASK-327: a test-process argv (no --session) must register NO crash
+  // hooks — a test that instantiates the real extension must never arm the
+  // exit sidecar path that writes into the inherited PI_SUBAGENT_SESSION.
+  it("registers no crash hooks from a test-process argv", () => {
+    withTempDir((dir) => {
+      const previousAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
+      const previousSession = process.env.PI_SUBAGENT_SESSION;
+      const sessionFile = join(dir, "child.jsonl");
+      const priorExitHandlers = process.listeners("exit");
+      const priorUncaughtHandlers = process.listeners("uncaughtException");
+      process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+      process.env.PI_SUBAGENT_SESSION = sessionFile;
+
+      try {
+        const { api } = createMockExtensionApi();
+        subagentDoneExtension(api);
+        assert.equal(
+          process.listeners("exit").filter((h) => !priorExitHandlers.includes(h)).length,
+          0,
+          "test-process argv must not register an exit hook",
+        );
+        assert.equal(
+          process.listeners("uncaughtException").filter((h) => !priorUncaughtHandlers.includes(h)).length,
+          0,
+          "test-process argv must not register an uncaughtException hook",
+        );
+        assert.equal(existsSync(`${sessionFile}.exit`), false);
+      } finally {
+        restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
+        restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
+      }
+    });
+  });
+
+  describe("crash-hook session guard (TASK-327)", () => {
+    function childArgvFor(sessionFile: string): string[] {
+      // Real child launch form (harness/drivers/pi.ts): --session <file>.
+      return ["node", "pi", "--session", sessionFile];
+    }
+
+    it("treats only the exact --session host as the session host", () => {
+      const sf = "/tmp/a.jsonl";
+      assert.equal(
+        isSubagentSessionHost(sf, ["node", "pi", "--session", "/tmp/a.jsonl", "-e", "subagent-done.ts"]),
+        true,
+      );
+      assert.equal(isSubagentSessionHost(sf, ["node", "--test", "test/test.ts"]), false);
+      assert.equal(isSubagentSessionHost(sf, ["node", "pi"]), false);
+      assert.equal(isSubagentSessionHost(sf, ["node", "pi", "--session", "/tmp/other.jsonl"]), false);
+      assert.equal(isSubagentSessionHost(sf, ["node", "pi", "--session"]), false);
+      assert.equal(isSubagentSessionHost("", childArgvFor(sf)), false);
+    });
+
+    it("registers crash hooks only for the session host", () => {
+      const sf = "/tmp/a.jsonl";
+      assert.equal(shouldRegisterCrashHooks(sf, childArgvFor(sf)), true);
+      assert.equal(shouldRegisterCrashHooks(sf, ["node", "--test", "test/test.ts"]), false);
+      assert.equal(shouldRegisterCrashHooks(sf, ["node", "pi"]), false);
+      assert.equal(shouldRegisterCrashHooks(sf, ["node", "pi", "--session", "/tmp/other.jsonl"]), false);
+      assert.equal(shouldRegisterCrashHooks(sf, ["node", "pi", "--session"]), false);
+      assert.equal(shouldRegisterCrashHooks(undefined, childArgvFor(sf)), false);
+    });
+
+    it("stamps the crash sidecar with the writer identity and the terminal cause", () => {
+      assert.deepEqual(
+        buildCrashSidecar(
+          { runId: "run-1", workerPid: 1, workerStartTime: 2 },
+          { exitCode: 3, lastPhase: "active", message: "boom" },
+        ),
+        {
+          type: "error",
+          errorMessage: "boom",
+          message: "boom",
+          runId: "run-1",
+          workerPid: 1,
+          workerStartTime: 2,
+          exitCode: 3,
+          lastPhase: "active",
+        },
+      );
+      assert.deepEqual(
+        buildCrashSidecar({}, { exitCode: 1, message: "Subagent process exited before completing (exit code 1)." }),
+        {
+          type: "error",
+          errorMessage: "Subagent process exited before completing (exit code 1).",
+          message: "Subagent process exited before completing (exit code 1).",
+          exitCode: 1,
+        },
+      );
+    });
+  });
+
+  it("publishes one crash sidecar across uncaughtException and exit hooks", () => {
+    withTempDir((dir) => {
+      const previousAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
+      const previousSession = process.env.PI_SUBAGENT_SESSION;
+      const sessionFile = join(dir, "child.jsonl");
+      const exitFile = `${sessionFile}.exit`;
+      // The real child launch form (harness/drivers/pi.ts) passes
+      // --session <file>; only that argv may arm the sidecar path.
+      const childArgv = ["node", "pi", "--session", sessionFile];
+      const priorExitHandlers = process.listeners("exit");
+      const priorUncaughtHandlers = process.listeners("uncaughtException");
+      process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+      process.env.PI_SUBAGENT_SESSION = sessionFile;
+
+      try {
+        let hooks: { registerCrashHooks: (argv?: readonly string[]) => void } | undefined;
+        const { api } = createMockExtensionApi();
+        subagentDoneExtension(api, { onReady: (h) => { hooks = h; } });
+        // Inject the real child argv so the guarded registration path arms
+        // exactly as it does in a live child; the default process.argv of
+        // this test runner must keep registering nothing (previous test).
+        hooks!.registerCrashHooks(childArgv);
+        const exitHandlers = process.listeners("exit").filter(
+          (handler) => !priorExitHandlers.includes(handler),
+        );
+        const uncaughtHandlers = process.listeners("uncaughtException").filter(
+          (handler) => !priorUncaughtHandlers.includes(handler),
+        );
+        assert.equal(exitHandlers.length, 1);
+        assert.equal(uncaughtHandlers.length, 1);
+
+        (uncaughtHandlers[0] as (error: Error) => void)(new Error("read EIO"));
+        const written = JSON.parse(readFileSync(exitFile, "utf8")) as Record<string, unknown>;
+        assert.equal(written.type, "error");
+        assert.equal(written.errorMessage, "read EIO");
+
+        writeFileSync(exitFile, "latch-marker");
+        (exitHandlers[0] as () => void)();
+        assert.equal(readFileSync(exitFile, "utf8"), "latch-marker");
+
+        for (const handler of exitHandlers) process.off("exit", handler as () => void);
+        for (const handler of uncaughtHandlers) {
+          process.off("uncaughtException", handler as (error: Error) => void);
+        }
+      } finally {
+        restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
+        restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
       }
     });
   });
@@ -1736,6 +2308,58 @@ describe("lifecycle.ts", () => {
     assert.equal(lifecycle.process.kind, "running");
   });
 
+  it("fails a pane that remains missing after the debounce", () => {
+    let lifecycle = createLifecycle(1_000);
+    lifecycle = observePaneInspection(lifecycle, { kind: "present", observedAt: 2_000, agentStatus: "working" }, 2_000);
+    const firstMissingAt = 3_000;
+    lifecycle = observePaneInspection(
+      lifecycle,
+      { kind: "missing", error: "pane_not_found" },
+      firstMissingAt,
+    );
+    assert.equal(lifecycle.process.kind, "running", "one missing observation is a race, not failure");
+    assert.notEqual(
+      projectLifecycle(lifecycle, firstMissingAt + MISSING_PANE_DEBOUNCE_MS).kind,
+      "failed",
+      "one missing observation must not project failure",
+    );
+
+    lifecycle = observePaneInspection(
+      lifecycle,
+      { kind: "missing", error: "pane_not_found" },
+      firstMissingAt + MISSING_PANE_DEBOUNCE_MS,
+    );
+    assert.equal(lifecycle.process.kind, "failed");
+    assert.match(lifecycle.process.error, /pane disappeared before completion evidence/i);
+    assert.equal(projectLifecycle(lifecycle, firstMissingAt + MISSING_PANE_DEBOUNCE_MS).kind, "failed");
+  });
+
+  it("persists a terminal missing projection for result delivery", () => {
+    const testApi = (subagentsModule as any).__test__;
+    let lifecycle = createLifecycle(1_000);
+    lifecycle = observePaneInspection(lifecycle, { kind: "present", observedAt: 2_000, agentStatus: "working" }, 2_000);
+    lifecycle = observePaneInspection(lifecycle, { kind: "missing", error: "pane_not_found" }, 3_000);
+    lifecycle = observePaneInspection(lifecycle, { kind: "missing", error: "pane_not_found" }, 3_001);
+    const running = {
+      id: "missing-child",
+      name: "Worker",
+      task: "task",
+      surface: "pane-1",
+      startTime: 1_000,
+      sessionFile: "worker.jsonl",
+      interactive: false,
+      lifecycle,
+    };
+
+    const projection = testApi.reconcileProjectedFailure(
+      running,
+      projectLifecycle(lifecycle, 3_000 + MISSING_PANE_DEBOUNCE_MS),
+    );
+    assert.equal(projection.kind, "failed");
+    assert.equal(running.lifecycle.process.kind, "failed");
+    assert.match(running.lifecycle.process.error, /pane disappeared before completion evidence/i);
+  });
+
   it("preserves local interrupt over stale herdr statuses", () => {
     for (const agentStatus of ["working", "blocked", "idle", "done"] as const) {
       let lifecycle = createLifecycle(1_000);
@@ -1841,6 +2465,52 @@ describe("completion.ts", () => {
     }
   });
 
+  // TASK-327: a stamped foreign crash sidecar must never resolve as a
+  // failure — the watcher ignores it and keeps waiting; unstamped payloads
+  // (done/ping/provider errors) always pass through.
+  it("ignores a foreign stamped sidecar and keeps waiting", async () => {
+    // Unit shape of the guard itself.
+    const expected = { pid: 100, startTime: 200 };
+    assert.equal(isForeignSidecarIdentity({ workerPid: 100, workerStartTime: 200 }, expected), false);
+    assert.equal(isForeignSidecarIdentity({ workerPid: 999, workerStartTime: 200 }, expected), true);
+    assert.equal(isForeignSidecarIdentity({ workerPid: 100, workerStartTime: 201 }, expected), true);
+    assert.equal(isForeignSidecarIdentity({ type: "done" }, expected), false);
+    assert.equal(isForeignSidecarIdentity({ type: "error", errorMessage: "x" }, expected), false);
+    assert.equal(
+      isForeignSidecarIdentity({ workerPid: 999, workerStartTime: 200 }, undefined),
+      false,
+      "without an expected writer every payload passes through",
+    );
+
+    // Integration: a foreign stamped error sidecar is deleted and ignored —
+    // waitForCompletion keeps polling until the sentinel resolves.
+    const dir = mkdtempSync(join(tmpdir(), "completion-foreign-"));
+    const sessionFile = join(dir, "session.jsonl");
+    const exitFile = `${sessionFile}.exit`;
+    writeFileSync(exitFile, JSON.stringify({
+      type: "error",
+      errorMessage: "foreign crash",
+      workerPid: 999_999,
+      workerStartTime: 1,
+    }));
+    try {
+      let reads = 0;
+      const result = await waitForCompletion(new AbortController().signal, {
+        intervalMs: 1,
+        sessionFile,
+        expectedSidecarWriter: expected,
+        readTerminalTail: async () => {
+          reads += 1;
+          return reads >= 2 ? "__SUBAGENT_DONE_0__" : "";
+        },
+      });
+      assert.deepEqual(result, { reason: "sentinel", exitCode: 0 });
+      assert.equal(existsSync(exitFile), false, "foreign sidecar must be deleted, not left to poison");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("consumes a sidecar and removes it", async () => {
     const dir = mkdtempSync(join(tmpdir(), "completion-sidecar-"));
     const sessionFile = join(dir, "session.jsonl");
@@ -1869,6 +2539,104 @@ describe("completion.ts", () => {
       readTerminalTail: async () => "output\n__SUBAGENT_DONE_17__\n",
     });
     assert.deepEqual(result, { reason: "sentinel", exitCode: 17 });
+  });
+
+  it("reports a missing worker process while the pane is still present", async () => {
+    let inspections = 0;
+    const result = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => "",
+      processExists: (pid) => pid === 42,
+      inspectPane: async () => {
+        inspections += 1;
+        return {
+          kind: "present",
+          observedAt: Date.now(),
+          agentStatus: "working",
+          workerPgid: inspections === 1 ? 42 : 43,
+        };
+      },
+    });
+
+    assert.deepEqual(result, {
+      reason: "error",
+      exitCode: 1,
+      preservePane: true,
+      errorMessage: "subagent worker process died (no exit sidecar)",
+    });
+    assert.equal(inspections, 2, "the probe must fail without waiting for pane closure");
+  });
+
+  it("does not report a healthy worker as dead across multiple polls", async () => {
+    let reads = 0;
+    let inspections = 0;
+    const result = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => {
+        reads += 1;
+        return reads >= 3 ? "__SUBAGENT_DONE_0__" : "";
+      },
+      processExists: (pid) => pid === 42,
+      inspectPane: async () => {
+        inspections += 1;
+        return {
+          kind: "present",
+          observedAt: Date.now(),
+          agentStatus: "working",
+          workerPgid: 42,
+        };
+      },
+    });
+
+    assert.deepEqual(result, { reason: "sentinel", exitCode: 0 });
+    assert.ok(inspections >= 2, "a healthy worker must survive repeated probes");
+  });
+
+  it("keeps polling when the pane has no worker identity", async () => {
+    let reads = 0;
+    let probes = 0;
+    const result = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => {
+        reads += 1;
+        return reads >= 2 ? "__SUBAGENT_DONE_0__" : "";
+      },
+      processExists: () => {
+        probes += 1;
+        return false;
+      },
+      inspectPane: async () => ({
+        kind: "present",
+        observedAt: Date.now(),
+        agentStatus: "working",
+      }),
+    });
+
+    assert.deepEqual(result, { reason: "sentinel", exitCode: 0 });
+    assert.equal(probes, 0, "unknown worker identity must not probe or report death");
+  });
+
+  it("preserves a crash sidecar error without closing the pane", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "completion-crash-sidecar-"));
+    const sessionFile = join(dir, "session.jsonl");
+    const exitFile = `${sessionFile}.exit`;
+    writeFileSync(exitFile, JSON.stringify({ type: "error", errorMessage: "read EIO" }));
+    try {
+      const result = await waitForCompletion(new AbortController().signal, {
+        intervalMs: 1,
+        sessionFile,
+        readTerminalTail: async () => "",
+      });
+      assert.deepEqual(result, {
+        reason: "error",
+        exitCode: 1,
+        preservePane: true,
+        errorMessage: "read EIO",
+      });
+      assert.equal(existsSync(exitFile), false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("returns when an external sentinel file appears", async () => {
@@ -1918,6 +2686,26 @@ describe("completion.ts", () => {
       exitCode: 1,
       errorMessage: "Subagent pane disappeared before completion evidence was recorded.",
     });
+  });
+
+  it("does not reap a single transient missing-pane observation", async () => {
+    let inspections = 0;
+    let reads = 0;
+    const result = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => {
+        reads += 1;
+        return reads >= 3 ? "__SUBAGENT_DONE_0__" : "";
+      },
+      inspectPane: async () => {
+        inspections += 1;
+        return inspections === 1
+          ? { kind: "missing", error: "pane_not_found" }
+          : { kind: "present", observedAt: Date.now(), agentStatus: "working" };
+      },
+    });
+    assert.deepEqual(result, { reason: "sentinel", exitCode: 0 });
+    assert.ok(inspections >= 2, "a transient miss must be followed by another inspection");
   });
 
   it("lets a sidecar win the pane-disappearance race", async () => {
@@ -2014,6 +2802,300 @@ describe("completion.ts", () => {
     });
     controller.abort();
     await assert.rejects(completion, /Aborted while waiting for subagent to finish/);
+  });
+
+  // TASK-328: the single production caller (watchSubagent) never passes
+  // expectedSidecarWriter, so the expected writer must come from the worker
+  // activity snapshot already observed by the watcher. The mutation to guard
+  // against is rejecting when that identity is not yet known: undefined MUST
+  // mean accept, and it must not arrive after the loop already saw activity.
+  const activityRead = (overrides: Record<string, unknown> = {}) => ({
+    ok: true as const,
+    activity: {
+      version: 1,
+      runningChildId: "t328-child",
+      createdAt: 1_000,
+      updatedAt: 1_000,
+      sequence: 1,
+      latestEvent: "agent_start",
+      phase: "active",
+      agentActive: true,
+      turnActive: true,
+      providerActive: false,
+      toolActive: false,
+      ...overrides,
+    },
+  });
+
+  it("ignores a foreign stamped sidecar once the activity identity is known", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "completion-t328-foreign-"));
+    const sessionFile = join(dir, "session.jsonl");
+    const exitFile = `${sessionFile}.exit`;
+    try {
+      let activityReads = 0;
+      let terminalReads = 0;
+      const result = await waitForCompletion(new AbortController().signal, {
+        intervalMs: 1,
+        sessionFile,
+        // The foreign writer strikes only AFTER the watcher learned the real
+        // worker identity, so this drives the known-identity rejection path
+        // rather than the undefined-means-accept bootstrap iteration.
+        readTerminalTail: async () => {
+          terminalReads += 1;
+          if (terminalReads === 2) {
+            writeFileSync(exitFile, JSON.stringify({
+              type: "error",
+              errorMessage: "foreign crash",
+              workerPid: 999_999,
+              workerStartTime: 1,
+            }));
+          }
+          return terminalReads >= 4 ? "__SUBAGENT_DONE_0__" : "";
+        },
+        readWorkerActivity: () => {
+          activityReads += 1;
+          return activityRead({ workerPid: 6_101, workerStartTime: 7_001 });
+        },
+        probeWorkerProcess: () => "alive",
+      });
+      assert.deepEqual(result, { reason: "sentinel", exitCode: 0 });
+      assert.ok(activityReads >= 1, "the watcher must learn the identity from activity");
+      assert.equal(
+        existsSync(exitFile),
+        false,
+        "the foreign sidecar must be deleted and never returned as the result",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts a sidecar stamped with the known activity identity", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "completion-t328-match-"));
+    const sessionFile = join(dir, "session.jsonl");
+    const exitFile = `${sessionFile}.exit`;
+    try {
+      let terminalReads = 0;
+      const result = await waitForCompletion(new AbortController().signal, {
+        intervalMs: 1,
+        sessionFile,
+        readTerminalTail: async () => {
+          terminalReads += 1;
+          // Publish only after iteration 1 observed the activity identity, so
+          // the matching stamp is actually compared against a known writer.
+          if (terminalReads === 2) {
+            writeFileSync(exitFile, JSON.stringify({
+              type: "ping",
+              name: "Worker",
+              message: "ready",
+              workerPid: 6_201,
+              workerStartTime: 7_201,
+            }));
+          }
+          return "";
+        },
+        readWorkerActivity: () => activityRead({ workerPid: 6_201, workerStartTime: 7_201 }),
+        probeWorkerProcess: () => "alive",
+      });
+      assert.deepEqual(result, {
+        reason: "ping",
+        exitCode: 0,
+        ping: { name: "Worker", message: "ready" },
+      });
+      assert.equal(existsSync(exitFile), false, "a matching sidecar is consumed and removed");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts a stamped sidecar when no activity identity is known", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "completion-t328-unknown-"));
+    const sessionFile = join(dir, "session.jsonl");
+    const exitFile = `${sessionFile}.exit`;
+    writeFileSync(exitFile, JSON.stringify({
+      type: "done",
+      workerPid: 999_999,
+      workerStartTime: 1,
+    }));
+    try {
+      let terminalReads = 0;
+      const result = await waitForCompletion(new AbortController().signal, {
+        intervalMs: 1,
+        sessionFile,
+        // No usable identity is ever published; the watcher must not reject.
+        readWorkerActivity: () => ({ ok: false as const, error: "missing" }),
+        readTerminalTail: async () => {
+          terminalReads += 1;
+          return "__SUBAGENT_DONE_0__";
+        },
+      });
+      assert.deepEqual(result, { reason: "done", exitCode: 0 });
+      assert.equal(terminalReads, 0, "an unknown identity must accept the sidecar immediately");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("resume completion sidecar", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  it("clears stale done or ping sidecars before the watcher can consume actual resumed output", async () => {
+    for (const [index, payload] of [
+      { type: "done" },
+      { type: "ping", name: "Worker", message: "needs help" },
+    ].entries()) {
+      const dir = createTestDir();
+      const sessionFile = createSessionFile(dir, [
+        { type: "session", id: `session-${index}`, cwd: dir },
+      ]);
+      const entryCountBefore = getNewEntries(sessionFile, 0).length;
+      const exitFile = `${sessionFile}.exit`;
+      writeFileSync(exitFile, JSON.stringify(payload));
+
+      assert.equal(typeof testApi.clearResumeExitSidecar, "function");
+      testApi.clearResumeExitSidecar(sessionFile);
+      assert.equal(existsSync(exitFile), false, "resume must remove stale completion evidence");
+
+      writeFileSync(
+        sessionFile,
+        JSON.stringify({
+          type: "message",
+          id: `message-${index}`,
+          message: { role: "assistant", content: [{ type: "text", text: "actual resumed child output" }] },
+        }) + "\n",
+        { flag: "a" },
+      );
+      const completion = await waitForCompletion(new AbortController().signal, {
+        intervalMs: 1,
+        sessionFile,
+        readTerminalTail: async () => "__SUBAGENT_DONE_0__",
+      });
+      assert.deepEqual(completion, { reason: "sentinel", exitCode: 0 });
+      assert.equal(
+        findLastAssistantMessage(getNewEntries(sessionFile, entryCountBefore)),
+        "actual resumed child output",
+      );
+    }
+  });
+});
+
+describe("child launch hardening", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  it("reports a missing child extension with the absolute path and swap cause", () => {
+    const missingRoot = createTestDir();
+    const missingPath = join(missingRoot, "subagent-done.ts");
+
+    assert.throws(
+      () => testApi.preflightSubagentDonePath(missingRoot),
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        assert.match(message, new RegExp(missingPath.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")));
+        assert.match(message, /live.*package.*swap/i);
+        return true;
+      },
+    );
+  });
+
+  it("includes a wider pane tail in non-zero no-session failures", () => {
+    const sessionFile = join(createTestDir(), "child.jsonl");
+    let requestedLines: number | undefined;
+    const paneTail = 'Error: Failed to load extension "/missing/subagent-done.ts"\n';
+
+    const result = testApi.enrichNoSessionFailure(
+      { exitCode: 1 },
+      { sessionFile, surface: "pane-1" },
+      "Sub-agent exited with code 1",
+      (_surface: string, lines?: number) => {
+        requestedLines = lines;
+        return paneTail;
+      },
+    );
+
+    assert.equal(requestedLines, 20);
+    assert.match(result.summary, /Sub-agent exited with code 1/);
+    assert.match(result.summary, /Failed to load extension/);
+    assert.equal(result.error, paneTail);
+  });
+});
+
+describe("TASK-332 pane scrollback persistence on close", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  it("persists the pre-close scrollback tail and references it by path in the failure report", () => {
+    const artifactDir = createTestDir();
+    const sessionFile = join(artifactDir, "missing-child.jsonl");
+    const scrollback = [
+      "boot: loading extension /missing/subagent-done.ts",
+      'Error: Failed to load extension "/missing/subagent-done.ts"',
+      "STARTUP-ERROR-MARKER-t332",
+      "",
+    ].join("\n");
+
+    const reads: Array<{ surface: string; lines?: number; source?: string }> = [];
+    const reader = (surface: string, lines?: number, source?: string) => {
+      reads.push({ surface, lines, source });
+      return scrollback;
+    };
+
+    const result = testApi.enrichNoSessionFailure(
+      { exitCode: 1 },
+      { id: "run-t332", sessionFile, surface: "w38:pQ", artifactDir },
+      "Sub-agent exited with code 1",
+      reader,
+    );
+
+    const artifact = join(artifactDir, "pane-scrollback", "run-t332-w38_pQ.log");
+    assert.ok(existsSync(artifact), "expected the persisted scrollback artifact on disk");
+    assert.equal(readFileSync(artifact, "utf8"), scrollback);
+    assert.match(result.summary, /STARTUP-ERROR-MARKER-t332/);
+    assert.match(result.summary, /Pane scrollback persisted: .*run-t332-w38_pQ\.log/);
+    assert.match(result.summary, /sha256:[0-9a-f]{64}/);
+
+    const meta = JSON.parse(readFileSync(`${artifact}.meta.json`, "utf8"));
+    assert.equal(meta.bytes, Buffer.byteLength(scrollback));
+    assert.equal(meta.source, "recent-unwrapped");
+    assert.equal(meta.sha256, createHash("sha256").update(scrollback).digest("hex"));
+
+    // The scrollback snapshot must read herdr scrollback, not the viewport-only tail.
+    assert.equal(reads[0]?.source, "recent-unwrapped");
+    assert.equal(reads[0]?.lines, testApi.PANE_SCROLLBACK_READ_LINES);
+  });
+
+  it("keeps the tail (last 256 KiB) when the scrollback is larger", () => {
+    const artifactDir = createTestDir();
+    const sessionFile = join(artifactDir, "missing-child.jsonl");
+    const head = "HEAD".repeat(100_000);
+    const tailMarker = "TAIL-END-MARKER-t332\n";
+    const scrollback = `${head}\n${tailMarker}`;
+
+    testApi.enrichNoSessionFailure(
+      { exitCode: 1 },
+      { id: "run-big", sessionFile, surface: "w39:pR", artifactDir },
+      "Sub-agent exited with code 1",
+      (_surface: string, lines?: number) => (lines === 20 ? "visible" : scrollback),
+    );
+
+    const artifact = join(artifactDir, "pane-scrollback", "run-big-w39_pR.log");
+    const written = readFileSync(artifact);
+    assert.equal(written.byteLength, testApi.PANE_SCROLLBACK_MAX_BYTES);
+    assert.ok(written.toString("utf8").endsWith(tailMarker), "expected the tail to be preserved");
+  });
+
+  it("does not fabricate an artifact when no scrollback is readable", () => {
+    const artifactDir = createTestDir();
+    const sessionFile = join(artifactDir, "missing-child.jsonl");
+
+    const result = testApi.enrichNoSessionFailure(
+      { exitCode: 1 },
+      { id: "run-empty", sessionFile, surface: "w40:pS", artifactDir },
+      "Sub-agent exited with code 1",
+      (_surface: string, lines?: number) => (lines === 20 ? "visible" : ""),
+    );
+
+    assert.equal(existsSync(join(artifactDir, "pane-scrollback", "run-empty-w40_pS.log")), false);
+    assert.doesNotMatch(result.summary, /Pane scrollback persisted:/);
   });
 });
 
@@ -2258,6 +3340,17 @@ describe("subagent parent lifecycle", () => {
 
     assert.equal(selectCompletionApi(previous, current), current);
     assert.equal(selectCompletionApi(previous, undefined), previous);
+  });
+
+  it("does not let pane cleanup throw after a missing-pane result", () => {
+    const testApi = (subagentsModule as any).__test__;
+    let closeAttempts = 0;
+
+    assert.doesNotThrow(() => testApi.closePaneQuietly("pane-1", () => {
+      closeAttempts += 1;
+      throw new Error("pane_not_found");
+    }));
+    assert.equal(closeAttempts, 1);
   });
 });
 
@@ -2746,6 +3839,256 @@ describe("subagent interruption", () => {
     assert.match(presentation, /Resume: pi --session/);
     assert.doesNotMatch(presentation, /ignored when errorMessage is present/);
   });
+
+  // TASK-326: failureKind classifies what actually happened. A genuine
+  // provider failure keeps the original provider message verbatim; an
+  // operator close and a no-result exit render distinctly.
+  it("keeps a genuine provider failure message verbatim", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const presentation = testApi.resolveResultPresentation(
+      {
+        exitCode: 1,
+        elapsed: 14,
+        summary: "ignored when errorMessage is present",
+        sessionFile: "/tmp/subagent.jsonl",
+        errorMessage: "Anthropic 529 Overloaded after 3 retries",
+        failureKind: "provider",
+      },
+      "Worker",
+    );
+    assert.match(presentation, /provider\/agent error — auto-retry exhausted/);
+    assert.match(presentation, /Error: Anthropic 529 Overloaded after 3 retries/);
+    assert.match(presentation, /subagent_resume/);
+  });
+
+  it("renders an operator close as closed by the operator", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const presentation = testApi.resolveResultPresentation(
+      {
+        exitCode: 1,
+        elapsed: 9,
+        summary: "ignored when errorMessage is present",
+        sessionFile: "/tmp/subagent.jsonl",
+        errorMessage: "pane closed by operator",
+        failureKind: "operator",
+      },
+      "Worker",
+    );
+    assert.match(presentation, /closed by the operator/i);
+    assert.match(presentation, /Error: pane closed by operator/);
+    assert.doesNotMatch(presentation, /provider\/agent error/);
+    assert.match(presentation, /remains on disk|resum/i);
+  });
+
+  it("renders a no-result exit distinctly from a provider failure", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const presentation = testApi.resolveResultPresentation(
+      {
+        exitCode: 1,
+        elapsed: 3,
+        summary: "ignored when errorMessage is present",
+        sessionFile: "/tmp/subagent.jsonl",
+        errorMessage: "Subagent process exited unexpectedly.",
+        failureKind: "no-result",
+      },
+      "Worker",
+    );
+    assert.match(presentation, /without producing a result/i);
+    assert.match(presentation, /Error: Subagent process exited unexpectedly/);
+    assert.doesNotMatch(presentation, /provider\/agent error/);
+    assert.doesNotMatch(presentation, /closed by the operator/i);
+  });
+});
+
+// TASK-326: the failure kind must be ASSIGNED by production code, not merely
+// rendered. These cases drive the real production watcher (watchSubagent),
+// whose completion is resolved from a real <session>.exit sidecar, and assert
+// that the returned SubagentResult carries the classification derived from the
+// child's own session transcript. Without the assignment the type's render
+// branches are dead code and these cases fail with failureKind undefined.
+// The three shapes are taken from the two real owner-closed transcripts
+// observed 2026-09-21 (last assistant stopReason "aborted"; last assistant
+// stopReason "toolUse" with no terminal sidecar) plus an empty session.
+describe("TASK-326 failure kind assignment in the production watcher", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  function assistantEntry(stopReason: string, errorMessage?: string) {
+    return {
+      type: "message",
+      id: `assistant-${stopReason}`,
+      parentId: "root",
+      timestamp: "2026-09-21T20:40:00.000Z",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "working" }],
+        stopReason,
+        ...(errorMessage ? { errorMessage } : {}),
+      },
+    };
+  }
+
+  // No stopReason on the sidecar keeps preservePane set, so the watcher never
+  // reaches for herdr; the classification under test comes only from the
+  // transcript the production path reads.
+  async function runWatcher(dir: string, entries: object[]) {
+    const sessionFile = join(dir, "child.jsonl");
+    writeFileSync(sessionFile, entries.map((e) => JSON.stringify(e)).join("\n") + "\n");
+    writeFileSync(
+      `${sessionFile}.exit`,
+      JSON.stringify({ type: "error", errorMessage: "Subagent process exited unexpectedly." }),
+    );
+    const startTime = Date.now() - 14_000;
+    return await testApi.watchSubagent(
+      {
+        id: "t326-child",
+        name: "Worker",
+        task: "t326",
+        surface: "pane-t326",
+        startTime,
+        sessionFile,
+        interactive: false,
+        lifecycle: createLifecycle(startTime),
+      },
+      new AbortController().signal,
+    );
+  }
+
+  it("(TASK-326) assigns provider for a stopReason=error turn and preserves the provider message", async () => {
+    const dir = createTestDir();
+    const providerError = "Anthropic 529 Overloaded after 3 retries";
+    const sessionFile = join(dir, "child.jsonl");
+    writeFileSync(sessionFile, JSON.stringify(assistantEntry("error", providerError)) + "\n");
+    writeFileSync(
+      `${sessionFile}.exit`,
+      JSON.stringify({ type: "error", errorMessage: providerError, stopReason: "error" }),
+    );
+    const startTime = Date.now() - 14_000;
+    const result = await testApi.watchSubagent(
+      {
+        id: "t326-child",
+        name: "Worker",
+        task: "t326",
+        surface: "pane-t326",
+        startTime,
+        sessionFile,
+        interactive: false,
+        lifecycle: createLifecycle(startTime),
+      },
+      new AbortController().signal,
+    );
+    assert.equal(result.failureKind, "provider");
+    const presentation = testApi.resolveResultPresentation(result, "Worker");
+    assert.match(presentation, /provider\/agent error — auto-retry exhausted/);
+    assert.match(presentation, /Error: Anthropic 529 Overloaded after 3 retries/);
+  });
+
+  it("(TASK-326) assigns operator for an aborted child turn", async () => {
+    const result = await runWatcher(createTestDir(), [assistantEntry("aborted", "Operation aborted")]);
+    assert.equal(result.failureKind, "operator");
+    const presentation = testApi.resolveResultPresentation(result, "Worker");
+    assert.match(presentation, /closed by the operator/i);
+    assert.doesNotMatch(presentation, /provider\/agent error/);
+    assert.doesNotMatch(presentation, /auto-retry exhausted/);
+  });
+
+  it("(TASK-326) assigns operator for a child cut off mid-turn", async () => {
+    const result = await runWatcher(createTestDir(), [assistantEntry("toolUse")]);
+    assert.equal(result.failureKind, "operator");
+    const presentation = testApi.resolveResultPresentation(result, "Worker");
+    assert.match(presentation, /closed by the operator/i);
+    assert.doesNotMatch(presentation, /provider\/agent error/);
+  });
+
+  it("(TASK-326) assigns no-result for a child with no assistant turn", async () => {
+    const result = await runWatcher(createTestDir(), [
+      { type: "session", version: 3, id: "s-1", timestamp: "2026-09-21T20:34:00.000Z" },
+    ]);
+    assert.equal(result.failureKind, "no-result");
+    const presentation = testApi.resolveResultPresentation(result, "Worker");
+    assert.match(presentation, /without producing a result/i);
+    assert.doesNotMatch(presentation, /provider\/agent error/);
+    assert.doesNotMatch(presentation, /closed by the operator/i);
+  });
+
+  // AC5/AC6 (audit 2026-09-22): the parent-interrupt and parent-initiated
+  // lifecycle-stop results are built and returned BEFORE the transcript
+  // classification above, so their kind must be assigned where those results
+  // are constructed. These cases drive the real production watcher with the
+  // parent-owned state the interrupt/watchdog/time-limit paths set.
+  async function runWatcherWith(
+    dir: string,
+    entries: object[],
+    overrides: Record<string, unknown>,
+  ) {
+    const sessionFile = join(dir, "child.jsonl");
+    writeFileSync(sessionFile, entries.map((e) => JSON.stringify(e)).join("\n") + "\n");
+    writeFileSync(
+      `${sessionFile}.exit`,
+      JSON.stringify({ type: "error", errorMessage: "Subagent process exited unexpectedly." }),
+    );
+    const startTime = Date.now() - 31_000;
+    return await testApi.watchSubagent(
+      {
+        id: "t326-child",
+        name: "Worker",
+        task: "t326",
+        surface: "pane-t326",
+        startTime,
+        sessionFile,
+        interactive: false,
+        lifecycle: createLifecycle(startTime),
+        ...overrides,
+      },
+      new AbortController().signal,
+    );
+  }
+
+  it("(AC5) reports an explicit parent interrupt as interrupted, not a bare exit code", async () => {
+    const result = await runWatcherWith(createTestDir(), [assistantEntry("toolUse")], {
+      interrupted: {
+        errorMessage: "Subagent interrupted by parent after the grace period.",
+        interruptedAt: Date.now(),
+      },
+    });
+    assert.equal(result.failureKind, "interrupted");
+    assert.equal(result.exitCode, 130);
+    const presentation = testApi.resolveResultPresentation(result, "Worker");
+    assert.match(presentation, /interrupted/i);
+    assert.match(presentation, /was interrupted after/);
+    assert.doesNotMatch(presentation, /exit code 130/);
+    assert.doesNotMatch(presentation, /provider\/agent error/);
+    assert.doesNotMatch(presentation, /auto-retry exhausted/);
+  });
+
+  it("(AC6) reports a recovery-watchdog kill distinctly from a provider failure", async () => {
+    const result = await runWatcherWith(createTestDir(), [assistantEntry("toolUse")], {
+      recoveryKilled: {
+        errorMessage: "Subagent stalled for 120s; recovery watchdog killed it.",
+        killedAt: Date.now(),
+      },
+    });
+    assert.equal(result.failureKind, "watchdog");
+    const presentation = testApi.resolveResultPresentation(result, "Worker");
+    assert.match(presentation, /was killed by the recovery watchdog after/);
+    assert.match(presentation, /stalled for 120s; recovery watchdog killed it/);
+    assert.doesNotMatch(presentation, /provider\/agent error/);
+    assert.doesNotMatch(presentation, /auto-retry exhausted/);
+  });
+
+  it("(AC6) reports a hard time-limit stop distinctly from a provider failure", async () => {
+    const result = await runWatcherWith(createTestDir(), [assistantEntry("toolUse")], {
+      timeLimitStopped: {
+        errorMessage: "Subagent reached its hard time limit.",
+        stoppedAt: Date.now(),
+      },
+    });
+    assert.equal(result.failureKind, "time-limit");
+    const presentation = testApi.resolveResultPresentation(result, "Worker");
+    assert.match(presentation, /was stopped at its hard time limit after/);
+    assert.doesNotMatch(presentation, /failed \(exit code/);
+    assert.doesNotMatch(presentation, /provider\/agent error/);
+    assert.doesNotMatch(presentation, /auto-retry exhausted/);
+  });
 });
 
 describe("subagent status renderer", () => {
@@ -2762,6 +4105,44 @@ describe("subagent status renderer", () => {
       },
     };
   }
+
+  it("(TASK-326) labels the result header by failure kind instead of always provider error", () => {
+    const { api, registeredMessageRenderers } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+
+    const rendererEntry = registeredMessageRenderers.find((entry) => entry.name === "subagent_result");
+    assert.ok(rendererEntry, "expected subagent_result renderer to be registered");
+
+    const headerFor = (failureKind: string) => {
+      const rendered = rendererEntry.renderer(
+        {
+          customType: "subagent_result",
+          content: `Sub-agent "Worker" failed after 14s.\n\nError: boom`,
+          details: {
+            name: "Worker",
+            exitCode: 1,
+            elapsed: 14,
+            errorMessage: "boom",
+            failureKind,
+            sessionFile: "/tmp/subagent.jsonl",
+          },
+        },
+        { expanded: true },
+        createTheme(),
+      );
+      return rendered.render(80).join("\n");
+    };
+
+    assert.match(headerFor("operator"), /interrupted \(closed\)/);
+    assert.match(headerFor("no-result"), /failed \(no result\)/);
+    assert.match(headerFor("provider"), /failed \(provider\/agent error\)/);
+    assert.match(headerFor("interrupted"), /interrupted/);
+    assert.doesNotMatch(headerFor("interrupted"), /exit 130/);
+    assert.match(headerFor("watchdog"), /watchdog/i);
+    assert.doesNotMatch(headerFor("watchdog"), /provider\/agent error/);
+    assert.match(headerFor("time-limit"), /time limit/i);
+    assert.doesNotMatch(headerFor("time-limit"), /provider\/agent error/);
+  });
 
   it("renders only capped lines plus overflow", () => {
     const { api, registeredMessageRenderers } = createMockExtensionApi();
@@ -3163,6 +4544,27 @@ describe("herdr.ts", () => {
         ],
       );
     });
+
+    it("builds pane reads with an explicit source, defaulting to the viewport", () => {
+      assert.deepEqual(__herdrTest__.buildPaneReadArgs("w38:pQ", 20), [
+        "pane",
+        "read",
+        "w38:pQ",
+        "--source",
+        "visible",
+        "--lines",
+        "20",
+      ]);
+      assert.deepEqual(__herdrTest__.buildPaneReadArgs("w38:pQ", 10000, "recent-unwrapped"), [
+        "pane",
+        "read",
+        "w38:pQ",
+        "--source",
+        "recent-unwrapped",
+        "--lines",
+        "10000",
+      ]);
+    });
   });
 
   describe("herdr response parsing", () => {
@@ -3246,5 +4648,391 @@ describe("herdr.ts", () => {
       }), "w1:p1");
       assert.deepEqual(result, { kind: "present", agent: "pi", agentStatus: "unknown" });
     });
+
+    it("parses the worker pgid exposed by a pane record", () => {
+      const result = __herdrTest__.parsePaneGetOutput(JSON.stringify({
+        result: {
+          pane: {
+            pane_id: "w1:p1",
+            agent: "pi",
+            agent_status: "working",
+            process: "pi",
+            pgid: "Some(42)",
+          },
+        },
+      }), "w1:p1");
+      assert.deepEqual(result, {
+        kind: "present",
+        agent: "pi",
+        agentStatus: "working",
+        workerPgid: 42,
+      });
+    });
+
+    it("parses a Herdr process-info response and its process-group id", () => {
+      const result = __herdrTest__.parsePaneProcessInfoOutput(JSON.stringify({
+        result: {
+          process_info: {
+            pane_id: "w1:p1",
+            foreground_process_group_id: "Some(42)",
+            foreground_processes: [
+              { name: "bash", pid: 41, argv: ["bash"] },
+              { name: "pi", pid: 42, argv: ["pi"] },
+            ],
+          },
+        },
+      }), "w1:p1");
+      assert.deepEqual(result, {
+        workerPid: 42,
+        workerPgid: 42,
+      });
+    });
+  });
+});
+
+// --- F-209 continuation regressions (new bounded-test grant; existing suites untouched) ---
+describe("F-209 completion crash steering", () => {
+  const activity = (overrides: Record<string, unknown> = {}) => ({
+    version: 1 as const,
+    runningChildId: "f209-child",
+    createdAt: 1_000,
+    updatedAt: 1_000,
+    sequence: 1,
+    latestEvent: "agent_start" as const,
+    phase: "active" as const,
+    agentActive: true,
+    turnActive: true,
+    providerActive: false,
+    toolActive: false,
+    workerPid: 4_101,
+    workerStartTime: 9_001,
+    ...overrides,
+  });
+
+  const activityRead = (overrides: Record<string, unknown> = {}) => ({
+    ok: true as const,
+    activity: activity(overrides),
+  });
+
+  const presentPane = (overrides: Record<string, unknown> = {}) => ({
+    kind: "present" as const,
+    observedAt: Date.now(),
+    agentStatus: "working" as const,
+    ...overrides,
+  });
+
+  it("publishes the exact worker PID/start-time identity before activity is observed", () => {
+    withTempDir((dir) => {
+      const activityFile = getSubagentActivityFile(dir, "f209-child");
+      const recorder = createSubagentActivityRecorder({
+        runningChildId: "f209-child",
+        activityFile,
+        now: () => 1_000,
+      });
+
+      recorder.sessionStart();
+      const read = readSubagentActivityFile(activityFile, "f209-child");
+      assert.ok(read.ok);
+      assert.equal(read.activity.workerPid, process.pid);
+      assert.equal(typeof read.activity.workerStartTime, "number");
+      assert.ok(read.activity.workerStartTime! > 0);
+    });
+  });
+
+  it("turns an exit-137 sentinel into a detailed error while preserving the pane", async () => {
+    let inspections = 0;
+    const result = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => "__SUBAGENT_DONE_137__",
+      inspectPane: async () => {
+        inspections += 1;
+        return presentPane();
+      },
+    });
+
+    assert.deepEqual(result, {
+      reason: "error",
+      exitCode: 137,
+      preservePane: true,
+      errorMessage: "subagent worker process terminated with observed exit status 137 (no exit sidecar)",
+    });
+    assert.equal(inspections, 0, "the terminal sentinel is terminal before pane cleanup");
+  });
+
+  it("keeps sidecar precedence and F-47 pane policy over an exit-137 sentinel", async () => {
+    for (const [index, payload] of [
+      { type: "error", errorMessage: "provider failure", stopReason: "error" },
+      { type: "error", errorMessage: "crash failure" },
+    ].entries()) {
+      const dir = createTestDir();
+      const sessionFile = join(dir, `child-${index}.jsonl`);
+      const exitFile = `${sessionFile}.exit`;
+      writeFileSync(exitFile, JSON.stringify(payload));
+      let terminalReads = 0;
+      let inspections = 0;
+      try {
+        const result = await waitForCompletion(new AbortController().signal, {
+          intervalMs: 1,
+          sessionFile,
+          readTerminalTail: async () => {
+            terminalReads += 1;
+            return "__SUBAGENT_DONE_137__";
+          },
+          inspectPane: async () => {
+            inspections += 1;
+            return presentPane();
+          },
+        });
+        const expected = {
+          reason: "error" as const,
+          exitCode: 1,
+          ...(payload.stopReason === "error" ? {} : { preservePane: true }),
+          errorMessage: payload.errorMessage,
+        };
+        assert.deepEqual(result, expected);
+        assert.equal(terminalReads, 0, "sidecar must win before terminal sentinel parsing");
+        assert.equal(inspections, 0, "sidecar must win before pane inspection");
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("uses the published identity after Herdr drops worker metadata", async () => {
+    let inspections = 0;
+    let probes = 0;
+    const identities: Array<{ pid: number; startTime: number }> = [];
+    const result = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => "",
+      readWorkerActivity: () => activityRead(),
+      inspectPane: async () => {
+        inspections += 1;
+        return inspections === 1
+          ? presentPane({ workerPid: 4_101, workerPgid: 4_101 })
+          : presentPane();
+      },
+      probeWorkerProcess: (identity) => {
+        probes += 1;
+        identities.push(identity);
+        return inspections === 1 ? "alive" : "dead";
+      },
+    });
+
+    assert.deepEqual(result, {
+      reason: "error",
+      exitCode: 1,
+      preservePane: true,
+      errorMessage: "subagent worker process died (no exit sidecar)",
+    });
+    assert.equal(inspections, 2);
+    assert.equal(probes, 2);
+    assert.deepEqual(identities, [
+      { pid: 4_101, startTime: 9_001 },
+      { pid: 4_101, startTime: 9_001 },
+    ]);
+  });
+
+  it("detects death before Herdr's first identity-bearing poll", async () => {
+    const events: string[] = [];
+    const result = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => "",
+      readWorkerActivity: () => {
+        events.push("activity");
+        return activityRead({ workerPid: 4_102, workerStartTime: 9_002 });
+      },
+      inspectPane: async () => {
+        events.push("pane");
+        return presentPane();
+      },
+      probeWorkerProcess: (identity) => {
+        events.push(`probe:${identity.pid}:${identity.startTime}`);
+        return "dead";
+      },
+    });
+
+    assert.deepEqual(result, {
+      reason: "error",
+      exitCode: 1,
+      preservePane: true,
+      errorMessage: "subagent worker process died (no exit sidecar)",
+    });
+    assert.deepEqual(events, ["activity", "pane", "probe:4102:9002"]);
+  });
+
+  it("treats a zombie worker as dead even when the launch shell survives", async () => {
+    const { probeWorkerProcess } = await import("../pi-extension/subagents/completion.ts");
+    const identity = { pid: 4_103, startTime: 9_003 };
+    const readZombie = (pid: number) => ({
+      kind: "present" as const,
+      identity: { pid, startTime: 9_003 },
+      state: "Z",
+    });
+    assert.equal(probeWorkerProcess(identity, readZombie), "dead");
+
+    const probedPids: number[] = [];
+    const result = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => "",
+      readWorkerActivity: () => activityRead({ workerPid: identity.pid, workerStartTime: identity.startTime }),
+      inspectPane: async () => presentPane({ workerPgid: 4_104 }),
+      probeWorkerProcess: (current) => probeWorkerProcess(current, (pid) => {
+        probedPids.push(pid);
+        return readZombie(pid);
+      }),
+    });
+
+    assert.deepEqual(result, {
+      reason: "error",
+      exitCode: 1,
+      preservePane: true,
+      errorMessage: "subagent worker process died (no exit sidecar)",
+    });
+    assert.deepEqual(probedPids, [identity.pid], "probe the worker PID, not the surviving shell PGID");
+  });
+
+  it("treats PID reuse with a changed start time as worker death", async () => {
+    const { probeWorkerProcess } = await import("../pi-extension/subagents/completion.ts");
+    const identity = { pid: 4_105, startTime: 9_005 };
+    const reused = (pid: number) => ({
+      kind: "present" as const,
+      identity: { pid, startTime: 9_006 },
+      state: "S",
+    });
+    assert.equal(probeWorkerProcess(identity, reused), "dead");
+
+    const result = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => "",
+      readWorkerActivity: () => activityRead({ workerPid: identity.pid, workerStartTime: identity.startTime }),
+      inspectPane: async () => presentPane(),
+      probeWorkerProcess: (current) => probeWorkerProcess(current, reused),
+    });
+    assert.deepEqual(result, {
+      reason: "error",
+      exitCode: 1,
+      preservePane: true,
+      errorMessage: "subagent worker process died (no exit sidecar)",
+    });
+  });
+
+  it("keeps polling when process reads are unavailable", async () => {
+    const { probeWorkerProcess } = await import("../pi-extension/subagents/completion.ts");
+    const identity = { pid: 4_106, startTime: 9_007 };
+    const unavailable = () => ({ kind: "unknown" as const, error: "EACCES" });
+    assert.equal(probeWorkerProcess(identity, unavailable), "unknown");
+
+    let reads = 0;
+    let probes = 0;
+    const result = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => {
+        reads += 1;
+        return reads >= 4 ? "__SUBAGENT_DONE_0__" : "";
+      },
+      readWorkerActivity: () => activityRead({ workerPid: identity.pid, workerStartTime: identity.startTime }),
+      inspectPane: async () => presentPane(),
+      probeWorkerProcess: (current) => {
+        probes += 1;
+        return probeWorkerProcess(current, unavailable);
+      },
+    });
+
+    assert.deepEqual(result, { reason: "sentinel", exitCode: 0 });
+    assert.ok(reads >= 4);
+    assert.ok(probes >= 3, "unknown process reads must remain retryable");
+  });
+
+  it("does not declare healthy activity dead after more than two polling intervals", async () => {
+    let polls = 0;
+    let probes = 0;
+    const result = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => {
+        polls += 1;
+        return polls >= 5 ? "__SUBAGENT_DONE_0__" : "";
+      },
+      readWorkerActivity: () => activityRead({
+        sequence: polls,
+        updatedAt: 1_000 + polls,
+      }),
+      inspectPane: async () => presentPane(),
+      probeWorkerProcess: () => {
+        probes += 1;
+        return "alive";
+      },
+    });
+
+    assert.deepEqual(result, { reason: "sentinel", exitCode: 0 });
+    assert.ok(polls >= 5);
+    assert.ok(probes >= 4, "healthy activity must survive repeated probes");
+  });
+
+  it("does not reuse stale activity identity after a resume reset", async () => {
+    const { resetSubagentActivityFile } = await import("../pi-extension/subagents/activity.ts");
+    const dir = createTestDir();
+    const activityFile = getSubagentActivityFile(dir, "f209-child");
+    mkdirSync(join(dir, "subagent-activity"), { recursive: true });
+    writeFileSync(activityFile, `${JSON.stringify(activity({ workerPid: 4_107, workerStartTime: 9_008 }))}\n`);
+    resetSubagentActivityFile(activityFile);
+    assert.equal(existsSync(activityFile), false);
+
+    let reads = 0;
+    const identities: Array<{ pid: number; startTime: number }> = [];
+    const currentIdentity = { workerPid: 4_108, workerStartTime: 9_009 };
+    try {
+      const result = await waitForCompletion(new AbortController().signal, {
+        intervalMs: 1,
+        readTerminalTail: async () => "",
+        readWorkerActivity: () => {
+          reads += 1;
+          if (reads === 2) {
+            writeFileSync(activityFile, `${JSON.stringify(activity({ ...currentIdentity, sequence: 2 }))}\n`);
+          }
+          return readSubagentActivityFile(activityFile, "f209-child");
+        },
+        inspectPane: async () => presentPane(),
+        probeWorkerProcess: (identity) => {
+          identities.push(identity);
+          return "dead";
+        },
+      });
+
+      assert.deepEqual(result, {
+        reason: "error",
+        exitCode: 1,
+        preservePane: true,
+        errorMessage: "subagent worker process died (no exit sidecar)",
+      });
+      assert.deepEqual(identities, [{ pid: 4_108, startTime: 9_009 }]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("retains normal completion and missing-pane debounce behavior", async () => {
+    const normal = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => "__SUBAGENT_DONE_0__",
+      inspectPane: async () => presentPane(),
+    });
+    assert.deepEqual(normal, { reason: "sentinel", exitCode: 0 });
+
+    let reads = 0;
+    let inspections = 0;
+    const debounced = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => {
+        reads += 1;
+        return reads >= 3 ? "__SUBAGENT_DONE_0__" : "";
+      },
+      inspectPane: async () => {
+        inspections += 1;
+        return inspections === 1 ? { kind: "missing", error: "pane_not_found" } : presentPane();
+      },
+    });
+    assert.deepEqual(debounced, { reason: "sentinel", exitCode: 0 });
+    assert.ok(inspections >= 2, "a single missing pane observation must not fail the run");
   });
 });

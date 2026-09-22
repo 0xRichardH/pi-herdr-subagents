@@ -42,12 +42,18 @@ export interface SubagentLaunchContext {
   sessionDir: string;
   subagentSessionFile: string;
   effectiveCwd: string;
+  /** Parent session cwd, used to inherit its trust decision for same-folder children. */
+  parentCwd?: string;
+  /** Parent's own project-trust decision (`ctx.isProjectTrusted()`), when known. */
+  parentTrusted?: boolean;
   localAgentDir?: string;
   effectiveAutoExit: boolean;
   effectiveInteractive: boolean;
   inheritsConversationContext: boolean;
   taskDelivery: "direct" | "artifact";
   denySet?: Set<string>;
+  /** PI_SUBAGENT_SPAWN_DEPTH handed to this child (its children's ceiling); null = unlimited. */
+  childSpawnDepth?: number | null;
   identity?: string | null;
   identityInSystemPrompt?: boolean;
   systemPromptMode?: string;

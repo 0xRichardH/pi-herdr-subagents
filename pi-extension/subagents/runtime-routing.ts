@@ -75,6 +75,7 @@ export interface ResolvedRuntimePlan {
     thinking?: ThinkingLevel;
   };
   runtimeMismatch?: string;
+  runtimeFallback?: string;
 }
 
 export function modelForCli(
