@@ -291,8 +291,10 @@ function formatTokenCount(value: number | undefined): string | undefined {
 export function buildAuthenticatedModelCatalog(
   registry: ModelRegistryAdapter,
   limit = 24,
+  scopedModels?: RoutingModel[],
 ): string {
-  const models = registry.available().sort((a, b) =>
+  const source = scopedModels?.length ? scopedModels : registry.available();
+  const models = [...source].sort((a, b) =>
     `${a.provider}/${a.id}`.localeCompare(`${b.provider}/${b.id}`),
   );
   const visibleModels = models.slice(0, limit);

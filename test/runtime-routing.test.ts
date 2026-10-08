@@ -240,6 +240,13 @@ describe("authenticated model catalog", () => {
     );
   });
 
+  it("uses scoped models when provided", () => {
+    const available = [model("fake", "parent"), model("other", "fast")];
+    const catalog = buildAuthenticatedModelCatalog(registry(available), 24, [available[1]]);
+    assert.doesNotMatch(catalog, /fake\/parent/);
+    assert.match(catalog, /other\/fast/);
+  });
+
   it("caps large catalogs and reports omitted models", () => {
     const available = Array.from({ length: 30 }, (_, index) => model("fake", `model-${index}`));
     const catalog = buildAuthenticatedModelCatalog(registry(available), 5);
