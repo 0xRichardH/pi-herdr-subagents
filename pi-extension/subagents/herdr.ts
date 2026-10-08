@@ -261,8 +261,19 @@ export function sendHerdrEscape(surface: string): void {
   herdrExec(["pane", "send-keys", surface, "Escape"]);
 }
 
+function isPaneMissingError(error: any): boolean {
+  return parsePaneGetError(error).kind === "missing";
+}
+
 export function closeHerdrSurface(surface: string): void {
-  herdrExec(["pane", "close", surface]);
+  try {
+    herdrExec(["pane", "close", surface]);
+  } catch (error: any) {
+    // Closing a pane is cleanup. If the pane already disappeared (for example,
+    // after an interrupt or manual close), the desired end state is satisfied.
+    if (isPaneMissingError(error)) return;
+    throw error;
+  }
 }
 
 export function renameHerdrTab(title: string): void {
@@ -315,4 +326,5 @@ export const __herdrTest__ = {
   extractHerdrRootPaneId,
   parsePaneGetOutput,
   parsePaneGetError,
+  isPaneMissingError,
 };

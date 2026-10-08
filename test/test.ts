@@ -3213,6 +3213,18 @@ describe("herdr.ts", () => {
       assert.deepEqual(result, { kind: "missing", error: "pane gone" });
     });
 
+    it("treats an already-missing pane as successful cleanup", () => {
+      assert.equal(__herdrTest__.isPaneMissingError({
+        stderr: JSON.stringify({ error: { code: "pane_not_found", message: "pane gone" } }),
+        stdout: "",
+      }), true);
+      assert.equal(__herdrTest__.isPaneMissingError({
+        message: "connection refused",
+        stderr: "",
+        stdout: "",
+      }), false);
+    });
+
     it("continues from non-JSON stderr to structured stdout", () => {
       const result = __herdrTest__.parsePaneGetError({
         stderr: "warning: connection closed",
