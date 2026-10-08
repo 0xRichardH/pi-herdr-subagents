@@ -797,7 +797,15 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
 
 function updateWidget() {
   const latestCtx = runtime.latestCtx;
-  if (!latestCtx?.hasUI) return;
+  if (!latestCtx) return;
+  try {
+    if (!latestCtx.hasUI) return;
+  } catch {
+    // Ctx went stale (session replacement / reload) mid-flight. Drop it and
+    // wait for the next session_start to install a fresh one.
+    runtime.latestCtx = undefined;
+    return;
+  }
 
   if (runningSubagents.size === 0) {
     latestCtx.ui.setWidget("subagent-status", undefined);
@@ -1453,6 +1461,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   // Clean up on session shutdown
   pi.on("session_shutdown", (event, _ctx) => {
+    // Preserved watchers must not touch a ctx that is about to go stale.
+    runtime.latestCtx = undefined;
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
