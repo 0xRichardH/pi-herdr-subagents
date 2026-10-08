@@ -67,6 +67,16 @@ If your shell startup is slow and subagent commands sometimes get dropped before
 export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500
 ```
 
+By default each subagent runs in its **own new tab**. If you'd rather keep them
+side-by-side with the orchestrator, set `PI_SUBAGENT_LAYOUT=split` (right-hand
+split) or `PI_SUBAGENT_LAYOUT=split:down` (split below). Unset, empty, or any
+other value keeps the default new-tab behavior:
+
+```bash
+export PI_SUBAGENT_LAYOUT=split        # right-hand split
+# export PI_SUBAGENT_LAYOUT=split:down # split below
+```
+
 Subagent tabs and panes are created without stealing keyboard focus. Launch commands target child panes by explicit ID, so focus and command delivery are independent. Note: the `interactive` option controls parent status notifications, not terminal focus.
 
 ## What's Included

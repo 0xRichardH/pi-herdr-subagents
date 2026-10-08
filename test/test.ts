@@ -26,6 +26,10 @@ import {
 
 import { isHerdrAvailable, __herdrTest__ } from "../pi-extension/subagents/herdr.ts";
 import {
+  parseSubagentLayout,
+  resolveSubagentLayout,
+} from "../pi-extension/subagents/terminal.ts";
+import {
   loadModelConfig,
   parseModelConfig,
   resolveModelDefault,
@@ -3250,6 +3254,72 @@ describe("herdr.ts", () => {
         result: { pane: { pane_id: "w1:p1", agent: "pi", agent_status: "paused" } },
       }), "w1:p1");
       assert.deepEqual(result, { kind: "present", agent: "pi", agentStatus: "unknown" });
+    });
+  });
+});
+
+describe("subagent surface layout", () => {
+  describe("buildPaneSplitArgs", () => {
+    it("constructs a right-hand split against the parent pane", () => {
+      assert.deepEqual(__herdrTest__.buildPaneSplitArgs("w1:p1", "right", "/repo"), [
+        "pane",
+        "split",
+        "w1:p1",
+        "--direction",
+        "right",
+        "--no-focus",
+        "--cwd",
+        "/repo",
+      ]);
+    });
+
+    it("constructs a downward split against the parent pane", () => {
+      assert.deepEqual(__herdrTest__.buildPaneSplitArgs("w1:p1", "down", "/repo"), [
+        "pane",
+        "split",
+        "w1:p1",
+        "--direction",
+        "down",
+        "--no-focus",
+        "--cwd",
+        "/repo",
+      ]);
+    });
+  });
+
+  describe("parseSubagentLayout", () => {
+    it("defaults to a tab when the env var is unset", () => {
+      assert.equal(parseSubagentLayout(undefined), "tab");
+    });
+
+    it("defaults to a tab when the env var is empty or whitespace", () => {
+      assert.equal(parseSubagentLayout(""), "tab");
+      assert.equal(parseSubagentLayout("   "), "tab");
+    });
+
+    it("maps `split` to a right-hand split", () => {
+      assert.equal(parseSubagentLayout("split"), "right");
+    });
+
+    it("maps `split:right` to a right-hand split", () => {
+      assert.equal(parseSubagentLayout("split:right"), "right");
+    });
+
+    it("maps `split:down` to a downward split", () => {
+      assert.equal(parseSubagentLayout("split:down"), "down");
+    });
+
+    it("falls back to a tab for unknown values", () => {
+      assert.equal(parseSubagentLayout("side-by-side"), "tab");
+      assert.equal(parseSubagentLayout("tab"), "tab");
+    });
+  });
+
+  describe("resolveSubagentLayout", () => {
+    it("reads PI_SUBAGENT_LAYOUT from the provided environment", () => {
+      assert.equal(resolveSubagentLayout({ PI_SUBAGENT_LAYOUT: "split:down" }), "down");
+      assert.equal(resolveSubagentLayout({ PI_SUBAGENT_LAYOUT: "split" }), "right");
+      assert.equal(resolveSubagentLayout({}), "tab");
     });
   });
 });

@@ -15,7 +15,8 @@ import { homedir } from "node:os";
 import {
   isTerminalAvailable,
   terminalSetupHint,
-  createSubagentPane,
+  createSubagentSurface,
+  resolveSubagentLayout,
   runScriptInPane,
   closePane,
   interruptPane,
@@ -1171,7 +1172,7 @@ async function launchSubagent(
   driver.validateRuntimePlan?.(runtimePlan, parentThinking);
 
   const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSubagentPane(params.name);
+  const surface = options?.surface ?? createSubagentSurface(params.name, resolveSubagentLayout());
   if (params.task) {
     setPaneTask(surface, params.task);
   }
@@ -1927,7 +1928,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Record entry count before resuming so we can extract new messages
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
-        const surface = createSubagentPane(name);
+        const surface = createSubagentSurface(name, resolveSubagentLayout());
         if (params.message) {
           setPaneTask(surface, params.message);
         }
