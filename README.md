@@ -125,6 +125,15 @@ Agents default to running with `pi`, but can run inside any supported harness CL
 | **Grok** | `grok` | bare model ID | Runs `grok --model <model> <task>` |
 | **Custom / Generic** | any CLI name | bare model ID | Supports custom `command:` template (e.g. `command: "aider --model {model} --message {task}"`) |
 
+Claude Code completion follows the resolved `auto-exit` setting. For autonomous
+runs, its Stop hook publishes the final response even when `--resume` loads prior
+user messages or additional input was sent during the task. Non-auto-exit runs
+remain open until the Claude CLI exits; `interactive` separately controls parent
+status notifications. The hook uses `last_assistant_message` when available and
+falls back to the last 4 MiB of transcript text on older Claude versions. Completion is published
+atomically, after saving the transcript pointer, so Pi cannot consume a partial
+result. A temporarily missing transcript does not block completion.
+
 ---
 
 ## Async Subagent Flow
@@ -369,7 +378,7 @@ You are a specialized agent that does X...
 | `session-mode` | string | Default child-session mode: `standalone`, `lineage-only`, or `fork` |
 | `spawning`    | boolean | Set `false` to deny all subagent-spawning tools                                                                                                                                                                                                                             |
 | `deny-tools`  | string  | Comma-separated extension tool names to deny                                                                                                                                                                                                                                |
-| `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
+| `auto-exit`   | boolean | Automatically complete the run after a final response — no `subagent_done` call needed. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Claude uses its Stop hook; Pi uses its settled lifecycle. Also determines the default value of `interactive` (see below). |
 | `interactive` | boolean | derived        | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
 | `disable-model-invocation` | boolean | Hide this agent from discovery surfaces like `subagents_list`. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`. |
@@ -403,8 +412,8 @@ When set to `true`, the agent session shuts down automatically as soon as the ag
 
 **Behavior:**
 
-- The session closes after the agent's final message (on the `agent_end` event)
-- If the user sends **any input** before the agent finishes, auto-exit is permanently disabled for that session — the user takes over interactively
+- Pi-backed sessions close after a normal final response once the run has settled; tool-use and aborted turns do not auto-exit
+- Claude-backed sessions signal completion at the final Stop hook, regardless of historical or additional user messages; use `auto-exit: false` for a user-driven session
 - The modeHint injected into the agent's task is adjusted accordingly: autonomous agents see "Complete your task autonomously." rather than instructions to call `subagent_done`
 
 **When to use:**
