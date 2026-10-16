@@ -1,0 +1,164 @@
+#!/usr/bin/env node
+// Node 24+, no dependencies. Drives real Pi PTYs through the existing herdr CLI.
+import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, appendFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../../../..');
+const extension = join(repo, 'pi-extension/subagents/index.ts');
+const [command, evidenceArg, ...args] = process.argv.slice(2);
+if (!evidenceArg || !['launch', 'doctor', 'drive-spawn', 'send', 'capture', 'cleanup'].includes(command)) {
+  console.error('Usage: control-subagents <launch|doctor|drive-spawn|send|capture|cleanup> <evidence-dir> [prompt]');
+  process.exit(2);
+}
+const evidence = resolve(evidenceArg);
+const statePath = join(evidence, 'state.json');
+const quote = (s) => "'" + String(s).replaceAll("'", "'\\''") + "'";
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const hash = () => createHash('sha256').update(readFileSync(extension)).digest('hex');
+const run = (bin, a) => execFileSync(bin, a, { encoding: 'utf8', timeout: 15000 });
+const herdr = (...a) => run('herdr', a);
+const json = (...a) => {
+  const result = JSON.parse(herdr(...a));
+  if (result.error) throw new Error(JSON.stringify(result.error));
+  return result.result;
+};
+const load = () => JSON.parse(readFileSync(statePath, 'utf8'));
+const save = (s) => writeFileSync(statePath, JSON.stringify(s, null, 2) + '\n', { mode: 0o600 });
+const entries = () => {
+  const path = join(evidence, 'parent.jsonl');
+  if (!existsSync(path)) return [];
+  return readFileSync(path, 'utf8').split('\n').flatMap(l => { try { return [JSON.parse(l)]; } catch { return []; } });
+};
+const assistantSaid = (token) => entries().some(e => e.message?.role === 'assistant' && e.message.content?.some?.(c => c.type === 'text' && c.text.includes(token)));
+async function until(check, label) {
+  const deadline = Date.now() + Number(process.env.PI_TEST_TIMEOUT || 180000);
+  while (Date.now() < deadline) {
+    if (check()) return;
+    await sleep(1000);
+  }
+  throw new Error(`Timeout: ${label}`);
+}
+function capture(s, label) {
+  const name = `${Date.now()}-${label}`;
+  writeFileSync(join(evidence, `${name}.txt`), herdr('pane', 'read', s.rootPaneId, '--source', 'visible', '--lines', '200'));
+  writeFileSync(join(evidence, `${name}-panes.json`), herdr('pane', 'list', '--workspace', s.workspaceId));
+}
+function send(s, prompt) {
+  appendFileSync(join(evidence, 'actions.jsonl'), JSON.stringify({ at: new Date().toISOString(), pane: s.rootPaneId, prompt }) + '\n');
+  herdr('pane', 'run', s.rootPaneId, prompt);
+}
+function doctor(s) {
+  if (s.cleaned) throw new Error('Run already cleaned; launch with a fresh evidence directory');
+  if (process.env.HERDR_ENV !== '1') throw new Error('Run inside herdr: HERDR_ENV must be 1');
+  if (s.extension !== extension || s.sourceHash !== hash()) throw new Error('Wrong checkout or source changed since launch; restart verification');
+  const pane = json('pane', 'get', s.rootPaneId).pane;
+  if (pane.workspace_id !== s.workspaceId) throw new Error('Pane/workspace ownership mismatch');
+  const processes = json('pane', 'process-info', '--pane', s.rootPaneId).process_info.foreground_processes;
+  if (!processes.some(p => p.name === 'pi' || p.argv?.some(a => /(?:^|\/)pi(?:\/dist\/cli\.js)?$/.test(a)))) throw new Error('Owned pane is not running Pi in the foreground');
+  const ready = assistantSaid(s.readyToken);
+  if (!ready) throw new Error('Pi has not completed its authenticated readiness prompt; inspect launch transcript');
+  const result = { ready, pane: pane.pane_id, workspace: s.workspaceId, extension, sourceHash: s.sourceHash, model: s.model, piVersion: run('pi', ['--version']).trim(), herdrVersion: run('herdr', ['--version']).trim() };
+  writeFileSync(join(evidence, 'doctor.json'), JSON.stringify(result, null, 2));
+  console.log(JSON.stringify(result, null, 2));
+}
+function cleanup(s) {
+  if (!s.cleaned) {
+    const workspaces = json('workspace', 'list').workspaces;
+    const owned = workspaces.find(w => w.workspace_id === s.workspaceId);
+    if (owned) {
+      if (owned.label !== s.label) throw new Error('Workspace label changed; refusing automatic close. Inspect state.json and close only the recorded owned workspace.');
+      json('workspace', 'close', s.workspaceId);
+    }
+    if (json('workspace', 'list').workspaces.some(w => w.workspace_id === s.workspaceId)) throw new Error('Workspace still exists');
+    rmSync(s.scratchDir, { recursive: true, force: true });
+    s.cleaned = true;
+    save(s);
+  }
+  writeFileSync(join(evidence, 'cleanup.json'), JSON.stringify({ workspaceAbsent: true, scratchAbsent: !existsSync(s.scratchDir), evidencePreserved: existsSync(join(evidence, 'parent.jsonl')) }, null, 2));
+  console.log(`Cleaned owned workspace and scratch; evidence retained at ${evidence}`);
+}
+
+try {
+  if (command === 'launch') {
+    if (process.env.HERDR_ENV !== '1' || !process.env.HERDR_WORKSPACE_ID) throw new Error('Start Pi inside herdr first');
+    if (existsSync(statePath)) throw new Error('Evidence directory already has a run; choose a fresh directory');
+    mkdirSync(evidence, { recursive: true, mode: 0o700 });
+    const scratchDir = mkdtempSync(join(tmpdir(), 'pi-verify-'));
+    const model = process.env.PI_TEST_MODEL;
+    if (!model) { rmSync(scratchDir, { recursive: true }); throw new Error('Set PI_TEST_MODEL to an exact authenticated provider/model-id'); }
+    const agents = join(scratchDir, '.pi/agents');
+    mkdirSync(agents, { recursive: true });
+    writeFileSync(join(agents, 'verify-worker.md'), `---\nname: verify-worker\ndescription: Disposable verification worker\nmodel: ${model}\ntools: bash, read, write\nspawning: false\nauto-exit: true\n---\nExecute the requested task immediately. Use bash to write requested marker files.\n`);
+    const label = `pi-verify-${Date.now()}-${process.pid}`;
+    let ws;
+    try { ws = json('workspace', 'create', '--cwd', scratchDir, '--label', label, '--no-focus'); }
+    catch (error) { rmSync(scratchDir, { recursive: true }); throw error; }
+    const s = { workspaceId: ws.workspace.workspace_id, rootPaneId: ws.root_pane.pane_id, scratchDir, label, model, extension, sourceHash: hash(), readyToken: `VERIFY_READY_${process.pid}`, cleaned: false };
+    save(s); // Persist ownership before any command can fail.
+    const prompt = `Reply with exactly ${s.readyToken}. Do not call tools.`;
+    const cmd = ['pi', '-e', extension, '--no-mcp', '--no-skills', '--no-context-files', '--approve', '--session', join(evidence, 'parent.jsonl'), '--model', model, '--thinking', 'off', prompt].map(quote).join(' ');
+    const script = `#!/bin/sh\ncd ${quote(scratchDir)} || exit 1\nexport HERDR_WORKSPACE_ID=${quote(s.workspaceId)}\n${cmd}\nprintf '\\nPI_VERIFY_EXIT=%s\\n' "$?"\n`;
+    writeFileSync(join(evidence, 'launch.sh'), script, { mode: 0o700 });
+    try {
+      // Bounded shell warmup; readiness below requires an actual authenticated response.
+      await sleep(Number(process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS || 2500));
+      herdr('pane', 'run', s.rootPaneId, `sh ${quote(join(evidence, 'launch.sh'))}`);
+      await until(() => assistantSaid(s.readyToken), 'authenticated Pi readiness');
+      capture(s, 'ready');
+      doctor(s);
+    } catch (error) {
+      try { capture(s, 'launch-failure'); } catch {}
+      cleanup(s);
+      throw error;
+    }
+  } else {
+    const s = load();
+    if (command === 'cleanup') cleanup(s);
+    else if (command === 'doctor') doctor(s);
+    else if (command === 'capture') capture(s, 'capture');
+    else if (command === 'send') {
+      doctor(s);
+      if (!args[0]) throw new Error('send requires a literal Pi prompt or slash command');
+      send(s, args[0]);
+    } else if (command === 'drive-spawn') {
+      doctor(s);
+      const marker = join(s.scratchDir, 'spawn-marker.txt');
+      if (existsSync(marker)) throw new Error('Spawn already driven; use a fresh run for an uncontaminated proof');
+      const token = `SPAWN_PASS_${s.label}`;
+      const done = `SPAWN_COMPLETE_${s.label}`;
+      const prompt = `Call subagent once with name "VerifyWorker", agent "verify-worker", task "Run bash: printf '${token}\\n' > '${marker}'". Do not write the file yourself. End your turn after spawning. After the async subagent_result arrives, reply exactly ${done}.`;
+      try {
+        capture(s, 'before-spawn');
+        send(s, prompt);
+        await until(() => existsSync(marker) && readFileSync(marker, 'utf8').trim() === token, 'child marker');
+        await until(() => entries().some(e => e.customType === 'subagent_result') && assistantSaid(done), 'completion steering and parent acknowledgment');
+        const events = entries();
+        const spawnCalls = events.flatMap(e => e.message?.role === 'assistant' ? e.message.content || [] : []).filter(c => c.type === 'toolCall' && c.name === 'subagent');
+        if (spawnCalls.length !== 1 || spawnCalls[0].arguments?.agent !== 'verify-worker') throw new Error('Expected exactly one real subagent call to verify-worker');
+        const result = events.find(e => e.customType === 'subagent_result');
+        if (result.details?.error || result.details?.exitCode !== 0) throw new Error(`Child completion not successful: ${JSON.stringify(result.details)}`);
+        const childPath = result.details?.sessionFile;
+        if (!childPath || !existsSync(childPath)) throw new Error('Missing child session proof');
+        const childLog = readFileSync(childPath, 'utf8');
+        const childEntries = childLog.trim().split('\n').map(l => JSON.parse(l));
+        if (!childEntries.some(e => e.message?.role === 'assistant' && e.message.content?.some?.(c => c.type === 'toolCall' && c.name === 'bash' && c.arguments?.command?.includes(marker)))) throw new Error('Child session does not show real bash marker action');
+        writeFileSync(join(evidence, 'child.jsonl'), childLog);
+        capture(s, 'after-spawn');
+        writeFileSync(join(evidence, 'spawn-marker.txt'), readFileSync(marker));
+        writeFileSync(join(evidence, 'spawn-proof.json'), JSON.stringify({ feature: 'spawn', entryPoint: 'subagent tool', model: s.model, toolCall: spawnCalls[0], result, parentAcknowledged: true, markerMatched: true }, null, 2));
+        console.log(`Spawn proven; evidence: ${evidence}`);
+      } catch (error) {
+        try { capture(s, 'spawn-failure'); } catch {}
+        cleanup(s);
+        throw error;
+      }
+    }
+  }
+} catch (error) {
+  console.error(error.stack || error);
+  process.exitCode = 1;
+}
