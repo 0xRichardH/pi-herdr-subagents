@@ -6,6 +6,7 @@ import type {
   BuiltHarnessCommand,
 } from "../types.ts";
 import type { ResolvedRuntimePlan } from "../../runtime-routing.ts";
+import { getSubagentActivityFile } from "../../activity.ts";
 
 const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
 
@@ -133,7 +134,7 @@ export class PiHarnessDriver implements HarnessDriver {
     }
     envParts.push(`PI_SUBAGENT_SESSION=${shellQuote(subagentSessionFile)}`);
     envParts.push(`PI_SUBAGENT_ID=${shellQuote(params.id)}`);
-    const activityFile = join(artifactDir, `subagent-activity-${params.id}.json`);
+    const activityFile = getSubagentActivityFile(artifactDir, params.id);
     envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
     envParts.push(`PI_SUBAGENT_SURFACE=${shellQuote(surface)}`);
 

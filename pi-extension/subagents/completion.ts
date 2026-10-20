@@ -6,6 +6,8 @@ const TERMINAL_SENTINEL = /__SUBAGENT_DONE_(\d+)__/;
 export interface CompletionResult {
   reason: "done" | "ping" | "sentinel" | "error";
   exitCode: number;
+  /** The child completed its one-shot report-only continuation after a time warning. */
+  wrapup?: boolean;
   ping?: { name: string; message: string };
   errorMessage?: string;
 }
@@ -31,6 +33,7 @@ export function interpretExitSidecar(data: unknown): CompletionResult {
     name?: unknown;
     message?: unknown;
     errorMessage?: unknown;
+    wrapup?: unknown;
   };
 
   if (payload?.type === "ping") {
@@ -52,7 +55,9 @@ export function interpretExitSidecar(data: unknown): CompletionResult {
     return { reason: "error", exitCode: 1, errorMessage };
   }
 
-  if (payload?.type === "done") return { reason: "done", exitCode: 0 };
+  if (payload?.type === "done") {
+    return { reason: "done", exitCode: 0, ...(payload.wrapup === true ? { wrapup: true } : {}) };
+  }
 
   return {
     reason: "error",
