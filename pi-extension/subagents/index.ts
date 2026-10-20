@@ -1435,7 +1435,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // subagents whose watchers survived a reload.
   pi.on("session_start", (_event, ctx) => {
     runtime.latestCtx = ctx;
-    runtime.modelCatalog = buildAuthenticatedModelCatalog(wrapPiModelRegistry(ctx.modelRegistry));
+    runtime.modelCatalog = buildAuthenticatedModelCatalog(
+      wrapPiModelRegistry(ctx.modelRegistry),
+      24,
+      ctx.scopedModels.map(({ model }) => model),
+    );
     runtime.agentCatalog = buildAvailableAgentCatalog(
       discoverAgentDefinitions().filter((agent) => !agent.disableModelInvocation),
     );
