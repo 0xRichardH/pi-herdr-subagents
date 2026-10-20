@@ -267,6 +267,25 @@ describe("Claude Harness Driver", () => {
     );
   });
 
+  it("passes explicit autonomous completion mode, including resumed sessions", () => {
+    const built = driver.buildCommand(createMockLaunchContext({
+      params: { id: "abc12345", name: "worker", task: "Follow-up", resumeSessionId: "previous-session" },
+      effectiveAutoExit: true,
+    }));
+    assert.match(built.command, /PI_CLAUDE_AUTO_EXIT=1 claude/);
+    assert.match(built.command, /--resume 'previous-session'/);
+  });
+
+  it("disables Stop completion for non-auto-exit sessions", () => {
+    const built = driver.buildCommand(createMockLaunchContext({ effectiveAutoExit: false }));
+    assert.match(built.command, /PI_CLAUDE_AUTO_EXIT=0 claude/);
+  });
+
+  it("does not confuse status-notification preferences with completion mode", () => {
+    const built = driver.buildCommand(createMockLaunchContext({ effectiveAutoExit: true, effectiveInteractive: true }));
+    assert.match(built.command, /PI_CLAUDE_AUTO_EXIT=1 claude/);
+  });
+
   it("rejects thinking-level overrides for Claude CLI subagents", () => {
     assert.throws(
       () => driver.validateRuntimePlan({

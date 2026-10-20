@@ -65,6 +65,7 @@ export class ClaudeHarnessDriver implements HarnessDriver {
 
     const cmdParts: string[] = [];
     cmdParts.push(`PI_CLAUDE_SENTINEL=${shellQuote(sentinelFile)}`);
+    cmdParts.push(`PI_CLAUDE_AUTO_EXIT=${context.effectiveAutoExit ? "1" : "0"}`);
     cmdParts.push("claude");
     cmdParts.push("--dangerously-skip-permissions");
 
