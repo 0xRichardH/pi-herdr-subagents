@@ -1,6 +1,6 @@
 # pi-herdr-subagents
 
-Async subagents for [pi](https://github.com/badlogic/pi-mono) running exclusively in [herdr](https://herdr.dev). Spawn, orchestrate, and manage sub-agent sessions in dedicated herdr tabs or panes. **Fully non-blocking** — the main agent keeps working while subagents run in the background.
+Async subagents for [pi](https://github.com/earendil-works/pi) running exclusively in [herdr](https://herdr.dev). Spawn, orchestrate, and manage sub-agent sessions in dedicated herdr tabs or panes. **Fully non-blocking** — the main agent keeps working while subagents run in the background.
 
 ## How It Works
 
@@ -542,7 +542,7 @@ Every sub-agent session displays a compact tools widget showing available and de
 
 ## Requirements
 
-- [pi](https://github.com/badlogic/pi-mono) — the coding agent
+- [pi](https://github.com/earendil-works/pi) 1.3.x, minimum 1.3.0. The extension is tested on this line only.
 - [herdr](https://herdr.dev) — the required terminal workspace
 
 ```bash

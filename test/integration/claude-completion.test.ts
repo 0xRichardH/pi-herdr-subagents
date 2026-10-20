@@ -77,6 +77,7 @@ setInterval(() => {}, 60000); // Simulate the Claude TUI remaining open after St
         model,
         modelRegistry: { find: (provider: string, id: string) => provider === "test" && id === "model" ? model : undefined, getAvailable: () => [model], hasConfiguredAuth: () => true },
         sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => env.workspaceId, getSessionDir: () => env.dir },
+        scopedModels: [],
         hasUI: false,
         ui: { setWidget() {} },
       };
