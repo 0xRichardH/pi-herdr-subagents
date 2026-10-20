@@ -48,6 +48,8 @@ export interface SubagentLaunchContext {
   inheritsConversationContext: boolean;
   taskDelivery: "direct" | "artifact";
   denySet?: Set<string>;
+  /** PI_SUBAGENT_SPAWN_DEPTH handed to this child (its children's ceiling); null = unlimited. */
+  childSpawnDepth?: number | null;
   identity?: string | null;
   identityInSystemPrompt?: boolean;
   systemPromptMode?: string;
