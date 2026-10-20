@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
+import { captureGuidanceRequests } from "./guidance-session.ts";
 import {
   cleanupSubagentsForShutdown,
   selectCompletionApi,
@@ -2046,85 +2047,25 @@ describe("commands", () => {
 
 describe("tool registration", () => {
   it("advertises named agents and tells callers to preserve their runtime defaults", async () => {
-    await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
-      writeAgentFile(
-        globalAgentsDir,
-        "researcher",
-        [
-          "name: researcher",
-          "description: Researches external topics using authoritative sources",
-          "model: fake/research",
-          "thinking: max",
-        ].join("\n"),
-      );
+    const [{ prompt }] = await captureGuidanceRequests();
+    assert.match(prompt, /Available named subagents/);
+    assert.match(prompt, /researcher.*Researches external topics using authoritative sources/);
+    assert.match(prompt, /omit.*model.*thinking.*named agent.*defaults/i);
 
-      const { api, registeredTools, eventHandlers } = createMockExtensionApi();
-      (subagentsModule as any).default(api);
-
-      const subagent = registeredTools.find((tool) => tool.name === "subagent");
-      assert.ok(subagent);
-      const sessionStart = eventHandlers.get("session_start")?.[0];
-      assert.ok(sessionStart);
-      sessionStart({}, {
-        hasUI: false,
-        scopedModels: [],
-        modelRegistry: {
-          find: (provider: string, id: string) => ({ provider, id, reasoning: true }),
-          getAvailable: () => [{
-            provider: "fake",
-            id: "parent",
-            reasoning: true,
-            input: ["text"],
-            contextWindow: 128_000,
-            maxTokens: 16_000,
-            cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
-          }],
-          hasConfiguredAuth: () => true,
-        },
-      });
-
-      const guidance = subagent.promptGuidelines.join("\n");
-      assert.match(guidance, /Available named subagents/);
-      assert.match(
-        guidance,
-        /researcher.*Researches external topics using authoritative sources/,
-      );
-      assert.match(guidance, /omit.*model.*thinking.*named agent.*defaults/i);
-      assert.match(
-        subagent.parameters.properties.thinking.description,
-        /named agent's thinking default/i,
-      );
-    });
-  });
-
-  it("refreshes subagent routing guidance from the live authenticated model registry", () => {
-    const { api, registeredTools, eventHandlers } = createMockExtensionApi();
+    const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
-
     const subagent = registeredTools.find((tool) => tool.name === "subagent");
     assert.ok(subagent);
-    const sessionStart = eventHandlers.get("session_start")?.[0];
-    assert.ok(sessionStart);
-    sessionStart({}, {
-      hasUI: false,
-      scopedModels: [],
-      modelRegistry: {
-        find: (provider: string, id: string) => ({ provider, id, reasoning: true }),
-        getAvailable: () => [{
-          provider: "fake",
-          id: "fast",
-          reasoning: true,
-          input: ["text"],
-          contextWindow: 128_000,
-          maxTokens: 16_000,
-          cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
-        }],
-        hasConfiguredAuth: () => true,
-      },
-    });
+    assert.match(
+      subagent.parameters.properties.thinking.description,
+      /named agent's thinking default/i,
+    );
+  });
 
-    assert.match(subagent.promptGuidelines.join("\n"), /fake\/fast/);
-    assert.match(subagent.promptGuidelines.join("\n"), /inherit the parent runtime/);
+  it("delivers subagent routing guidance from the live authenticated model registry", async () => {
+    const [{ prompt }] = await captureGuidanceRequests();
+    assert.match(prompt, /guidance-test\/fast/);
+    assert.match(prompt, /inherit the parent runtime/);
   });
 
   it("ignores an inherited deny list in a parent process", () => {
