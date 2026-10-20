@@ -2067,6 +2067,7 @@ describe("tool registration", () => {
       assert.ok(sessionStart);
       sessionStart({}, {
         hasUI: false,
+        scopedModels: [],
         modelRegistry: {
           find: (provider: string, id: string) => ({ provider, id, reasoning: true }),
           getAvailable: () => [{
@@ -2106,6 +2107,7 @@ describe("tool registration", () => {
     assert.ok(sessionStart);
     sessionStart({}, {
       hasUI: false,
+      scopedModels: [],
       modelRegistry: {
         find: (provider: string, id: string) => ({ provider, id, reasoning: true }),
         getAvailable: () => [{
