@@ -138,8 +138,8 @@ describe("Claude Stop completion hook", () => {
   });
 
   it("does not act outside a Pi-spawned session", () => {
-    fixture([user("Task")], ({ sentinel, transcript }) => {
-      runHook(undefined, { transcript_path: transcript, last_assistant_message: "Result" });
+    fixture([user("Task")], ({ sentinel }) => {
+      runHook(undefined, undefined);
       assert.equal(existsSync(sentinel), false);
     });
   });
