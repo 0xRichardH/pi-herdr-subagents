@@ -135,10 +135,15 @@ export function createHerdrSurface(name: string): string {
   const output = herdrExec([
     "tab",
     "create",
+    "--workspace",
+    getHerdrCurrentPaneInfo().workspace_id,
     "--label",
     name,
     "--cwd",
     process.cwd(),
+    // An Oh My Zsh update prompt can consume the launch command before the shell is ready.
+    "--env",
+    "DISABLE_AUTO_UPDATE=true",
     "--no-focus",
   ]);
   const paneId = extractHerdrRootPaneId(output, "tab create");
@@ -168,6 +173,8 @@ export function createHerdrSurfaceSplit(
     "--no-focus",
     "--cwd",
     process.cwd(),
+    "--env",
+    "DISABLE_AUTO_UPDATE=true",
   ]);
   const paneId = extractHerdrPaneId(output, "pane split");
   if (direction === "left" || direction === "up") {

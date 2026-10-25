@@ -158,11 +158,8 @@ export function getFocusedSurface(backend: MuxBackend): string | null {
 
   if (backend === "herdr") {
     try {
-      const workspaceId = process.env.HERDR_WORKSPACE_ID;
-      if (!workspaceId) return null;
-      const info = execFileSync("herdr", ["pane", "list", "--workspace", workspaceId], {
-        encoding: "utf8",
-      });
+      // The user may be focused in a different workspace from the caller.
+      const info = execFileSync("herdr", ["pane", "list"], { encoding: "utf8" });
       const panes = JSON.parse(info)?.result?.panes;
       return Array.isArray(panes)
         ? panes.find((pane: { focused?: boolean; pane_id?: string }) => pane.focused)?.pane_id ?? null

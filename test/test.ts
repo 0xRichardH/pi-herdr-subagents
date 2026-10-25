@@ -32,7 +32,12 @@ import {
   selectZellijStackPlacement,
   __muxTest__,
 } from "../pi-extension/subagents/cmux.ts";
-import { isHerdrAvailable, __herdrTest__ } from "../pi-extension/subagents/herdr.ts";
+import {
+  isHerdrAvailable,
+  createHerdrSurface,
+  createHerdrSurfaceSplit,
+  __herdrTest__,
+} from "../pi-extension/subagents/herdr.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -989,24 +994,26 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("bundled scout/worker/reviewer agents resolve as non-interactive; planner resolves as interactive", () => {
-    for (const name of ["scout", "worker", "reviewer"]) {
-      const defs = testApi.loadAgentDefaults(name);
-      assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
-      assert.equal(
-        testApi.resolveEffectiveInteractive({ name, task: "" }, defs),
-        false,
-        `${name} should resolve as non-interactive (autonomous)`,
-      );
-    }
+  it("bundled scout/worker/reviewer agents resolve as non-interactive; planner resolves as interactive", async () => {
+    await withIsolatedAgentEnv(() => {
+      for (const name of ["scout", "worker", "reviewer"]) {
+        const defs = testApi.loadAgentDefaults(name);
+        assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
+        assert.equal(
+          testApi.resolveEffectiveInteractive({ name, task: "" }, defs),
+          false,
+          `${name} should resolve as non-interactive (autonomous)`,
+        );
+      }
 
-    const planner = testApi.loadAgentDefaults("planner");
-    assert.ok(planner, "expected bundled planner to be discoverable");
-    assert.equal(
-      testApi.resolveEffectiveInteractive({ name: "planner", task: "" }, planner),
-      true,
-      "planner should resolve as interactive (no auto-exit)",
-    );
+      const planner = testApi.loadAgentDefaults("planner");
+      assert.ok(planner, "expected bundled planner to be discoverable");
+      assert.equal(
+        testApi.resolveEffectiveInteractive({ name: "planner", task: "" }, planner),
+        true,
+        "planner should resolve as interactive (no auto-exit)",
+      );
+    });
   });
 
   it("ignores invalid session-mode values", async () => {
@@ -2386,6 +2393,44 @@ describe("cmux.ts", () => {
 });
 
 describe("herdr.ts", () => {
+  it("creates tabs in the caller workspace and suppresses child shell update prompts", () => {
+    withTempDir((dir) => {
+      const log = join(dir, "calls.jsonl");
+      writeFileSync(join(dir, "herdr"), `#!/usr/bin/env node
+const fs = require("node:fs");
+fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(process.argv.slice(2)) + "\\n");
+console.log(JSON.stringify({result: {root_pane: {pane_id: "wA:p2"}, pane: {pane_id: "wA:p3"}}}));
+`, { mode: 0o755 });
+      const env = {
+        PATH: process.env.PATH,
+        HERDR_WORKSPACE_ID: process.env.HERDR_WORKSPACE_ID,
+        HERDR_TAB_ID: process.env.HERDR_TAB_ID,
+        HERDR_PANE_ID: process.env.HERDR_PANE_ID,
+      };
+      Object.assign(process.env, {
+        PATH: `${dir}:${env.PATH ?? ""}`,
+        HERDR_WORKSPACE_ID: "wA",
+        HERDR_TAB_ID: "wA:t1",
+        HERDR_PANE_ID: "wA:p1",
+      });
+      try {
+        assert.equal(createHerdrSurface("test tab"), "wA:p2");
+        assert.equal(createHerdrSurfaceSplit("test split", "right"), "wA:p3");
+        const calls = readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+        const tab = calls.find((args) => args[0] === "tab" && args[1] === "create");
+        const split = calls.find((args) => args[0] === "pane" && args[1] === "split");
+        assert.equal(tab[tab.indexOf("--workspace") + 1], "wA");
+        assert.equal(split[split.indexOf("--pane") + 1], "wA:p1");
+        for (const args of [tab, split]) {
+          assert.equal(args[args.indexOf("--env") + 1], "DISABLE_AUTO_UPDATE=true");
+          assert.ok(args.includes("--no-focus"));
+        }
+      } finally {
+        for (const [key, value] of Object.entries(env)) restoreEnvVar(key, value);
+      }
+    });
+  });
+
   describe("isHerdrAvailable", () => {
     it("requires Herdr's explicit pane context", () => {
       const previousEnv = process.env.HERDR_ENV;

@@ -53,6 +53,8 @@ zellij --session pi   # then run: pi
 
 Herdr takes precedence when an outer terminal or multiplexer leaves its environment variables in the Herdr pane. Optional: set `PI_SUBAGENT_MUX=herdr|cmux|tmux|zellij|wezterm` to force a specific backend.
 
+Herdr subagent tabs stay in the caller's workspace. New subagent shells receive `DISABLE_AUTO_UPDATE=true` so Oh My Zsh's update prompt does not consume their launch command; normal user shells are unchanged.
+
 If your shell startup is slow and subagent commands sometimes get dropped before the prompt is ready, set `PI_SUBAGENT_SHELL_READY_DELAY_MS` to a higher value (defaults to `500`):
 
 ```bash
