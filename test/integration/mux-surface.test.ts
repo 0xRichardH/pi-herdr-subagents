@@ -6,6 +6,7 @@
  * No LLM calls — fast and free.
  *
  * Run inside a supported multiplexer:
+ *   herdr                 # then run: npm run test:integration
  *   cmux bash -c 'npm run test:integration'
  *   tmux new 'npm run test:integration'
  *   zellij --session pi  # then run: npm run test:integration
@@ -24,6 +25,7 @@ import {
   focusSurface,
   getFocusedSurface,
   getSurfacePane,
+  getHerdrPaneRect,
   waitForFocusedSurface,
   untrackSurface,
   sendCommand,
@@ -45,7 +47,7 @@ const FOCUS_TEST_SHELL_READY_DELAY_MS = Number(process.env.PI_SUBAGENT_SHELL_REA
 
 if (backends.length === 0) {
   console.log("⚠️  No mux backend available — skipping mux-surface integration tests");
-  console.log("   Run inside cmux or tmux to enable these tests.");
+  console.log("   Run inside herdr, cmux, tmux, or zellij to enable these tests.");
 }
 
 for (const backend of backends) {
@@ -64,17 +66,14 @@ for (const backend of backends) {
     });
 
     it("keeps focus on the active surface while creating and targeting subagent surfaces", async () => {
-      // herdr and wezterm don't expose absolute pane focusing via CLI —
-      // herdr only has directional focus, wezterm has no focus helpers at all.
-      // The --no-focus behavior these backends use for surface creation is
-      // already covered by the other mux-surface tests.
-      if (backend === "herdr" || backend === "wezterm") return;
-
-      const anchor = createTrackedSurfaceSplit(env, "focus-anchor", "right");
-      await sleep(1000);
-
-      focusSurface(backend, anchor);
-      await waitForFocusedSurface(backend, anchor, 10_000);
+      let anchor = getFocusedSurface(backend);
+      if (backend !== "herdr") {
+        anchor = createTrackedSurfaceSplit(env, "focus-anchor", "right");
+        await sleep(1000);
+        focusSurface(backend, anchor);
+        await waitForFocusedSurface(backend, anchor, 10_000);
+      }
+      assert.ok(anchor, `Expected a focused ${backend} surface`);
 
       const childA = createTrackedSurface(env, "focus-child-a");
       await sleep(FOCUS_TEST_SHELL_READY_DELAY_MS);
@@ -103,6 +102,43 @@ for (const backend of backends) {
       ]);
       assert.equal(getFocusedSurface(backend), anchor);
     });
+
+    if (backend === "herdr") {
+      it("creates an explicit split from the requested parent pane", async () => {
+        const surface = createTrackedSurfaceSplit(
+          env,
+          "herdr-split-test",
+          "right",
+          process.env.HERDR_PANE_ID,
+        );
+        await sleep(1000);
+
+        const marker = uniqueId();
+        sendCommand(surface, `echo "HERDR_SPLIT_${marker}"`);
+        await waitForScreen(surface, new RegExp(`HERDR_SPLIT_${marker}`), 10_000, 50);
+
+        closeSurface(surface);
+        untrackSurface(env, surface);
+      });
+
+      it("honors left and up split placement", async () => {
+        const parent = process.env.HERDR_PANE_ID;
+        assert.ok(parent, "Expected HERDR_PANE_ID");
+
+        for (const direction of ["left", "up"] as const) {
+          const surface = createTrackedSurfaceSplit(env, `herdr-${direction}-test`, direction, parent);
+          const childRect = getHerdrPaneRect(surface);
+          const parentRect = getHerdrPaneRect(parent);
+          assert.ok(childRect && parentRect, `Expected Herdr layout for ${direction} split`);
+          assert.ok(
+            direction === "left" ? childRect.x < parentRect.x : childRect.y < parentRect.y,
+            `Expected child ${surface} ${direction} of parent ${parent}`,
+          );
+          closeSurface(surface);
+          untrackSurface(env, surface);
+        }
+      });
+    }
 
     it("creates a surface, sends a command, reads output, and closes it", async () => {
       const surface = createTrackedSurface(env, "echo-test");

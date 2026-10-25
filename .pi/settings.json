@@ -4,6 +4,11 @@
       "source": "git:github.com/HazAT/pi-interactive-subagents",
       "extensions": [],
       "skills": []
+    },
+    {
+      "source": "git:github.com/mfractal/pi-interactive-subagents@feat/herdr-mux-support",
+      "extensions": [],
+      "skills": []
     }
   ],
   "extensions": [

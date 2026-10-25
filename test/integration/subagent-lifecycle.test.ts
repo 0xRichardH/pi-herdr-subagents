@@ -9,6 +9,7 @@
  * Duration: ~30-90s per test.
  *
  * Run inside a supported multiplexer:
+ *   herdr                 # then run: npm run test:integration
  *   cmux bash -c 'npm run test:integration'
  *   tmux new 'npm run test:integration'
  *
@@ -41,7 +42,7 @@ const backends = getAvailableBackends();
 
 if (backends.length === 0) {
   console.log("⚠️  No mux backend available — skipping subagent lifecycle integration tests");
-  console.log("   Run inside cmux or tmux to enable these tests.");
+  console.log("   Run inside herdr, cmux, tmux, or zellij to enable these tests.");
 }
 
 for (const backend of backends) {

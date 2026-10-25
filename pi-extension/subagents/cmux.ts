@@ -20,6 +20,7 @@ const execFileAsync = promisify(execFile);
 
 export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm" | "herdr";
 
+const AUTO_BACKEND_ORDER: readonly MuxBackend[] = ["herdr", "cmux", "tmux", "zellij", "wezterm"];
 const commandAvailability = new Map<string, boolean>();
 
 function hasCommand(command: string): boolean {
@@ -91,21 +92,28 @@ export function isWezTermAvailable(): boolean {
   return isWezTermRuntimeAvailable();
 }
 
-export function getMuxBackend(): MuxBackend | null {
-  const pref = muxPreference();
-  if (pref === "cmux") return isCmuxRuntimeAvailable() ? "cmux" : null;
-  if (pref === "tmux") return isTmuxRuntimeAvailable() ? "tmux" : null;
-  if (pref === "zellij") return isZellijRuntimeAvailable() ? "zellij" : null;
-  if (pref === "wezterm") return isWezTermRuntimeAvailable() ? "wezterm" : null;
-  if (pref === "herdr") return isHerdrAvailable() ? "herdr" : null;
-
-  if (isCmuxRuntimeAvailable()) return "cmux";
-  if (isTmuxRuntimeAvailable()) return "tmux";
-  if (isZellijRuntimeAvailable()) return "zellij";
-  if (isWezTermRuntimeAvailable()) return "wezterm";
-  if (isHerdrAvailable()) return "herdr";
-  return null;
+function isBackendAvailable(backend: MuxBackend): boolean {
+  if (backend === "herdr") return isHerdrAvailable();
+  if (backend === "cmux") return isCmuxRuntimeAvailable();
+  if (backend === "tmux") return isTmuxRuntimeAvailable();
+  if (backend === "zellij") return isZellijRuntimeAvailable();
+  return isWezTermRuntimeAvailable();
 }
+
+function selectMuxBackend(
+  preference: MuxBackend | null,
+  available: (backend: MuxBackend) => boolean,
+): MuxBackend | null {
+  if (preference) return available(preference) ? preference : null;
+  return AUTO_BACKEND_ORDER.find(available) ?? null;
+}
+
+export function getMuxBackend(): MuxBackend | null {
+  // Herdr comes first because its panes can inherit outer mux environment variables.
+  return selectMuxBackend(muxPreference(), isBackendAvailable);
+}
+
+export const __muxTest__ = { selectMuxBackend };
 
 export function isMuxAvailable(): boolean {
   return getMuxBackend() !== null;
@@ -128,7 +136,7 @@ export function muxSetupHint(): string {
   if (pref === "herdr") {
     return "Start pi inside herdr (`herdr`, then run `pi`).";
   }
-  return "Start pi inside cmux (`cmux pi`), tmux (`tmux new -A -s pi 'pi'`), zellij (`zellij --session pi`, then run `pi`), WezTerm, or herdr (`herdr`, then run `pi`).";
+  return "Start pi inside herdr (`herdr`, then run `pi`), cmux (`cmux pi`), tmux (`tmux new -A -s pi 'pi'`), zellij (`zellij --session pi`, then run `pi`), or WezTerm.";
 }
 
 function requireMuxBackend(): MuxBackend {
@@ -765,8 +773,9 @@ function createCmuxSplitSurface(
  * tabs to that same pane (avoiding ever-narrower splits).
  * For zellij: chooses a tab-aware tiled or stacked placement.
  * For tmux/wezterm: falls back to split behavior.
+ * For herdr: creates a background tab.
  *
- * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm, `1-2` in herdr).
+ * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm, `w1:p2` in herdr).
  */
 export function createSurface(name: string): string {
   const backend = getMuxBackend();
@@ -831,7 +840,7 @@ function createSurfaceInPane(name: string, pane: string): string {
 
 /**
  * Create a new split in the given direction from an optional source pane.
- * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm, `1-2` in herdr).
+ * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm, `w1:p2` in herdr).
  */
 export function createSurfaceSplit(
   name: string,
@@ -841,7 +850,7 @@ export function createSurfaceSplit(
   const backend = requireMuxBackend();
 
   if (backend === "herdr") {
-    return createHerdrSurfaceSplit(name, direction);
+    return createHerdrSurfaceSplit(name, direction, fromSurface);
   }
 
   if (backend === "cmux") {
