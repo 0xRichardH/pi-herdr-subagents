@@ -2,6 +2,12 @@
   "status": {
     "enabled": true
   },
+  "environment": {
+    "allowOutsideHerdr": false
+  },
+  "behavior": {
+    "closeOnDone": true
+  },
   "models": {
     "agents": {}
   }
