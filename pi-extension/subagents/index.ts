@@ -40,7 +40,8 @@ import {
   buildSubagentToolAllowlist,
   buildPiPromptArgs,
 } from "./harness/index.ts";
-import { loadModelConfig, resolveModelDefault, type ModelConfig } from "./model-config.ts";
+import { resolveModelDefault, type ModelConfig } from "./model-config.ts";
+import { getSubagentConfig } from "./config.ts";
 
 import {
   findLastAssistantMessage,
@@ -54,7 +55,6 @@ import {
   formatElapsedDuration,
   formatStatusAggregate,
   normalizeStatusName,
-  loadStatusConfig,
 } from "./status.ts";
 import {
   getSubagentActivityFile,
@@ -347,7 +347,7 @@ function discoverAgentDefinitions(): ListedAgentDefinition[] {
 function buildAvailableAgentCatalog(
   agents: ListedAgentDefinition[],
   limit = 24,
-  config: ModelConfig = modelConfig,
+  modelConfig: ModelConfig = config.models,
 ): string {
   const sorted = [...agents].sort((a, b) => a.name.localeCompare(b.name));
   const visible = sorted.slice(0, limit);
@@ -356,7 +356,7 @@ function buildAvailableAgentCatalog(
   ];
 
   for (const agent of visible) {
-    const effectiveModel = resolveModelDefault(agent.name, agent.model, config);
+    const effectiveModel = resolveModelDefault(agent.name, agent.model, modelConfig);
     const defaults = [
       effectiveModel ? `model ${effectiveModel}` : undefined,
       agent.thinking ? `thinking ${agent.thinking}` : undefined,
@@ -515,8 +515,7 @@ function getArtifactDir(sessionDir: string, sessionId: string): string {
   return join(sessionDir, "artifacts", sessionId);
 }
 
-const statusConfig = loadStatusConfig();
-const modelConfig = loadModelConfig();
+const config = getSubagentConfig();
 
 function resolveResultPresentation(
   result: Pick<
@@ -783,7 +782,7 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
     const runtimeTag = agent.runtimePlan
       ? `${agent.runtimePlan.modelId}|${agent.runtimePlan.thinking} · `
       : "";
-    const right = statusConfig.enabled
+    const right = config.status.enabled
       ? ` ${runtimeTag}${formatLifecycleWidgetLabel(projection, now).trim()} `
       : agent.cli && agent.cli !== "pi"
         ? ` ${runtimeTag}running… `
@@ -1005,7 +1004,7 @@ function handleSubagentInterrupt(
 }
 
 function startStatusRefresh(pi: ExtensionAPI) {
-  if (!statusConfig.enabled || statusInterval) return;
+  if (!config.status.enabled || statusInterval) return;
 
   statusInterval = setInterval(() => {
     if (runningSubagents.size === 0) {
@@ -1052,11 +1051,11 @@ function startStatusRefresh(pi: ExtensionAPI) {
     if (shouldRefreshWidget) updateWidget();
 
     if (transitionLines.length > 0) {
-      const capped = capStatusLines(transitionLines, statusConfig.lineLimit);
+      const capped = capStatusLines(transitionLines, config.status.lineLimit);
       pi.sendMessage(
         {
           customType: "subagent_status",
-          content: formatStatusAggregate(transitionLines, statusConfig.lineLimit),
+          content: formatStatusAggregate(transitionLines, config.status.lineLimit),
           display: true,
           details: { lines: capped.visibleLines, overflow: capped.overflow },
         },
@@ -1136,7 +1135,7 @@ async function launchSubagent(
   const runtimePlan = resolveRuntimePlan(
     { model: params.model, thinking: params.thinking },
     {
-      model: resolveModelDefault(params.agent, agentDefs?.model, modelConfig),
+      model: resolveModelDefault(params.agent, agentDefs?.model, config.models),
       thinking: agentDefs?.thinking,
     },
     { provider: ctx.model.provider, modelId: ctx.model.id, thinking: parentThinking },

@@ -1,5 +1,6 @@
 import { execFile, execSync, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
+import { getEnvironmentConfig } from "./config.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -36,8 +37,18 @@ function hasCommand(command: string): boolean {
   return available;
 }
 
+let serverAvailable = false;
+
+function herdrServerReachable(): boolean {
+  if (!serverAvailable) serverAvailable = listHerdrWorkspaces() !== null;
+  return serverAvailable;
+}
+
 export function isHerdrAvailable(): boolean {
-  return process.env.HERDR_ENV === "1" && hasCommand("herdr");
+  if (!hasCommand("herdr")) return false;
+  if (process.env.HERDR_ENV === "1") return true;
+  if (!getEnvironmentConfig().allowOutsideHerdr) return false;
+  return herdrServerReachable();
 }
 
 function parseHerdrJson(value: string): unknown {
@@ -76,42 +87,62 @@ async function herdrExecAsync(args: string[]): Promise<string> {
   return stdout;
 }
 
-function getHerdrParentPaneId(): string {
-  const paneId = process.env.HERDR_PANE_ID;
-  if (!paneId) {
-    throw new Error("HERDR_PANE_ID not set");
-  }
-  return paneId;
+type PaneIdentity = {
+  pane_id?: string;
+  tab_id?: string;
+  workspace_id?: string;
+};
+
+function parseCurrentPane(output: string): PaneIdentity {
+  const parsed = parseHerdrJson(output) as { result?: { pane?: Record<string, unknown> } } | null;
+  const pane = parsed?.result?.pane;
+  return {
+    pane_id: typeof pane?.pane_id === "string" ? pane.pane_id : undefined,
+    tab_id: typeof pane?.tab_id === "string" ? pane.tab_id : undefined,
+    workspace_id: typeof pane?.workspace_id === "string" ? pane.workspace_id : undefined,
+  };
 }
 
-function getHerdrCurrentPaneInfo(): {
-  pane_id: string;
-  tab_id: string;
-  workspace_id: string;
-} {
-  const paneId = process.env.HERDR_PANE_ID;
-  const tabId = process.env.HERDR_TAB_ID;
-  const workspaceId = process.env.HERDR_WORKSPACE_ID;
+function parseFirstWorkspaceId(output: string): string | null {
+  const parsed = parseHerdrJson(output) as {
+    result?: { workspaces?: unknown };
+    workspaces?: unknown;
+  } | null;
+  const workspaces = parsed?.result?.workspaces ?? parsed?.workspaces;
+  if (!Array.isArray(workspaces)) return null;
+  const first = workspaces[0];
+  if (first == null || typeof first !== "object") return null;
+  const id = (first as { workspace_id?: unknown }).workspace_id;
+  return typeof id === "string" && id ? id : null;
+}
 
-  // Fall back to `herdr pane current` if any identity env var is missing —
-  // older herdr versions may not set all three.
-  if (!paneId || !tabId || !workspaceId) {
-    const output = herdrExec(["pane", "current"]);
-    const parsed = parseHerdrJson(output);
-    const pane = (parsed as { result?: { pane?: unknown } } | null)?.result?.pane as
-      | { pane_id?: string; tab_id?: string; workspace_id?: string }
-      | undefined;
-    if (!pane?.pane_id || !pane?.tab_id || !pane?.workspace_id) {
-      throw new Error(`Unexpected herdr pane current output: ${output.trim() || "(empty)"}`);
-    }
-    return {
-      pane_id: pane.pane_id,
-      tab_id: pane.tab_id,
-      workspace_id: pane.workspace_id,
-    };
+function readCurrentPane(): PaneIdentity {
+  try {
+    return parseCurrentPane(herdrExec(["pane", "current"]));
+  } catch {
+    return {};
   }
+}
 
-  return { pane_id: paneId, tab_id: tabId, workspace_id: workspaceId };
+function listHerdrWorkspaces(): string | null {
+  try {
+    return herdrExec(["workspace", "list"]);
+  } catch {
+    return null;
+  }
+}
+
+export function getHerdrParentPaneId(): string | null {
+  return process.env.HERDR_PANE_ID || readCurrentPane().pane_id || null;
+}
+
+function resolveHerdrWorkspaceId(): string {
+  const workspaceId = process.env.HERDR_WORKSPACE_ID || readCurrentPane().workspace_id;
+  if (workspaceId) return workspaceId;
+  const output = listHerdrWorkspaces();
+  const fallback = output === null ? null : parseFirstWorkspaceId(output);
+  if (fallback) return fallback;
+  throw new Error("Cannot resolve a herdr workspace from HERDR_WORKSPACE_ID, pane current, or workspace list.");
 }
 
 function buildTabCreateArgs(name: string, cwd: string, workspaceId: string): string[] {
@@ -129,10 +160,7 @@ function buildTabCreateArgs(name: string, cwd: string, workspaceId: string): str
 }
 
 export function createHerdrSurface(name: string): string {
-  // Create a new tab per subagent so parallel spawns each get a full tab
-  // instead of ever-narrower splits of the parent pane. Target the current
-  // workspace explicitly because Herdr's implicit default may be another space.
-  const { workspace_id: workspaceId } = getHerdrCurrentPaneInfo();
+  const workspaceId = resolveHerdrWorkspaceId();
   const output = herdrExec(buildTabCreateArgs(name, process.cwd(), workspaceId));
   const paneId = extractHerdrRootPaneId(output, "tab create");
   try {
@@ -163,8 +191,8 @@ function buildPaneSplitArgs(
 export function createHerdrSurfaceSplit(
   name: string,
   direction: "right" | "down",
+  parentPaneId: string,
 ): string {
-  const parentPaneId = getHerdrParentPaneId();
   const output = herdrExec(buildPaneSplitArgs(parentPaneId, direction, process.cwd()));
   const paneId = extractHerdrPaneId(output, "pane split");
   try {
@@ -277,12 +305,13 @@ export function closeHerdrSurface(surface: string): void {
 }
 
 export function renameHerdrTab(title: string): void {
-  const { tab_id: tabId } = getHerdrCurrentPaneInfo();
+  const tabId = process.env.HERDR_TAB_ID || readCurrentPane().tab_id;
+  if (!tabId) throw new Error("Cannot rename herdr tab: no current tab is available.");
   herdrExec(["tab", "rename", tabId, title]);
 }
 
 export function renameHerdrWorkspace(title: string): void {
-  const { workspace_id: workspaceId } = getHerdrCurrentPaneInfo();
+  const workspaceId = resolveHerdrWorkspaceId();
   herdrExec(["workspace", "rename", workspaceId, title]);
 }
 
