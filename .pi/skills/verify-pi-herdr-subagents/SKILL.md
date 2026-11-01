@@ -15,14 +15,18 @@ From the repository root, inside herdr:
 npm ci
 npm test
 npm run lint
-export PI_TEST_MODEL=0xdev/gemini-3-flash
+export PI_TEST_MODEL=0xdev/gemini-3.8-flash
 export PI_TEST_TIMEOUT=180000
 export CONTROL="$PWD/.pi/skills/verify-pi-herdr-subagents/scripts/control-subagents"
 export EVIDENCE="$(git rev-parse --absolute-git-dir)/verification/$(date +%Y%m%d-%H%M%S)-$$"
 "$CONTROL" launch "$EVIDENCE"
 ```
 
-Node 24+, `pi`, `herdr`, `HERDR_ENV=1`, and `HERDR_WORKSPACE_ID` are required. Choose an **exact authenticated model** from `pi --list-models`; the model above worked on the generating host, not a portable credential promise. Runs make real model requests and can incur charges. Keep credentials in the existing Pi configuration; never copy auth files into evidence.
+Node 24+, `pi`, `herdr`, `HERDR_ENV=1`, and `HERDR_WORKSPACE_ID` are required. Run the helper with Node 24 when the default `node` is older, for example `mise exec node@24 -- node "$CONTROL" launch "$EVIDENCE"`. Choose an **exact authenticated model** from `pi --list-models`; the model above is the current working example on this host, not a portable credential promise. `0xdev/gemini-3-flash` no longer exists. Runs make real model requests and can incur charges. Keep credentials in the existing Pi configuration; never copy auth files into evidence.
+
+`launch` forwards `PI_SUBAGENT_LAYOUT` and `PI_SUBAGENT_SHELL_READY_DELAY_MS` from the helper's environment into `launch.sh`. Export `PI_SUBAGENT_LAYOUT=split` or `split:down` before `launch` to drive the split journeys.
+
+The extension also supports `environment.allowOutsideHerdr`, which runs outside a herdr pane. This helper cannot cover that path because `doctor` requires `HERDR_ENV=1`. Report it as untested.
 
 `launch` creates a unique empty scratch project, seeds `verify-worker`, and creates an unfocused **owned herdr workspace**. It starts the working-tree extension explicitly with `pi -e .../index.ts --no-mcp --no-skills --no-context-files --approve --session <evidence>/parent.jsonl --model "$PI_TEST_MODEL" --thinking off`. The exact quoted command is in `launch.sh`. Ready means an authenticated assistant reply matching the generated `VERIFY_READY_…` token, not merely a shell or an open pane. Launch runs doctor after readiness. A readiness failure captures diagnostics and cleans up.
 

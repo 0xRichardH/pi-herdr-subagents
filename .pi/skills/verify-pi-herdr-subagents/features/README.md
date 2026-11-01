@@ -26,11 +26,11 @@ export SCRATCH=$(node -e 'console.log(require(process.argv[1]).scratchDir)' "$EV
 
 ## Proof and failure reporting
 
-Record feature ID and entry point, submitted action, visible result, tool result, and persisted side effect. CLI checks include command, output, and exit status. A provider failure, missing seed/precondition, refused tool call, or unavailable harness is a **failed or blocked journey**, not a pass through another path. Report untested entries separately. Interactive children must be observed directly because parent completion notifications are intentionally suppressed.
+Record feature ID and entry point, submitted action, visible result, tool result, and persisted side effect. CLI checks include command, output, and exit status. A provider failure, missing seed/precondition, refused tool call, or unavailable harness is a **failed or blocked journey**, not a pass through another path. Report untested entries separately. Interactive children suppress stall and recovery steers only; their completion result is still delivered, so observe the child directly for its turn state.
 
 ## Features
 
-- [Spawn and completion](spawn.md): tool and `/subagent` entry points, background execution, parallel children, runtime selection, persisted marker, steering.
+- [Spawn and completion](spawn.md): tool and `/subagent` entry points, background execution, parallel children, runtime selection, persisted marker, steering, split layouts, keep-open panes.
 - [Agent discovery](discovery.md): list definitions, local precedence, hidden agents, slash-command resolution.
 - [Interrupt a child turn](interrupt.md): real Pi tool interruption, surviving child process, no false completion.
 - [Resume a child session](resume.md): resume tool, saved history, continuation and auto-exit choice.
