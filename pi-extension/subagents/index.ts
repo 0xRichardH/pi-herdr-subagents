@@ -40,7 +40,8 @@ import {
   buildSubagentToolAllowlist,
   buildPiPromptArgs,
 } from "./harness/index.ts";
-import { loadModelConfig, resolveModelDefault, type ModelConfig } from "./model-config.ts";
+import { resolveModelDefault, type ModelConfig } from "./model-config.ts";
+import { getSubagentConfig } from "./config.ts";
 
 import {
   findLastAssistantMessage,
@@ -54,7 +55,6 @@ import {
   formatElapsedDuration,
   formatStatusAggregate,
   normalizeStatusName,
-  loadStatusConfig,
 } from "./status.ts";
 import {
   getSubagentActivityFile,
@@ -338,7 +338,7 @@ function discoverAgentDefinitions(): ListedAgentDefinition[] {
 function buildAvailableAgentCatalog(
   agents: ListedAgentDefinition[],
   limit = 24,
-  config: ModelConfig = modelConfig,
+  modelConfig: ModelConfig = config.models,
 ): string {
   const sorted = [...agents].sort((a, b) => a.name.localeCompare(b.name));
   const visible = sorted.slice(0, limit);
@@ -347,7 +347,7 @@ function buildAvailableAgentCatalog(
   ];
 
   for (const agent of visible) {
-    const effectiveModel = resolveModelDefault(agent.name, agent.model, config);
+    const effectiveModel = resolveModelDefault(agent.name, agent.model, modelConfig);
     const defaults = [
       effectiveModel ? `model ${effectiveModel}` : undefined,
       agent.thinking ? `thinking ${agent.thinking}` : undefined,
@@ -506,16 +506,16 @@ function getArtifactDir(sessionDir: string, sessionId: string): string {
   return join(sessionDir, "artifacts", sessionId);
 }
 
-const statusConfig = loadStatusConfig();
-const modelConfig = loadModelConfig();
+const config = getSubagentConfig();
 
 function resolveResultPresentation(
   result: Pick<
     SubagentResult,
-    "exitCode" | "elapsed" | "summary" | "sessionFile" | "errorMessage"
+    "exitCode" | "elapsed" | "summary" | "sessionFile" | "errorMessage" | "keepOpen"
   >,
   name: string,
 ): string {
+  const followUp = result.keepOpen === true ? "\n\nThe pane stayed open for follow-up conversation." : "";
   const sessionRef = result.sessionFile
     ? `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`
     : "";
@@ -530,13 +530,13 @@ function resolveResultPresentation(
       `(provider/agent error — auto-retry exhausted).\n\n` +
       `Error: ${result.errorMessage}\n\n` +
       `The subagent did not produce a result. You can retry by spawning a new ` +
-      `subagent or resume the session with subagent_resume.${sessionRef}`
+      `subagent or resume the session with subagent_resume.${sessionRef}${followUp}`
     );
   }
 
   return result.exitCode !== 0
-    ? `Sub-agent "${name}" failed (exit code ${result.exitCode}).\n\n${result.summary}${sessionRef}`
-    : `Sub-agent "${name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${sessionRef}`;
+    ? `Sub-agent "${name}" failed (exit code ${result.exitCode}).\n\n${result.summary}${sessionRef}${followUp}`
+    : `Sub-agent "${name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${sessionRef}${followUp}`;
 }
 
 /**
@@ -553,6 +553,7 @@ interface SubagentResult {
   error?: string;
   /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
   errorMessage?: string;
+  keepOpen?: boolean;
   ping?: { name: string; message: string };
 }
 
@@ -774,7 +775,7 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
     const runtimeTag = agent.runtimePlan
       ? `${agent.runtimePlan.modelId}|${agent.runtimePlan.thinking} · `
       : "";
-    const right = statusConfig.enabled
+    const right = config.status.enabled
       ? ` ${runtimeTag}${formatLifecycleWidgetLabel(projection, now).trim()} `
       : agent.cli && agent.cli !== "pi"
         ? ` ${runtimeTag}running… `
@@ -996,7 +997,7 @@ function handleSubagentInterrupt(
 }
 
 function startStatusRefresh(pi: ExtensionAPI) {
-  if (!statusConfig.enabled || statusInterval) return;
+  if (!config.status.enabled || statusInterval) return;
 
   statusInterval = setInterval(() => {
     if (runningSubagents.size === 0) {
@@ -1043,11 +1044,11 @@ function startStatusRefresh(pi: ExtensionAPI) {
     if (shouldRefreshWidget) updateWidget();
 
     if (transitionLines.length > 0) {
-      const capped = capStatusLines(transitionLines, statusConfig.lineLimit);
+      const capped = capStatusLines(transitionLines, config.status.lineLimit);
       pi.sendMessage(
         {
           customType: "subagent_status",
-          content: formatStatusAggregate(transitionLines, statusConfig.lineLimit),
+          content: formatStatusAggregate(transitionLines, config.status.lineLimit),
           display: true,
           details: { lines: capped.visibleLines, overflow: capped.overflow },
         },
@@ -1127,7 +1128,7 @@ async function launchSubagent(
   const runtimePlan = resolveRuntimePlan(
     { model: params.model, thinking: params.thinking },
     {
-      model: resolveModelDefault(params.agent, agentDefs?.model, modelConfig),
+      model: resolveModelDefault(params.agent, agentDefs?.model, config.models),
       thinking: agentDefs?.thinking,
     },
     { provider: ctx.model.provider, modelId: ctx.model.id, thinking: parentThinking },
@@ -1317,7 +1318,7 @@ async function watchSubagent(
       });
 
       if (extracted) {
-        closePane(surface);
+        if (result.keepOpen !== true) closePane(surface);
         running.lifecycle = result.exitCode === 0
           ? markCompleted(running.lifecycle, Date.now())
           : markFailed(running.lifecycle, result.errorMessage ?? extracted.summary, Date.now(), result.exitCode);
@@ -1330,6 +1331,7 @@ async function watchSubagent(
           elapsed,
           ...(extracted.sessionId ? { claudeSessionId: extracted.sessionId } : {}),
           ...extracted.details,
+          keepOpen: result.keepOpen,
         };
       }
     }
@@ -1379,7 +1381,7 @@ async function watchSubagent(
           : "Sub-agent exited without output";
     }
 
-    closePane(surface);
+    if (result.keepOpen !== true) closePane(surface);
     running.lifecycle = result.exitCode === 0
       ? markCompleted(running.lifecycle, Date.now())
       : markFailed(running.lifecycle, result.errorMessage ?? summary, Date.now(), result.exitCode);
@@ -1391,6 +1393,7 @@ async function watchSubagent(
       sessionFile,
       exitCode: result.exitCode,
       elapsed,
+      keepOpen: result.keepOpen,
       ping: result.ping,
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
     };

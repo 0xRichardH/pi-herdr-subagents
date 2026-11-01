@@ -6,6 +6,7 @@ import {
   createHerdrSurface,
   createHerdrSurfaceSplit,
   isHerdrAvailable,
+  getHerdrParentPaneId,
   readHerdrScreen,
   readHerdrScreenAsync,
   inspectHerdrPane,
@@ -50,7 +51,10 @@ export function resolveSubagentLayout(env: Record<string, string | undefined> = 
 /** Create the surface for a subagent according to the requested layout. */
 export function createSubagentSurface(name: string, layout: SubagentLayout = "tab"): PaneId {
   assertTerminalAvailable();
-  return layout === "tab" ? createSubagentPane(name) : splitCurrentPane(name, layout);
+  if (layout === "tab") return createSubagentPane(name);
+  const parentPaneId = getHerdrParentPaneId();
+  if (!parentPaneId) return createSubagentPane(name);
+  return createHerdrSurfaceSplit(name, layout, parentPaneId);
 }
 
 export function isTerminalAvailable(): boolean {
@@ -73,12 +77,6 @@ export function shellQuote(value: string): string {
 export function createSubagentPane(name: string): PaneId {
   assertTerminalAvailable();
   return createHerdrSurface(name);
-}
-
-/** Split the current herdr pane and return the child pane ID. */
-export function splitCurrentPane(name: string, direction: SplitDirection): PaneId {
-  assertTerminalAvailable();
-  return createHerdrSurfaceSplit(name, direction);
 }
 
 export function renameCurrentTab(title: string): void {

@@ -7,6 +7,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { writeFileSync } from "node:fs";
+import { getBehaviorConfig } from "./config.ts";
 import { createSubagentActivityRecorder } from "./activity.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
@@ -143,6 +144,7 @@ export default function (pi: ExtensionAPI) {
   let userTookOver = false;
   let agentStarted = false;
   let latestAgentMessages: any[] | undefined;
+  let completionDelivered = false;
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
@@ -183,7 +185,8 @@ export default function (pi: ExtensionAPI) {
     const shouldExit = autoExit
       && shouldAutoExitOnAgentEnd(userTookOver, latestAgentMessages);
 
-    if (shouldExit) {
+    if (shouldExit && !completionDelivered) {
+      const keepOpen = !getBehaviorConfig().closeOnDone;
       // Surface stopReason: "error" turns (auto-retry exhausted, provider
       // overload, etc.) to the parent via the .exit sidecar so the watcher
       // can report a clear failure with the underlying error message.
@@ -192,16 +195,17 @@ export default function (pi: ExtensionAPI) {
         try {
           writeFileSync(
             `${sessionFile}.exit`,
-            JSON.stringify(buildCompletionSidecar(latestAgentMessages)),
+            JSON.stringify({ ...buildCompletionSidecar(latestAgentMessages), ...(keepOpen ? { keepOpen: true } : {}) }),
           );
         } catch {
           // Best effort — the watcher can still detect the terminal sentinel
-          // after shutdown if the completion sidecar cannot be written.
+          // or the pane status if the completion sidecar cannot be written.
         }
       }
 
+      completionDelivered = true;
       recorder.agentEndDone();
-      ctx.shutdown();
+      if (!keepOpen) ctx.shutdown();
       return;
     }
 
@@ -305,18 +309,26 @@ export default function (pi: ExtensionAPI) {
     label: "Subagent Done",
     description:
       "Call this tool when you have completed your task. " +
-      "It will close this session and return your results to the main session. " +
+      "It returns your results to the main session and optionally closes this session. " +
       "Your LAST assistant message before calling this becomes the summary returned to the caller.",
-    parameters: Type.Object({}),
-    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+    parameters: Type.Object({
+      close: Type.Optional(Type.Boolean({
+        description: "False leaves this session and its pane open for follow-up. True closes it. Omitting it uses behavior.closeOnDone.",
+      })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const keepOpen = !(params.close ?? getBehaviorConfig().closeOnDone);
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       recorder.subagentDone();
       if (sessionFile) {
-        writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
+        writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done", ...(keepOpen ? { keepOpen: true } : {}) }));
       }
-      ctx.shutdown();
+      completionDelivered = true;
+      if (!keepOpen) ctx.shutdown();
       return {
-        content: [{ type: "text", text: "Shutting down subagent session." }],
+        content: [{ type: "text", text: keepOpen
+          ? "Result delivered. This session and its pane stay open for follow-up."
+          : "Shutting down subagent session." }],
         details: {},
       };
     },
