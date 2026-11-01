@@ -520,10 +520,11 @@ const config = getSubagentConfig();
 function resolveResultPresentation(
   result: Pick<
     SubagentResult,
-    "exitCode" | "elapsed" | "summary" | "sessionFile" | "errorMessage"
+    "exitCode" | "elapsed" | "summary" | "sessionFile" | "errorMessage" | "keepOpen"
   >,
   name: string,
 ): string {
+  const followUp = result.keepOpen === true ? "\n\nThe pane stayed open for follow-up conversation." : "";
   const sessionRef = result.sessionFile
     ? `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`
     : "";
@@ -538,13 +539,13 @@ function resolveResultPresentation(
       `(provider/agent error — auto-retry exhausted).\n\n` +
       `Error: ${result.errorMessage}\n\n` +
       `The subagent did not produce a result. You can retry by spawning a new ` +
-      `subagent or resume the session with subagent_resume.${sessionRef}`
+      `subagent or resume the session with subagent_resume.${sessionRef}${followUp}`
     );
   }
 
   return result.exitCode !== 0
-    ? `Sub-agent "${name}" failed (exit code ${result.exitCode}).\n\n${result.summary}${sessionRef}`
-    : `Sub-agent "${name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${sessionRef}`;
+    ? `Sub-agent "${name}" failed (exit code ${result.exitCode}).\n\n${result.summary}${sessionRef}${followUp}`
+    : `Sub-agent "${name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${sessionRef}${followUp}`;
 }
 
 /**
@@ -561,6 +562,7 @@ interface SubagentResult {
   error?: string;
   /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
   errorMessage?: string;
+  keepOpen?: boolean;
   ping?: { name: string; message: string };
 }
 
@@ -1325,7 +1327,7 @@ async function watchSubagent(
       });
 
       if (extracted) {
-        closePane(surface);
+        if (result.keepOpen !== true) closePane(surface);
         running.lifecycle = result.exitCode === 0
           ? markCompleted(running.lifecycle, Date.now())
           : markFailed(running.lifecycle, result.errorMessage ?? extracted.summary, Date.now(), result.exitCode);
@@ -1338,6 +1340,7 @@ async function watchSubagent(
           elapsed,
           ...(extracted.sessionId ? { claudeSessionId: extracted.sessionId } : {}),
           ...extracted.details,
+          keepOpen: result.keepOpen,
         };
       }
     }
@@ -1387,7 +1390,7 @@ async function watchSubagent(
           : "Sub-agent exited without output";
     }
 
-    closePane(surface);
+    if (result.keepOpen !== true) closePane(surface);
     running.lifecycle = result.exitCode === 0
       ? markCompleted(running.lifecycle, Date.now())
       : markFailed(running.lifecycle, result.errorMessage ?? summary, Date.now(), result.exitCode);
@@ -1399,6 +1402,7 @@ async function watchSubagent(
       sessionFile,
       exitCode: result.exitCode,
       elapsed,
+      keepOpen: result.keepOpen,
       ping: result.ping,
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
     };

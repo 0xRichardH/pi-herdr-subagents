@@ -59,7 +59,7 @@ herdr
 pi
 ```
 
-herdr is the only supported terminal environment. The extension requires `HERDR_ENV=1` and the `herdr` CLI to be available.
+The extension normally requires `HERDR_ENV=1`, which means pi runs inside a herdr pane. To orchestrate from a plain terminal while herdr runs in the background, set `environment.allowOutsideHerdr` to `true` in `config.json`. The `herdr` CLI and a reachable server are still required. See [Configuration](#configuration).
 
 If your shell startup is slow and subagent commands sometimes get dropped before the prompt is ready, set `PI_SUBAGENT_SHELL_READY_DELAY_MS` to a higher value (defaults to `500`):
 
@@ -194,6 +194,12 @@ cp config.json.example config.json
   },
   "models": {
     "agents": {}
+  },
+  "environment": {
+    "allowOutsideHerdr": false
+  },
+  "behavior": {
+    "closeOnDone": true
   }
 }
 ```
@@ -213,6 +219,10 @@ The copyable example is model-neutral, so it works without requiring credentials
 ```
 
 `models.default` sets the model for subagents that do not specify a model. `models.agents` sets per-agent defaults, keyed by the agent name passed to `subagent({ agent: ... })`. Explicit `model` tool arguments take precedence, followed by agent frontmatter, per-agent config, the global default, and finally the parent model. Model values must be exact authenticated `provider/model-id` references.
+
+`environment.allowOutsideHerdr` lifts the inside-herdr requirement. When `true`, the extension accepts a session running in any terminal as long as the `herdr` CLI exists and `herdr workspace list` responds. Subagent tabs are created in the first workspace when the current pane cannot be resolved. Split layouts need a parent pane, so they fall back to a new tab when running outside herdr. Defaults to `false`, which keeps the fail-fast setup hint for new users.
+
+`behavior.closeOnDone` sets the default for what happens to a subagent's pane after its result is delivered. `true` closes the pane as before. `false` leaves the pane and its pi session open so you can continue the conversation in place. A subagent can override the default per call with `subagent_done({ close: false })` or `subagent_done({ close: true })`. The parent is told the pane stayed open so it can send a follow-up there instead of calling `subagent_resume`.
 
 `config.json` is gitignored so local overrides don't get committed.
 
@@ -267,6 +277,18 @@ This sends Escape to the child pane, cancelling the in-progress model turn. The 
 This is a turn-level interrupt, not a method for forcibly terminating a subagent session.
 
 > **Note:** Only Pi-backed subagents are supported. Claude-backed runs will return an error.
+
+---
+
+## Keeping a subagent pane open after completion
+
+A subagent finishes by calling `subagent_done`, and the parent closes its pane after delivering the result. To keep the pane and its session alive for a follow-up question, pass `close: false`:
+
+```typescript
+subagent_done({ close: false });
+```
+
+The result is still delivered to the parent as a steer message. The pane stays open and idle, so the next message can continue the same conversation in place. The orchestrator sees that the pane stayed open and can send a follow-up there instead of starting a new tab with `subagent_resume`. Omitting `close` uses `behavior.closeOnDone` from `config.json`, which defaults to `true`.
 
 ---
 
