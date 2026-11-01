@@ -6,7 +6,7 @@ A user continues a saved child's work in a new herdr pane, with its previous con
 
 - `resume-history`: resume an actual child session path and retain context.
 - `resume-message`: submit follow-up work on launch.
-- `resume-mode`: choose autonomous auto-exit or an interactive session.
+- `resume-mode`: choose autonomous auto-exit or an interactive session. `autoExit` defaults to `true` and does not read the agent's `auto-exit` frontmatter.
 
 ## How to get to it (user POV)
 
@@ -19,12 +19,14 @@ Preconditions: healthy owned run after successful `drive-spawn`, **before cleanu
 
 - **Tool resume.** Extract `SESSION=$(node -e 'console.log(require(process.argv[1]).result.details.sessionFile)' "$EVIDENCE/spawn-proof.json")`. Run `"$CONTROL" send "$EVIDENCE" "Call subagent_resume with sessionPath \"$SESSION\", name \"VerifyResume\", message \"Read spawn-marker.txt and write its exact contents to resumed-marker.txt using bash\", autoExit true. End your turn after submitting and await steering."`. Require the resume tool acknowledgment, a new child pane, a successful completion result, and `resumed-marker.txt` in scratch matching `spawn-marker.txt` byte-for-byte. Capture the submitted resolved prompt, both marker copies, resumed child log, and parent transcript.
 - **History.** Inspect the resumed conversation through the real Pi UI/session transcript: require the earlier marker-writing turn as well as the new continuation. A fresh worker creating the same file is not resume proof.
-- **Interactive variant.** Repeat tool resume on a fresh prepared run with `autoExit false`. Observe the child accepting another real prompt after its first response. Capture the surviving Pi process and response; do not expect autonomous completion steering.
-- **Manual session entry.** In a newly created tab inside the owned workspace, run `pi --session "$SESSION"` using the extracted path (the completion output prints this same command). Ask it to recall the marker task and create `manual-resume.txt` with `MANUAL_RESUME_PASS`. Capture the child conversation and persisted file. Only target the owned workspace, never a user's open tab.
+- **Interactive variant.** Repeat tool resume on a fresh prepared run with `autoExit false`. Observe the child accepting another real prompt after its first response. Capture the surviving Pi process and response. No sidecar or sentinel is written, so the watcher stays pending and a later pane close produces an error steer `Subagent pane disappeared before completion evidence was recorded.` Record that as expected for this mode.
+- **Manual session entry.** In a newly created tab inside the owned workspace, run `pi --session "$SESSION"` using the extracted path (the completion output prints this same command). Ask it to recall the marker task and create `manual-resume.txt` with `MANUAL_RESUME_PASS`. Capture the child conversation and persisted file. Only target the owned workspace, never a user's open tab. This command omits `-e subagent-done.ts`, so the manual session has no `subagent_done` or `caller_ping`.
 
 ## Gotchas
 
 - The displayed session path is a file, not a guessed agent ID. Copy it from the successful spawn result.
+- With `behavior.closeOnDone: false` in the package-root `config.json`, a resumed completion still arrives but the pane stays open and the result ends with `The pane stayed open for follow-up conversation.` Do not assert that the resumed pane closed under that setting.
+- Resume applies no model, thinking level, tool allowlist, or agent body, and it does not change directory. The child runs from the parent Pi process cwd with the session's recorded state. Tool and model parity with the original spawn is not guaranteed.
 - Cleanup removes the working directory, so continuing after cleanup changes the preconditions even if Pi retains the session file.
 - Report tool resume and manual `pi --session` separately. The automated spawn proof does not cover either resume path.
 - Keep copied child session proof before teardown; Pi-managed originals also remain at the paths recorded in completion details.

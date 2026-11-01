@@ -4,14 +4,14 @@ A user can see available agent definitions and launch the project-local definiti
 
 ## Sub-features
 
-- `discovery-list`: show local and bundled names and runtime defaults.
+- `discovery-list`: show definition names and the model declared in agent frontmatter.
 - `discovery-precedence`: project definitions override lower-priority definitions.
 - `discovery-hidden`: hidden definitions stay off the model-visible list but remain directly loadable.
 
 ## How to get to it (user POV)
 
 - Ask Pi to call `subagents_list`.
-- Type `/subagent <agent> <task>` to select a known definition directly.
+- Type `/subagent <agent> <task>`. The command checks the name and sends the model an instruction to call the `subagent` tool; the spawn happens only when the model does so. An unknown name shows an error and spawns nothing.
 - Create an agent Markdown file under the project's `.pi/agents/` to customize available agents.
 
 ## Driving it with control-subagents
@@ -25,6 +25,9 @@ Preconditions: healthy baseline with seeded `verify-worker`; bundled agents incl
 ## Gotchas
 
 - File names and frontmatter names need not match; route by the declared name. The override recipe explicitly sets both.
-- Discovery refreshes tool guidance, but verify the real list and launch after fixture edits. Restart the owned Pi if its host version caches local resources and record that requirement.
+- `subagents_list` re-reads the filesystem on every call. The model-visible prompt catalog is built only at session start, so a fixture edit changes the list immediately but not the guidance. Restart the owned Pi or run `/reload` when a journey depends on guidance.
+- The list prints the frontmatter model only. A model that comes from `config.json` `models.default` or `models.agents` does not appear, so a blank model in the list is not missing runtime resolution.
+- The list badges `(project)` only. Bundled and global entries look identical, so the list alone cannot prove their provenance.
+- The model-visible catalog stops at 24 entries alphabetically. Invisibility there can mean truncation, not `disable-model-invocation`. The global agent directory is `$PI_CODING_AGENT_DIR/agents` when that variable is set, otherwise `~/.pi/agent/agents`.
 - A hidden fixture is not in the launch seed. If the override or hidden journey is attempted without creating it, report the missing precondition as a failure; do not substitute `verify-worker` and claim coverage.
 - This recipe mutates only disposable agent files. Never test precedence by overwriting a real global agent.

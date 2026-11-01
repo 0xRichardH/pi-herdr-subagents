@@ -26,8 +26,10 @@ Preconditions: healthy baseline. For fork verification, first establish parent c
 
 ## Gotchas
 
-- The default child is lineage-only, not a full-context fork. A parent linkage alone does not prove inherited conversation; the token journey does.
-- `/iterate` is interactive, so a missing autonomous completion message is expected. A child that merely launches but never receives context is a failure.
+- The default child is standalone, not a full-context fork. A default child gets no seeded session file and no `parentSession` linkage. `lineage-only` is reachable only through agent frontmatter, and no bundled agent declares it. The token journey is what proves inherited conversation.
+- `/iterate` sends the parent model an instruction to call `subagent` with `fork: true`, `interactive: true`, and name `Iterate`. Those values are prose, not an enforced contract, and the arguments are taken whole with no flag parsing. Inspect the actual tool call rather than trusting the command text.
+- A direct `fork: true` spawn with the seeded worker stays autonomous, so its only steering is the async `subagent_result`. Only `/iterate` sets `interactive: true`.
 - The bundled planner may inherit the parent model or a configured override. Capture the observed runtime; an unauthenticated override is a failed prerequisite, not a reason to skip planning silently.
+- `/plan` injects the extension-bundled `pi-extension/subagents/plan-skill.md`, not a project skill, and strips its frontmatter before sending.
 - The empty seed project has no application requirements to discover. Ask for a scoped disposable feature as above; do not lower the planning journey to “a tab opened.”
 - Planning can ask questions and remain open. Observe and answer in the owned child pane when needed; do not drive another user's planner session.

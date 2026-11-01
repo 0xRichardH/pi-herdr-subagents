@@ -101,7 +101,11 @@ try {
     save(s); // Persist ownership before any command can fail.
     const prompt = `Reply with exactly ${s.readyToken}. Do not call tools.`;
     const cmd = ['pi', '-e', extension, '--no-mcp', '--no-skills', '--no-context-files', '--approve', '--session', join(evidence, 'parent.jsonl'), '--model', model, '--thinking', 'off', prompt].map(quote).join(' ');
-    const script = `#!/bin/sh\ncd ${quote(scratchDir)} || exit 1\nexport HERDR_WORKSPACE_ID=${quote(s.workspaceId)}\n${cmd}\nprintf '\\nPI_VERIFY_EXIT=%s\\n' "$?"\n`;
+    const forwarded = ['PI_SUBAGENT_LAYOUT', 'PI_SUBAGENT_SHELL_READY_DELAY_MS']
+      .filter(name => process.env[name])
+      .map(name => `export ${name}=${quote(process.env[name])}\n`)
+      .join('');
+    const script = `#!/bin/sh\ncd ${quote(scratchDir)} || exit 1\nexport HERDR_WORKSPACE_ID=${quote(s.workspaceId)}\n${forwarded}${cmd}\nprintf '\\nPI_VERIFY_EXIT=%s\\n' "$?"\n`;
     writeFileSync(join(evidence, 'launch.sh'), script, { mode: 0o700 });
     try {
       // Bounded shell warmup; readiness below requires an actual authenticated response.
