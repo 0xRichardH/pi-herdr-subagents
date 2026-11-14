@@ -29,7 +29,6 @@ export class GenericHarnessDriver implements HarnessDriver {
       agentDefs,
       effectiveModel,
       effectiveCwd,
-      surface,
       shellQuote,
       inheritsConversationContext,
       roleBlock,
@@ -87,7 +86,6 @@ export class GenericHarnessDriver implements HarnessDriver {
       launchScriptPreamble: [
         `# ${this.name} subagent launch script for ${params.name}`,
         `# Generated: ${new Date().toISOString()}`,
-        `# Surface: ${surface}`,
       ],
     };
   }

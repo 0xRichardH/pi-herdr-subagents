@@ -24,7 +24,6 @@ export class OpenCodeHarnessDriver implements HarnessDriver {
       agentDefs,
       effectiveModel,
       effectiveCwd,
-      surface,
       shellQuote,
       inheritsConversationContext,
       roleBlock,
@@ -62,7 +61,6 @@ export class OpenCodeHarnessDriver implements HarnessDriver {
       launchScriptPreamble: [
         `# OpenCode subagent launch script for ${params.name}`,
         `# Generated: ${new Date().toISOString()}`,
-        `# Surface: ${surface}`,
       ],
     };
   }

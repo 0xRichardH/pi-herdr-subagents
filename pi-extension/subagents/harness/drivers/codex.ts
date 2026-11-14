@@ -25,7 +25,6 @@ export class CodexHarnessDriver implements HarnessDriver {
       effectiveModel,
       effectiveThinking,
       effectiveCwd,
-      surface,
       shellQuote,
       inheritsConversationContext,
       roleBlock,
@@ -63,7 +62,6 @@ export class CodexHarnessDriver implements HarnessDriver {
       launchScriptPreamble: [
         `# Codex subagent launch script for ${params.name}`,
         `# Generated: ${new Date().toISOString()}`,
-        `# Surface: ${surface}`,
       ],
     };
   }

@@ -116,6 +116,10 @@ async function waitForDisappearanceArtifacts(
     await abortableDelay(Math.min(25, remaining), signal);
     const result = completionArtifact(options);
     if (result) return result;
+    try {
+      const exitCode = terminalExitCode(await options.readTerminalTail());
+      if (exitCode !== null) return { reason: "sentinel", exitCode };
+    } catch {}
   }
   return null;
 }
@@ -169,15 +173,15 @@ export async function waitForCompletion(
       }
       const observedAt = Date.now();
       options.onPaneInspection?.(inspection, observedAt);
-      if (inspection.kind === "missing") {
-        // Pane closure and atomic artifact publication are separate operations.
-        // Allow a short bounded grace window before declaring evidence lost.
+      if (inspection.kind === "missing" || (inspection.kind === "present" && inspection.ended)) {
         const racedCompletion = await waitForDisappearanceArtifacts(signal, options);
         if (racedCompletion) return racedCompletion;
         return {
           reason: "error",
           exitCode: 1,
-          errorMessage: "Subagent pane disappeared before completion evidence was recorded.",
+          errorMessage: inspection.kind === "missing"
+            ? "Subagent pane disappeared before completion evidence was recorded."
+            : "Subagent program ended before completion evidence was recorded.",
         };
       }
     }

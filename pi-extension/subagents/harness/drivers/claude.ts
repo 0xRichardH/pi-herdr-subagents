@@ -56,7 +56,6 @@ export class ClaudeHarnessDriver implements HarnessDriver {
       effectiveModel,
       subagentsDir,
       effectiveCwd,
-      surface,
       shellQuote,
     } = context;
 
@@ -99,7 +98,6 @@ export class ClaudeHarnessDriver implements HarnessDriver {
       launchScriptPreamble: [
         `# Claude Code subagent launch script for ${params.name}`,
         `# Generated: ${new Date().toISOString()}`,
-        `# Surface: ${surface}`,
       ],
     };
   }

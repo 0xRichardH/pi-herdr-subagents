@@ -62,7 +62,6 @@ export class PiHarnessDriver implements HarnessDriver {
       runtimePlan,
       effectiveModel,
       effectiveThinking,
-      surface,
       artifactDir,
       subagentSessionFile,
       effectiveCwd,
@@ -135,7 +134,6 @@ export class PiHarnessDriver implements HarnessDriver {
     envParts.push(`PI_SUBAGENT_ID=${shellQuote(params.id)}`);
     const activityFile = join(artifactDir, `subagent-activity-${params.id}.json`);
     envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
-    envParts.push(`PI_SUBAGENT_SURFACE=${shellQuote(surface)}`);
 
     const fullTask = taskDelivery === "direct"
       ? params.task
@@ -181,7 +179,6 @@ export class PiHarnessDriver implements HarnessDriver {
         `# Subagent launch script for ${params.name}`,
         `# Generated: ${new Date().toISOString()}`,
         `# Session: ${subagentSessionFile}`,
-        `# Surface: ${surface}`,
         `# Runtime: ${runtimePlan.model} (thinking: ${runtimePlan.thinking})`,
       ],
     };

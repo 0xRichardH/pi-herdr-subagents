@@ -13,6 +13,7 @@ export type PaneInspection =
       kind: "present";
       agent?: string;
       agentStatus: HerdrAgentStatus;
+      ended?: boolean;
       observedAt: number;
     }
   | { kind: "missing"; error?: string }
