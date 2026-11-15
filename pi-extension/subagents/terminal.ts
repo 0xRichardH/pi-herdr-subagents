@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -49,7 +50,7 @@ export interface TerminalBackend {
   readonly renameWorkspace: (title: string) => void;
 }
 
-const SETUP_HINT = "Start pi inside herdr-tui (`herdr`, then `pi`) or herdr-core (`hc run pi`). Set PI_SUBAGENT_BACKEND=herdr-tui or herdr-core when both host identities are inherited.";
+const SETUP_HINT = "Start pi inside herdr-tui (`herdr`, then `pi`) or herdr-core (`hc run pi`). PI_SUBAGENT_BACKEND=herdr-tui or herdr-core optionally overrides automatic host selection.";
 
 export function parseSubagentLayout(raw?: string): SubagentLayout {
   const value = (raw ?? "").trim();
@@ -107,6 +108,43 @@ function createTuiBackend(): TerminalBackend {
   } satisfies TerminalBackend);
 }
 
+function detectOwningBackend(): TerminalBackendKind | undefined {
+  const probe = (bin: string, args: string[]) => execFileSync(bin, args, {
+    encoding: "utf8", timeout: 1000, maxBuffer: 1024 * 1024, stdio: ["ignore", "pipe", "pipe"],
+  });
+  const candidates = new Map<number, TerminalBackendKind>();
+  for (const bin of ["hc", "herdr-core"]) {
+    try {
+      const record = JSON.parse(probe(bin, ["get", process.env.HC_TERMINAL_ID!, "--json"]));
+      if (record.address === process.env.HC_TERMINAL_ID && record.state === "live" && Number.isSafeInteger(record.pid) && record.pid > 0) {
+        candidates.set(record.pid, "herdr-core");
+      }
+      break;
+    } catch {}
+  }
+  if (process.env.HERDR_PANE_ID) {
+    try {
+      const record = JSON.parse(probe("herdr", ["pane", "process-info", "--pane", process.env.HERDR_PANE_ID]));
+      const pid = record?.result?.process_info?.shell_pid;
+      if (Number.isSafeInteger(pid) && pid > 0 && !candidates.has(pid)) candidates.set(pid, "herdr-tui");
+    } catch {}
+  }
+  if (!candidates.size) return undefined;
+  try {
+    const parents = new Map(probe("ps", ["-axo", "pid=,ppid="]).trim().split("\n").map((line) => {
+      const [pid, ppid] = line.trim().split(/\s+/).map(Number);
+      return [pid, ppid] as const;
+    }));
+    const visited = new Set<number>();
+    for (let pid = process.pid; pid > 0 && !visited.has(pid); pid = parents.get(pid) ?? 0) {
+      const kind = candidates.get(pid);
+      if (kind) return kind;
+      visited.add(pid);
+    }
+  } catch {}
+  return undefined;
+}
+
 let selectedBackend: TerminalBackend | undefined;
 let selectionError: Error | undefined;
 
@@ -116,11 +154,12 @@ export function getTerminalBackend(): TerminalBackend {
   const override = process.env.PI_SUBAGENT_BACKEND;
   const core = Boolean(process.env.HC_TERMINAL_ID);
   const tui = process.env.HERDR_ENV === "1";
-  if ((override !== undefined && override !== "herdr-tui" && override !== "herdr-core") || (!override && core && tui)) {
+  if (override !== undefined && override !== "herdr-tui" && override !== "herdr-core") {
     selectionError = new Error(`Cannot select terminal backend. ${SETUP_HINT}`);
     throw selectionError;
   }
-  selectedBackend = override === "herdr-core" || (!override && core) ? createCoreBackend() : createTuiBackend();
+  const kind = override ?? (core && tui ? detectOwningBackend() : undefined) ?? (core ? "herdr-core" : "herdr-tui");
+  selectedBackend = kind === "herdr-core" ? createCoreBackend() : createTuiBackend();
   return selectedBackend;
 }
 

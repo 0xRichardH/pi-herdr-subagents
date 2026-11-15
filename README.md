@@ -43,9 +43,16 @@ PI_TEST_MODEL="your-provider/your-model" npm run test:system -- herdr-core --evi
 npm run test:system -- herdr-tui --transport-only --evidence=/tmp/pi-tui-transport
 ```
 
+Add `--mixed-identities` to provision both an owned TUI workspace and an isolated core server for each host check. Each real parent and selection probe receives its own host identity plus a live terminal identity from the other host, outside its process ancestry. Both CLIs and a reachable TUI server are required in this mode, even when checking only one host.
+
+```bash
+npm run test:system -- --mixed-identities --transport-only --evidence=/tmp/pi-mixed-transport
+PI_TEST_MODEL="your-provider/your-model" npm run test:system -- --mixed-identities --evidence=/tmp/pi-mixed-pi
+```
+
 Use a fresh evidence directory for each run. `PI_TEST_MODEL` selects the model for both parent and child and is required for authenticated checks. Transport checks run without a model. `PI_TEST_TIMEOUT` sets each wait deadline in milliseconds, defaulting to `180000`.
 
-The system check uses the production launch, input, read, inspection, Escape, and cleanup operations. It then proves a real Pi parent tool call, the child's bash action, asynchronous completion steering, and the parent's acknowledgment. It resumes that child session, requests completion with the terminal kept open, and sends a follow-up that writes another marker. Core also checks that an ended program without completion evidence fails after the bounded artifact grace.
+The system check first verifies automatic backend selection inside a real host terminal with `PI_SUBAGENT_BACKEND` unset. It saves `selection.json` with the selected kind and runtime identities. Mixed mode also records both live process records and the probe's ancestry. Real Pi parents likewise unset the override and save `parent-selection.json` before Pi starts. The system check uses the production launch, input, read, inspection, Escape, and cleanup operations. It then proves a real Pi parent tool call, the child's bash action, asynchronous completion steering, and the parent's acknowledgment. It resumes that child session, requests completion with the terminal kept open, and sends a follow-up that writes another marker. Core also checks that an ended program without completion evidence fails after the bounded artifact grace.
 
 TUI runs own an unfocused disposable workspace. Core runs use a fresh socket, an isolated `HC_SESSION`, and scratch XDG directories. The check stops its owned core server and removes scratch files after cleanup. Transcripts, markers, and ownership records remain in the evidence directory. The older integration suite remains TUI-only:
 
@@ -78,7 +85,9 @@ pi
 
 Alternatively, start Pi in herdr-core with `hc run pi`. Either `hc` or `herdr-core` must be on `PATH`.
 
-The extension selects its backend once. `HC_TERMINAL_ID` selects herdr-core. `HERDR_ENV=1` selects herdr-tui. If both identities are present, set `PI_SUBAGENT_BACKEND=herdr-core` or `PI_SUBAGENT_BACKEND=herdr-tui`. An explicit override wins and is pinned in child launch scripts. Without either identity, herdr-tui remains the default.
+The extension detects its host automatically and selects the backend once. `HC_TERMINAL_ID` alone selects herdr-core. `HERDR_ENV=1` alone selects herdr-tui. When both identities are inherited, it checks which live host process owns the Pi session and selects the nearest owner. This handles nested hosts and inherited variables independently of terminal focus.
+
+If process ownership cannot be resolved, `HC_TERMINAL_ID` takes precedence and selects herdr-core. Without either host marker, herdr-tui remains the default. `PI_SUBAGENT_BACKEND=herdr-core` or `PI_SUBAGENT_BACKEND=herdr-tui` is an optional manual override. It wins over automatic selection, and child launch scripts pin the selected backend.
 
 Plain-terminal orchestration requires `environment.allowOutsideHerdr=true` in `config.json`, even with an explicit backend override. The selected CLI and server must be reachable. See [Configuration](#configuration).
 

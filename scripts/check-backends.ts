@@ -4,11 +4,13 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createCoreBackend } from "../pi-extension/subagents/herdr-core.ts";
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const args = process.argv.slice(2);
 const host = args.find((arg) => arg === "herdr-core" || arg === "herdr-tui");
 const transportOnly = args.includes("--transport-only");
+const mixedIdentities = args.includes("--mixed-identities");
 if (!transportOnly && !process.env.PI_TEST_MODEL) throw new Error("Set PI_TEST_MODEL to an authenticated provider/model for the real Pi checks");
 const evidenceArg = args.find((arg) => arg.startsWith("--evidence="))?.slice(11);
 const evidence = evidenceArg ? resolve(evidenceArg) : mkdtempSync(join(tmpdir(), "pi-backends-"));
@@ -19,7 +21,7 @@ if (!host) {
   const failures: Error[] = [];
   for (const backend of ["herdr-tui", "herdr-core"]) {
     try {
-      execFileSync(process.execPath, [fileURLToPath(import.meta.url), backend, `--evidence=${join(evidence, backend)}`, ...(transportOnly ? ["--transport-only"] : [])], { stdio: "inherit", env: process.env });
+      execFileSync(process.execPath, [fileURLToPath(import.meta.url), backend, `--evidence=${join(evidence, backend)}`, ...(transportOnly ? ["--transport-only"] : []), ...(mixedIdentities ? ["--mixed-identities"] : [])], { stdio: "inherit", env: process.env });
     } catch (error) {
       failures.push(error as Error);
     }
@@ -40,6 +42,9 @@ async function checkHost(host: string): Promise<void> {
   const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
   let coreBin = "hc";
   let coreStarted = false;
+  let coreAnchor: string | undefined;
+  let tuiAnchor: string | undefined;
+  const parentEnv: Record<string, string> = {};
   let workspace: { workspace_id: string; label: string } | undefined;
   const label = `pi-system-${Date.now()}-${process.pid}`;
   const coreSocket = join(scratch, "core.sock");
@@ -52,32 +57,45 @@ async function checkHost(host: string): Promise<void> {
     }
     throw new Error(`Timed out waiting for ${name}`);
   }
-  const state = () => writeFileSync(join(evidence, "ownership.json"), JSON.stringify({ host, scratch, workspace, session: process.env.HC_SESSION, owned: [...owned] }, null, 2));
+  const state = () => writeFileSync(join(evidence, "ownership.json"), JSON.stringify({ host, mixedIdentities, scratch, workspace, coreSocket, coreAnchor, tuiAnchor, session: process.env.HC_SESSION, owned: [...owned] }, null, 2));
 
   try {
     process.env.PI_SUBAGENT_BACKEND = host;
-    if (host === "herdr-core") {
+    process.env.HC_SOCKET = coreSocket;
+    delete process.env.HC_TERMINAL_ID;
+    if (mixedIdentities) {
+      const status = json("herdr", ["status", "server", "--json"]);
+      assert.equal(status.running, true);
+      assert.equal(typeof status.socket, "string");
+      process.env.HERDR_SOCKET_PATH = parentEnv.HERDR_SOCKET_PATH = status.socket;
+    }
+    if (!mixedIdentities && host === "herdr-core") {
+      delete process.env.HERDR_ENV;
+      delete process.env.HERDR_PANE_ID;
+    }
+    if (host === "herdr-core" || mixedIdentities) {
       try { run(coreBin, ["--version"]); } catch { coreBin = "herdr-core"; run(coreBin, ["--version"]); }
-      delete process.env.HC_TERMINAL_ID;
       process.env.HC_SESSION = label;
-      process.env.HC_SOCKET = coreSocket;
+      Object.assign(parentEnv, { HC_SESSION: label, HC_SOCKET: coreSocket });
       assert(!existsSync(coreSocket));
       for (const [key, path] of Object.entries({ XDG_RUNTIME_DIR: "runtime", XDG_STATE_HOME: "state", XDG_CACHE_HOME: "cache", XDG_CONFIG_HOME: "config", XDG_DATA_HOME: "data" })) {
-        process.env[key] = join(scratch, path);
+        process.env[key] = parentEnv[key] = join(scratch, path);
         mkdirSync(process.env[key]!, { recursive: true, mode: 0o700 });
       }
       run(coreBin, ["server", "start"]);
       coreStarted = true;
       const anchor = json(coreBin, ["run", "--json", "--bg", "--no-notify", "--no-parent", "--label", `system-check=${label}`, "sleep", "3600"]);
       assert.equal(typeof anchor.address, "string");
-      owned.add(anchor.address);
+      coreAnchor = anchor.address;
+      if (host === "herdr-core") owned.add(anchor.address);
       process.env.HC_TERMINAL_ID = anchor.address;
-    } else {
+    }
+    if (host === "herdr-tui" || mixedIdentities) {
       const result = json("herdr", ["workspace", "create", "--cwd", scratch, "--label", label, "--no-focus"]).result;
       workspace = result.workspace;
       process.env.HERDR_ENV = "1";
       process.env.HERDR_WORKSPACE_ID = workspace!.workspace_id;
-      process.env.HERDR_PANE_ID = result.root_pane.pane_id;
+      process.env.HERDR_PANE_ID = tuiAnchor = result.root_pane.pane_id;
       delete process.env.HERDR_TAB_ID;
     }
     state();
@@ -90,6 +108,56 @@ async function checkHost(host: string): Promise<void> {
       state();
       return pane;
     }
+    const parentPreamble = [
+      "unset PI_SUBAGENT_BACKEND",
+      ...Object.entries({ HC_SOCKET: coreSocket, ...parentEnv }).map(([key, value]) => `export ${key}=${quote(value)}`),
+      ...(host === "herdr-tui" ? [
+        "export HERDR_ENV=1",
+        `export HERDR_WORKSPACE_ID=${quote(workspace!.workspace_id)}`,
+        'export HERDR_PANE_ID="$PI_SUBAGENT_SURFACE"',
+        "unset HERDR_TAB_ID",
+        mixedIdentities ? `export HC_TERMINAL_ID=${quote(coreAnchor!)}` : "unset HC_TERMINAL_ID",
+      ] : mixedIdentities ? [
+        "export HERDR_ENV=1",
+        `export HERDR_WORKSPACE_ID=${quote(workspace!.workspace_id)}`,
+        `export HERDR_PANE_ID=${quote(tuiAnchor!)}`,
+        "unset HERDR_TAB_ID",
+      ] : ["unset HERDR_ENV HERDR_PANE_ID HERDR_WORKSPACE_ID HERDR_TAB_ID"]),
+    ].join("\n");
+    const detector = join(scratch, "detect.mjs");
+    const detectionFile = join(evidence, "selection.json");
+    writeFileSync(detector, String.raw`import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { writeFileSync } from "node:fs";
+import { getTerminalBackend } from ${JSON.stringify(join(repo, "pi-extension/subagents/terminal.ts"))};
+const selected = getTerminalBackend().kind;
+const proof = { selected, override: process.env.PI_SUBAGENT_BACKEND ?? null, surface: process.env.PI_SUBAGENT_SURFACE, coreTerminal: process.env.HC_TERMINAL_ID ?? null, tuiPane: process.env.HERDR_PANE_ID ?? null, mixedIdentities: ${mixedIdentities} };
+assert.equal(selected, ${JSON.stringify(host)});
+assert.equal(proof.override, null);
+assert.equal(${JSON.stringify(host)} === "herdr-core" ? proof.coreTerminal : proof.tuiPane, proof.surface);
+if (proof.mixedIdentities) {
+  const run = (bin, args) => execFileSync(bin, args, { encoding: "utf8", timeout: 15000, stdio: ["ignore", "pipe", "pipe"] });
+  proof.core = JSON.parse(run(${JSON.stringify(coreBin)}, ["get", proof.coreTerminal, "--json"]));
+  proof.tui = JSON.parse(run("herdr", ["pane", "process-info", "--pane", proof.tuiPane])).result.process_info;
+  const parents = new Map(run("ps", ["-axo", "pid=,ppid="]).trim().split("\n").map(line => line.trim().split(/\s+/).map(Number)));
+  proof.ancestors = [];
+  for (let pid = process.pid; pid > 0 && !proof.ancestors.includes(pid); pid = parents.get(pid) ?? 0) proof.ancestors.push(pid);
+  assert.equal(proof.core.state, "live");
+  assert.equal(proof.core.address, proof.coreTerminal);
+  assert(Number.isSafeInteger(proof.tui.shell_pid) && proof.tui.shell_pid > 0);
+  assert(proof.ancestors.includes(selected === "herdr-core" ? proof.core.pid : proof.tui.shell_pid));
+  assert(!proof.ancestors.includes(selected === "herdr-core" ? proof.tui.shell_pid : proof.core.pid));
+}
+writeFileSync(process.argv[2] ?? ${JSON.stringify(detectionFile)}, JSON.stringify(proof, null, 2));
+console.log("AUTO_SELECTED " + selected);
+`);
+    const automatic = await launch("automatic-selection", `${quote(process.execPath)} ${quote(detector)}; exec sleep 3600`, parentPreamble);
+    await until(() => existsSync(detectionFile), "automatic host selection inside a real terminal");
+    const selection = JSON.parse(readFileSync(detectionFile, "utf8"));
+    assert.equal(selection.surface, automatic);
+    writeFileSync(join(evidence, "selection.txt"), await terminal.readPaneAsync(automatic, 100));
+    terminal.closePane(automatic);
+    owned.delete(automatic);
     const probeFile = join(scratch, "probe.mjs");
     writeFileSync(probeFile, `process.stdin.setRawMode(true);process.stdin.resume();console.log('PROBE_READY '+process.env.PI_SUBAGENT_BACKEND+' '+process.env.PI_SUBAGENT_SURFACE);let input='';process.stdin.on('data',data=>{input+=data.toString();if(input.includes('production-input')){console.log('INPUT_OK');input='';}if(data.includes(27))console.log('ESC_OK');});\n`);
     const probe = await launch("transport", `${quote(process.execPath)} ${quote(probeFile)}`);
@@ -154,9 +222,10 @@ async function checkHost(host: string): Promise<void> {
       };
       const ready = `READY_${label}`;
       const extension = join(repo, "pi-extension/subagents/index.ts");
-      const preamble = host === "herdr-tui" ? `export HERDR_WORKSPACE_ID=${quote(workspace!.workspace_id)}\nexport HERDR_PANE_ID="$PI_SUBAGENT_SURFACE"\nunset HERDR_TAB_ID` : undefined;
-      const parent = await launch("parent", ["pi", "-e", extension, "--no-mcp", "--no-skills", "--no-context-files", "--approve", "--session", session, "--model", model, "--thinking", "off", `Reply with exactly ${ready}. Do not call tools.`].map(quote).join(" "), preamble);
+      const parentDetection = join(evidence, "parent-selection.json");
+      const parent = await launch("parent", `${quote(process.execPath)} ${quote(detector)} ${quote(parentDetection)} && ` + ["pi", "-e", extension, "--no-mcp", "--no-skills", "--no-context-files", "--approve", "--session", session, "--model", model, "--thinking", "off", `Reply with exactly ${ready}. Do not call tools.`].map(quote).join(" "), parentPreamble);
       await until(() => assistantSaid(ready), "authenticated real Pi readiness");
+      assert.equal(JSON.parse(readFileSync(parentDetection, "utf8")).surface, parent);
       const marker = join(scratch, "child-marker.txt");
       const token = `CHILD_${label}`;
       const acknowledgment = `ACK_${label}`;
@@ -196,9 +265,8 @@ async function checkHost(host: string): Promise<void> {
       assert.match(resumeResult.content, /pane stayed open/);
       assert.equal((await terminal.inspectPane(resumed)).kind, "present");
       const followMarker = join(scratch, "follow-marker.txt");
-      const followAck = `FOLLOW_${label}`;
-      terminal.runInPane(resumed, `Use bash to run printf '${token}' > '${followMarker}'. Then reply exactly ${followAck}.`);
-      await until(() => existsSync(followMarker) && readFileSync(followMarker, "utf8") === token && sessionEntries(result.details.sessionFile).some((entry) => entry.message?.role === "assistant" && entry.message.content?.some?.((content: any) => content.type === "text" && content.text.trim() === followAck)), "follow-up in the kept-open resumed session");
+      terminal.runInPane(resumed, `Use bash to run printf '${token}' > '${followMarker}'. Then confirm completion.`);
+      await until(() => existsSync(followMarker) && readFileSync(followMarker, "utf8") === token && sessionEntries(result.details.sessionFile).some((entry) => entry.message?.role === "assistant" && entry.message.content?.some?.((content: any) => content.type === "toolCall" && content.name === "bash" && content.arguments?.command?.includes(followMarker))), "follow-up in the kept-open resumed session");
       const resumeCalls = entries().flatMap((entry) => entry.message?.role === "assistant" ? entry.message.content || [] : []).filter((content) => content.type === "toolCall" && content.name === "subagent_resume");
       assert.equal(resumeCalls.length, 1);
       assert.equal(resumeCalls[0].arguments.sessionPath, result.details.sessionFile);
@@ -221,31 +289,39 @@ async function checkHost(host: string): Promise<void> {
         writeFileSync(join(evidence, "final-panes.json"), run("herdr", ["pane", "list", "--workspace", workspace.workspace_id]));
       }
     } catch {}
-    if (workspace) {
-      const current = json("herdr", ["workspace", "list"]).result.workspaces.find((item: any) => item.workspace_id === workspace!.workspace_id);
-      if (current) {
-        assert.equal(current.label, label, "Refusing cleanup after owned workspace label changed");
-        run("herdr", ["workspace", "close", workspace.workspace_id]);
+    try {
+      if (workspace) {
+        const current = json("herdr", ["workspace", "list"]).result.workspaces.find((item: any) => item.workspace_id === workspace!.workspace_id);
+        if (current) {
+          assert.equal(current.label, label, "Refusing cleanup after owned workspace label changed");
+          run("herdr", ["workspace", "close", workspace.workspace_id]);
+        }
+      }
+    } finally {
+      try {
+        if (coreStarted) {
+          assert.equal(process.env.HC_SESSION, label);
+          assert.equal(process.env.HC_SOCKET, coreSocket);
+          try {
+            const core = createCoreBackend();
+            const records = json(coreBin, ["ls", "--json", "--all"]).terminals;
+            assert(Array.isArray(records));
+            for (const record of records) {
+              assert.equal(typeof record.address, "string");
+              core.close(record.address);
+            }
+            const remaining = json(coreBin, ["ls", "--json", "--all"]);
+            writeFileSync(join(evidence, "core-cleanup.json"), JSON.stringify(remaining, null, 2));
+            assert.equal(remaining.terminals.length, 0);
+          } finally {
+            run(coreBin, ["server", "stop"]);
+          }
+        }
+      } finally {
+        rmSync(scratch, { recursive: true, force: true });
       }
     }
-    if (coreStarted) {
-      assert.equal(process.env.HC_SESSION, label);
-      assert.equal(process.env.HC_SOCKET, coreSocket);
-      const terminal = await import("../pi-extension/subagents/terminal.ts");
-      const records = json(coreBin, ["ls", "--json", "--all"]).terminals;
-      assert(Array.isArray(records));
-      for (const record of records) {
-        const address = record.address;
-        assert.equal(typeof address, "string");
-        terminal.closePane(address);
-      }
-      const remaining = json(coreBin, ["ls", "--json", "--all"]);
-      writeFileSync(join(evidence, "core-cleanup.json"), JSON.stringify(remaining, null, 2));
-      assert.equal(remaining.terminals.length, 0);
-      run(coreBin, ["server", "stop"]);
-    }
-    rmSync(scratch, { recursive: true, force: true });
   }
-  writeFileSync(join(evidence, "passed.json"), JSON.stringify({ host, transport: true, realPi: !transportOnly, resume: !transportOnly, keepOpenFollowUp: !transportOnly, cleanup: true }, null, 2));
+  writeFileSync(join(evidence, "passed.json"), JSON.stringify({ host, mixedIdentities, automaticSelection: true, transport: true, realPi: !transportOnly, resume: !transportOnly, keepOpenFollowUp: !transportOnly, cleanup: true }, null, 2));
   console.log(`${host} passed. Evidence retained at ${evidence}`);
 }
