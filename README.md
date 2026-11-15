@@ -1,6 +1,6 @@
 # pi-herdr-subagents
 
-Async subagents for [pi](https://github.com/earendil-works/pi) running exclusively in [herdr](https://herdr.dev). Spawn, orchestrate, and manage sub-agent sessions in dedicated herdr tabs or panes. **Fully non-blocking** — the main agent keeps working while subagents run in the background.
+Async subagents for [pi](https://github.com/earendil-works/pi) in [herdr-tui](https://herdr.dev) and herdr-core. Subagents run in dedicated TUI tabs or panes, or independent core terminals. The parent keeps working while results arrive asynchronously.
 
 ## How It Works
 
@@ -30,7 +30,31 @@ npm test
 npm run lint
 ```
 
-Run the real end-to-end suite from inside herdr with an explicit test model:
+Run the dual-host system check with both CLIs installed and a reachable herdr-tui server. Set `PI_TEST_MODEL` to an authenticated `provider/model` from your Pi catalog. Provider extensions remain enabled.
+
+```bash
+PI_TEST_MODEL="your-provider/your-model" npm run test:system -- --evidence=/tmp/pi-dual-host-proof
+```
+
+To check one host or skip authenticated Pi calls:
+
+```bash
+PI_TEST_MODEL="your-provider/your-model" npm run test:system -- herdr-core --evidence=/tmp/pi-core-proof
+npm run test:system -- herdr-tui --transport-only --evidence=/tmp/pi-tui-transport
+```
+
+Add `--mixed-identities` to provision both an owned TUI workspace and an isolated core server for each host check. Each real parent and selection probe receives its own host identity plus a live terminal identity from the other host, outside its process ancestry. Both CLIs and a reachable TUI server are required in this mode, even when checking only one host.
+
+```bash
+npm run test:system -- --mixed-identities --transport-only --evidence=/tmp/pi-mixed-transport
+PI_TEST_MODEL="your-provider/your-model" npm run test:system -- --mixed-identities --evidence=/tmp/pi-mixed-pi
+```
+
+Use a fresh evidence directory for each run. `PI_TEST_MODEL` selects the model for both parent and child and is required for authenticated checks. Transport checks run without a model. `PI_TEST_TIMEOUT` sets each wait deadline in milliseconds, defaulting to `180000`.
+
+The system check first verifies automatic backend selection inside a real host terminal with `PI_SUBAGENT_BACKEND` unset. It saves `selection.json` with the selected kind and runtime identities. Mixed mode also records both live process records and the probe's ancestry. Real Pi parents likewise unset the override and save `parent-selection.json` before Pi starts. The system check uses the production launch, input, read, inspection, Escape, and cleanup operations. It then proves a real Pi parent tool call, the child's bash action, asynchronous completion steering, and the parent's acknowledgment. It resumes that child session, requests completion with the terminal kept open, and sends a follow-up that writes another marker. Core also checks that an ended program without completion evidence fails after the bounded artifact grace.
+
+TUI runs own an unfocused disposable workspace. Core runs use a fresh socket, an isolated `HC_SESSION`, and scratch XDG directories. The check stops its owned core server and removes scratch files after cleanup. Transcripts, markers, and ownership records remain in the evidence directory. The older integration suite remains TUI-only:
 
 ```bash
 PI_TEST_MODEL="deepseek/deepseek-v4-flash" PI_TEST_TIMEOUT=180000 npm run test:integration
@@ -59,15 +83,23 @@ herdr
 pi
 ```
 
-The extension normally requires `HERDR_ENV=1`, which means pi runs inside a herdr pane. To orchestrate from a plain terminal while herdr runs in the background, set `environment.allowOutsideHerdr` to `true` in `config.json`. The `herdr` CLI and a reachable server are still required. See [Configuration](#configuration).
+Alternatively, start Pi in herdr-core with `hc run pi`. Either `hc` or `herdr-core` must be on `PATH`.
 
-If your shell startup is slow and subagent commands sometimes get dropped before the prompt is ready, set `PI_SUBAGENT_SHELL_READY_DELAY_MS` to a higher value (defaults to `500`):
+The extension detects its host automatically and selects the backend once. `HC_TERMINAL_ID` alone selects herdr-core. `HERDR_ENV=1` alone selects herdr-tui. When both identities are inherited, it checks which live host process owns the Pi session and selects the nearest owner. This handles nested hosts and inherited variables independently of terminal focus.
+
+If process ownership cannot be resolved, `HC_TERMINAL_ID` takes precedence and selects herdr-core. Without either host marker, herdr-tui remains the default. `PI_SUBAGENT_BACKEND=herdr-core` or `PI_SUBAGENT_BACKEND=herdr-tui` is an optional manual override. It wins over automatic selection, and child launch scripts pin the selected backend.
+
+Plain-terminal orchestration requires `environment.allowOutsideHerdr=true` in `config.json`, even with an explicit backend override. The selected CLI and server must be reachable. See [Configuration](#configuration).
+
+Core starts the prepared script directly with `hc run --bg --no-notify --no-parent --outlive-parent`. Human names and tasks become labels. Core maps every layout request to an independent terminal that survives its launcher exiting. Use `hc attach <id>` to interact with it. Completion requires sidecar or sentinel evidence, including when core reports a finished record.
+
+For herdr-tui, if your shell startup is slow and subagent commands sometimes get dropped before the prompt is ready, set `PI_SUBAGENT_SHELL_READY_DELAY_MS` to a higher value (defaults to `500`):
 
 ```bash
 export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500
 ```
 
-By default each subagent runs in its **own new tab**. If you'd rather keep them
+On herdr-tui, each subagent runs in its **own new tab** by default. If you'd rather keep them
 side-by-side with the orchestrator, set `PI_SUBAGENT_LAYOUT=split` (right-hand
 split) or `PI_SUBAGENT_LAYOUT=split:down` (split below). Unset, empty, or any
 other value keeps the default new-tab behavior:
@@ -87,7 +119,7 @@ Subagent tabs and panes are created without stealing keyboard focus. Launch comm
 
 | Tool                 | Description                                                                                 |
 | -------------------- | ------------------------------------------------------------------------------------------- |
-| `subagent`           | Spawn a sub-agent in a dedicated herdr pane (async — returns immediately)             |
+| `subagent`           | Spawn a sub-agent in a dedicated terminal (async — returns immediately)             |
 | `subagent_interrupt` | Interrupt a running Pi-backed subagent's current turn                                       |
 | `subagents_list`     | List available agent definitions                                                            |
 | `subagent_resume`    | Resume a previous sub-agent session (async)                                                 |
@@ -229,7 +261,7 @@ The copyable example is model-neutral, so it works without requiring credentials
 
 `models.default` sets the model for subagents that do not specify a model. `models.agents` sets per-agent defaults, keyed by the agent name passed to `subagent({ agent: ... })`. Explicit `model` tool arguments take precedence, followed by agent frontmatter, per-agent config, the global default, and finally the parent model. Model values must be exact authenticated `provider/model-id` references.
 
-`environment.allowOutsideHerdr` lifts the inside-herdr requirement. When `true`, the extension accepts a session running in any terminal as long as the `herdr` CLI exists and `herdr workspace list` responds. Subagent tabs are created in the first workspace when the current pane cannot be resolved. Split layouts need a parent pane, so they fall back to a new tab when running outside herdr. Defaults to `false`, which keeps the fail-fast setup hint for new users.
+`environment.allowOutsideHerdr` permits orchestration outside the selected host and defaults to `false`. For TUI, the `herdr` CLI and `herdr workspace list` must respond. Tabs use the first workspace when the current pane cannot be resolved. Splits fall back to a new tab without a parent pane. For core, choose `PI_SUBAGENT_BACKEND=herdr-core`; the extension requires `hc` or `herdr-core` and a reachable core server. An override does not bypass this permission.
 
 `behavior.closeOnDone` sets the default for what happens to a subagent's pane after its result is delivered. `true` closes the pane as before. `false` leaves the pane and its pi session open so you can continue the conversation in place. A subagent can override the default per call with `subagent_done({ close: false })` or `subagent_done({ close: true })`. The parent is told the pane stayed open so it can send a follow-up there instead of calling `subagent_resume`.
 
@@ -565,14 +597,14 @@ Every sub-agent session displays a compact tools widget showing available and de
 ## Requirements
 
 - [pi](https://github.com/earendil-works/pi) 1.3.x, minimum 1.3.0. The extension is tested on this line only.
-- [herdr](https://herdr.dev) — the required terminal workspace
+- [herdr-tui](https://herdr.dev) with the `herdr` CLI, or herdr-core with `hc` or `herdr-core` on `PATH`.
 
 ```bash
 herdr
 pi
 ```
 
-Other multiplexers and terminal backends are not supported.
+Use `hc run pi` for herdr-core. Other terminal backends are not supported.
 
 ---
 

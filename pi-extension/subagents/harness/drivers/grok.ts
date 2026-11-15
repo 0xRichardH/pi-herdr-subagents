@@ -24,7 +24,6 @@ export class GrokHarnessDriver implements HarnessDriver {
       agentDefs,
       effectiveModel,
       effectiveCwd,
-      surface,
       shellQuote,
       inheritsConversationContext,
       roleBlock,
@@ -58,7 +57,6 @@ export class GrokHarnessDriver implements HarnessDriver {
       launchScriptPreamble: [
         `# Grok subagent launch script for ${params.name}`,
         `# Generated: ${new Date().toISOString()}`,
-        `# Surface: ${surface}`,
       ],
     };
   }

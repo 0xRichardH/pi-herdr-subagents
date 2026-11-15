@@ -37,7 +37,6 @@ function createMockLaunchContext(overrides?: Partial<SubagentLaunchContext>): Su
     effectiveModel: "anthropic/claude-sonnet-4-5",
     effectiveThinking: "medium",
     parentThinking: "medium",
-    surface: "pane-1",
     artifactDir: "/tmp/artifacts",
     sessionDir: "/tmp/sessions",
     subagentSessionFile: "/tmp/sessions/subagent.jsonl",

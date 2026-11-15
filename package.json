@@ -1,7 +1,7 @@
 {
   "name": "pi-herdr-subagents",
   "version": "0.3.1",
-  "description": "Interactive subagents for pi running in herdr",
+  "description": "Async subagents for pi in herdr-tui and herdr-core",
   "keywords": [
     "pi-package"
   ],
@@ -13,8 +13,9 @@
   },
   "type": "module",
   "scripts": {
-    "lint": "oxlint pi-extension test",
+    "lint": "oxlint pi-extension test scripts",
     "test": "node --test test/test.ts test/runtime-routing.test.ts test/release-workflow.test.ts test/harness-drivers.test.ts test/claude-completion.test.ts test/guidance-delivery.test.ts",
+    "test:system": "node scripts/check-backends.ts",
     "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts"
   },
   "peerDependencies": {

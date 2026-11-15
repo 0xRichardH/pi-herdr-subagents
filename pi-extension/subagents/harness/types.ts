@@ -37,7 +37,6 @@ export interface SubagentLaunchContext {
   effectiveModel?: string;
   effectiveThinking?: ThinkingLevel;
   parentThinking: ThinkingLevel;
-  surface: string;
   artifactDir: string;
   sessionDir: string;
   subagentSessionFile: string;

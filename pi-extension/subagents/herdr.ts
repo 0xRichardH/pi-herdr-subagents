@@ -159,9 +159,9 @@ function buildTabCreateArgs(name: string, cwd: string, workspaceId: string): str
   ];
 }
 
-export function createHerdrSurface(name: string): string {
+export function createHerdrSurface(name: string, cwd = process.cwd()): string {
   const workspaceId = resolveHerdrWorkspaceId();
-  const output = herdrExec(buildTabCreateArgs(name, process.cwd(), workspaceId));
+  const output = herdrExec(buildTabCreateArgs(name, cwd, workspaceId));
   const paneId = extractHerdrRootPaneId(output, "tab create");
   try {
     herdrExec(["pane", "rename", paneId, name]);
@@ -192,8 +192,9 @@ export function createHerdrSurfaceSplit(
   name: string,
   direction: "right" | "down",
   parentPaneId: string,
+  cwd = process.cwd(),
 ): string {
-  const output = herdrExec(buildPaneSplitArgs(parentPaneId, direction, process.cwd()));
+  const output = herdrExec(buildPaneSplitArgs(parentPaneId, direction, cwd));
   const paneId = extractHerdrPaneId(output, "pane split");
   try {
     herdrExec(["pane", "rename", paneId, name]);

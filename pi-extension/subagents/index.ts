@@ -15,16 +15,15 @@ import { homedir } from "node:os";
 import {
   isTerminalAvailable,
   terminalSetupHint,
-  createSubagentSurface,
+  launchSubagentTerminal,
+  getShellReadyDelayMs,
   resolveSubagentLayout,
-  runScriptInPane,
   closePane,
   interruptPane,
   shellQuote,
   readPane,
   readPaneAsync,
   inspectPane,
-  setPaneTask,
 } from "./terminal.ts";
 import { waitForCompletion } from "./completion.ts";
 import {
@@ -471,25 +470,12 @@ function formatElapsed(seconds: number): string {
   return `${m}m ${s}s`;
 }
 
-/**
- * Wait long enough for a freshly created pane to finish shell startup.
- *
- * Some environments do extra shell-init work before the prompt is ready
- * (for example direnv/devenv), so the delay is configurable for users who hit
- * dropped commands. Keep the historical default at 500ms.
- */
-function getShellReadyDelayMs(): number {
-  const raw = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS?.trim();
-  const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500;
-}
-
 function muxUnavailableResult() {
   return {
     content: [
       {
         type: "text" as const,
-        text: `Subagents require herdr. ${terminalSetupHint()}`,
+        text: `Subagents require herdr-tui or herdr-core. ${terminalSetupHint()}`,
       },
     ],
     details: { error: "herdr not available" },
@@ -1098,12 +1084,6 @@ function startWidgetRefresh() {
   (globalThis as any)[WIDGET_INTERVAL_KEY] = widgetInterval;
 }
 
-/**
- * Launch a subagent: creates the herdr pane, builds the command, and
- * sends it. Returns a RunningSubagent — does NOT poll.
- *
- * Call watchSubagent() on the returned object to observe completion.
- */
 async function launchSubagent(
   params: typeof SubagentParams.static,
   ctx: {
@@ -1118,7 +1098,6 @@ async function launchSubagent(
     };
   },
   parentThinking: ThinkingLevel,
-  options?: { surface?: string },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
@@ -1163,15 +1142,6 @@ async function launchSubagent(
   const driver = getHarnessDriver(cliId);
   driver.validateRuntimePlan?.(runtimePlan, parentThinking);
 
-  const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSubagentSurface(params.name, resolveSubagentLayout());
-  if (params.task) {
-    setPaneTask(surface, params.task);
-  }
-  if (!surfacePreCreated) {
-    await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
-  }
-
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
 
   if (launchBehavior.seededSessionMode) {
@@ -1212,7 +1182,6 @@ async function launchSubagent(
     effectiveModel,
     effectiveThinking,
     parentThinking,
-    surface,
     artifactDir,
     sessionDir,
     subagentSessionFile,
@@ -1241,13 +1210,14 @@ async function launchSubagent(
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
 
-  runScriptInPane(surface, built.command, {
+  const surface = await launchSubagentTerminal({
+    name: params.name,
+    task: params.task,
+    cwd: targetCwdForSession,
+    layout: resolveSubagentLayout(),
+    command: built.command,
     scriptPath: launchScriptFile,
-    scriptPreamble: (built.launchScriptPreamble ?? [
-      `# Subagent launch script for ${params.name}`,
-      `# Generated: ${new Date().toISOString()}`,
-      `# Surface: ${surface}`,
-    ]).join("\n"),
+    preamble: built.launchScriptPreamble?.join("\n"),
   });
 
   const running: RunningSubagent = {
@@ -1494,14 +1464,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent",
       label: "Subagent",
       description:
-        "Spawn a sub-agent in a dedicated terminal herdr pane. " +
+        "Spawn a sub-agent in a dedicated terminal. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate, assume, or summarize results after calling this tool. " +
         "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
       promptSnippet:
-        "Spawn a sub-agent in a dedicated terminal herdr pane. " +
+        "Spawn a sub-agent in a dedicated terminal. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
@@ -1846,14 +1816,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent_resume",
       label: "Resume Subagent",
       description:
-        "Resume a previous sub-agent session in a new herdr pane. " +
+        "Resume a previous sub-agent session in a new terminal. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate or assume results. After resuming, either end your turn or work on other independent tasks; the harness will wake you when the result is ready. " +
         "Use when a sub-agent was cancelled or needs follow-up work.",
       promptSnippet:
-        "Resume a previous sub-agent session in a new herdr pane. " +
+        "Resume a previous sub-agent session in a new terminal. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status. All of that is wasted work — the harness handles delivery for you. " +
@@ -1928,12 +1898,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Record entry count before resuming so we can extract new messages
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
-        const surface = createSubagentSurface(name, resolveSubagentLayout());
-        if (params.message) {
-          setPaneTask(surface, params.message);
-        }
-        await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
-
         // Build pi resume command
         const parts = ["pi", "--session", shellQuote(params.sessionPath)];
 
@@ -1989,15 +1953,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             .replace(/-+/g, "-")
             .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
         );
-        runScriptInPane(surface, command, {
+        const surface = await launchSubagentTerminal({
+          name,
+          task: params.message ?? "resumed session",
+          cwd: ctx.cwd,
+          layout: resolveSubagentLayout(),
+          command,
           scriptPath: launchScriptFile,
-          scriptPreamble: [
-            `# Subagent resume script for ${name}`,
-            `# Generated: ${new Date().toISOString()}`,
-            `# Session: ${params.sessionPath}`,
-            `# Surface: ${surface}`,
-            ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
-          ].join("\n"),
         });
 
         // Register as a running subagent for widget tracking
