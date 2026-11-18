@@ -156,6 +156,10 @@ function buildTabCreateArgs(name: string, cwd: string, workspaceId: string): str
     "--cwd",
     cwd,
     "--no-focus",
+    "--env",
+    "AI_AGENT=pi",
+    "--env",
+    "PI_CODING_AGENT=true",
   ];
 }
 
@@ -185,6 +189,10 @@ function buildPaneSplitArgs(
     "--no-focus",
     "--cwd",
     cwd,
+    "--env",
+    "AI_AGENT=pi",
+    "--env",
+    "PI_CODING_AGENT=true",
   ];
 }
 
