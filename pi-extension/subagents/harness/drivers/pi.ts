@@ -93,6 +93,7 @@ export class PiHarnessDriver implements HarnessDriver {
 
     const toolAllowlist = buildSubagentToolAllowlist(params.tools ?? agentDefs?.tools);
     const parts = buildPiSessionArgs(subagentSessionFile, subagentsDir, toolAllowlist, shellQuote);
+    parts.push("--name", shellQuote(params.name.trim() || "subagent"));
 
     if (effectiveModel) {
       parts.push("--model", shellQuote(effectiveModel));

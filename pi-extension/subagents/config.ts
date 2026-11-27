@@ -14,6 +14,7 @@ export interface EnvironmentConfig {
 
 export interface BehaviorConfig {
   closeOnDone: boolean;
+  separateChildSessions: boolean;
 }
 
 export interface SubagentConfig {
@@ -24,7 +25,7 @@ export interface SubagentConfig {
 }
 
 const DEFAULT_ENVIRONMENT: EnvironmentConfig = { allowOutsideHerdr: false };
-const DEFAULT_BEHAVIOR: BehaviorConfig = { closeOnDone: true };
+const DEFAULT_BEHAVIOR: BehaviorConfig = { closeOnDone: true, separateChildSessions: false };
 
 function parseEnvironmentConfig(raw: unknown, source: string): EnvironmentConfig {
   if (raw == null) return DEFAULT_ENVIRONMENT;
@@ -52,7 +53,9 @@ function parseBehaviorConfig(raw: unknown, source: string): BehaviorConfig {
     throw new Error(`Invalid subagent config in ${source}: behavior must be an object`);
   }
   const value = raw as Record<string, unknown>;
-  const unsupported = Object.keys(value).filter((key) => key !== "closeOnDone");
+  const unsupported = Object.keys(value).filter(
+    (key) => key !== "closeOnDone" && key !== "separateChildSessions",
+  );
   if (unsupported.length > 0) {
     throw new Error(
       `Invalid subagent config in ${source}: behavior has unsupported key(s): ${unsupported.join(", ")}`,
@@ -63,7 +66,15 @@ function parseBehaviorConfig(raw: unknown, source: string): BehaviorConfig {
       `Invalid subagent config in ${source}: behavior.closeOnDone must be a boolean`,
     );
   }
-  return { closeOnDone: value.closeOnDone !== false };
+  if (value.separateChildSessions !== undefined && typeof value.separateChildSessions !== "boolean") {
+    throw new Error(
+      `Invalid subagent config in ${source}: behavior.separateChildSessions must be a boolean`,
+    );
+  }
+  return {
+    closeOnDone: value.closeOnDone !== false,
+    separateChildSessions: value.separateChildSessions ?? DEFAULT_BEHAVIOR.separateChildSessions,
+  };
 }
 
 function parseSubagentConfig(raw: unknown, source = "config.json"): SubagentConfig {

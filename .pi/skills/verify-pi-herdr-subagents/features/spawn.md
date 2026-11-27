@@ -5,6 +5,7 @@ A user delegates work to a child in its own herdr tab while the parent remains u
 ## Sub-features
 
 - `spawn-tool`: named child launch and authenticated runtime selection.
+- `spawn-session-picker`: new Pi sessions have the spawn display name and can be stored outside the normal project picker.
 - `spawn-command`: `/subagent` resolves the named agent and delegates the task.
 - `spawn-async`: tool acknowledgment precedes completion; parent receives steering.
 - `spawn-parallel`: two children run independently and both report results.
@@ -28,6 +29,10 @@ Preconditions: healthy fresh baseline; `verify-worker` has authenticated `PI_TES
 - **Parallel path (fresh run).** Run `"$CONTROL" send "$EVIDENCE" 'Call subagent twice without waiting: name ParallelA, agent verify-worker, task Write PARALLEL_A to parallel-a.txt using bash; name ParallelB, agent verify-worker, task Write PARALLEL_B to parallel-b.txt using bash. End your turn and await both steering results.'`. Capture two distinct child IDs/session paths, two matching markers in scratch, and two successful completion messages. Copy both markers and child logs into evidence. A single child completing is a failure for this path.
 - **Layout variants.** Repeat a fresh launch and tool journey with `PI_SUBAGENT_LAYOUT=split`, then separately `PI_SUBAGENT_LAYOUT=split:down`, exported before `launch`. The helper forwards `PI_SUBAGENT_LAYOUT` and `PI_SUBAGENT_SHELL_READY_DELAY_MS` into `launch.sh`; a run without that line creates tabs and proves nothing. Capture pane layout using `herdr pane layout --pane "$ROOT"`, plus focused pane identity before/after using `herdr pane current`. Require the intended split direction and unchanged user focus. Default launch uses tabs unless the environment already opts into splits. A split falls back to a tab when no parent pane resolves, so report that fallback as an unmet precondition rather than a split pass.
 - **Keep-open path (fresh run).** Run `"$CONTROL" send "$EVIDENCE" 'Call subagent with name KeepOpenWorker, agent verify-worker, task "Run bash: printf KEEPOPEN_PASS > keepopen.txt, then call subagent_done with close false." End your turn after spawning.'`. Require a `subagent` tool call, the marker, and a `subagent_result` whose content ends with `The pane stayed open for follow-up conversation.`. Assert the child pane from the completion details still exists with `herdr pane get <pane>`, and that `keepopen.txt` is in scratch. Copy the result text, the pane record, and the marker into evidence. The same run with `behavior.closeOnDone: false` in a temporary package-root `config.json` proves the config default; remove that file afterward.
+
+### Saved child sessions
+
+In a disposable checkout run `node scripts/check-backends.ts` with an authenticated `PI_TEST_MODEL` and a fresh evidence directory. Repeat with `behavior.separateChildSessions: true` in a copy of `config.json.example` saved as `config.json`. Restart the parent between runs. Check `session-picker.json`: the default run lists the child; the separate run omits it. Both must resume the exact returned path and retain the original session name when the pane label changes.
 
 ## Gotchas
 

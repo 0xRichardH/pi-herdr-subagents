@@ -124,6 +124,7 @@ describe("Pi Harness Driver", () => {
 
   it("builds correct pi invocation command", () => {
     const ctx = createMockLaunchContext({
+      params: { id: "abc12345", name: "  Worker's task  ", task: "Analyze the repository structure" },
       effectiveModel: "anthropic/claude-sonnet-4-5",
       effectiveThinking: "high",
     });
@@ -131,9 +132,17 @@ describe("Pi Harness Driver", () => {
 
     assert.equal(built.cli, "pi");
     assert.ok(built.command.includes("pi --session '/tmp/sessions/subagent.jsonl'"));
+    assert.ok(built.command.includes("--name 'Worker'\\''s task'"));
     assert.ok(built.command.includes("--model 'anthropic/claude-sonnet-4-5'"));
     assert.ok(built.command.includes("--thinking 'high'"));
     assert.ok(built.command.includes("echo '__SUBAGENT_DONE_'$?'__'"));
+  });
+
+  it("names a Pi session with a fallback when the display name is blank", () => {
+    const ctx = createMockLaunchContext();
+    ctx.params.name = "  	  ";
+
+    assert.ok(driver.buildCommand(ctx).command.includes("--name 'subagent'"));
   });
 });
 

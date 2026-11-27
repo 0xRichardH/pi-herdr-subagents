@@ -401,9 +401,10 @@ function resolveSubagentPaths(
   return { effectiveCwd, localAgentDir, effectiveAgentDir };
 }
 
-function getDefaultSessionDirFor(cwd: string, agentDir: string): string {
+function getSessionDirFor(cwd: string, agentDir: string, separateChildSessions: boolean): string {
   const safePath = `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
-  const sessionDir = join(agentDir, "sessions", safePath);
+  const workspaceSessionDir = join(agentDir, "sessions", safePath);
+  const sessionDir = separateChildSessions ? join(workspaceSessionDir, "subagents") : workspaceSessionDir;
   if (!existsSync(sessionDir)) {
     mkdirSync(sessionDir, { recursive: true });
   }
@@ -1143,7 +1144,13 @@ async function launchSubagent(
 
   const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
-  const sessionDir = getDefaultSessionDirFor(targetCwdForSession, effectiveAgentDir);
+  const cliId = agentDefs?.cli ?? "pi";
+  const driver = getHarnessDriver(cliId);
+  const sessionDir = getSessionDirFor(
+    targetCwdForSession,
+    effectiveAgentDir,
+    driver.id === "pi" && config.behavior.separateChildSessions,
+  );
 
   // Generate a deterministic session file path for this subagent.
   // This eliminates race conditions when multiple agents launch simultaneously —
@@ -1157,8 +1164,6 @@ async function launchSubagent(
   ].join("-");
   const subagentSessionFile = join(realpathSync(sessionDir), `${timestamp}_${uuid}.jsonl`);
 
-  const cliId = agentDefs?.cli ?? "pi";
-  const driver = getHarnessDriver(cliId);
   driver.validateRuntimePlan?.(runtimePlan, parentThinking);
 
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
