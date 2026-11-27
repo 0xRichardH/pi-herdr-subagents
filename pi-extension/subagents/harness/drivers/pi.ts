@@ -6,6 +6,7 @@ import type {
   BuiltHarnessCommand,
 } from "../types.ts";
 import type { ResolvedRuntimePlan } from "../../runtime-routing.ts";
+import { piDenyToolsAssignment } from "../../tool-policy.ts";
 
 const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
 
@@ -45,6 +46,17 @@ export function buildPiPromptArgs(params: {
   ];
 }
 
+export function buildPiSessionArgs(
+  sessionPath: string,
+  subagentsDir: string,
+  toolAllowlist: string | null,
+  shellQuote: (s: string) => string,
+): string[] {
+  const parts = ["pi", "--session", shellQuote(sessionPath), "-e", shellQuote(join(subagentsDir, "subagent-done.ts"))];
+  if (toolAllowlist !== null) parts.push("--tools", shellQuote(toolAllowlist));
+  return parts;
+}
+
 export class PiHarnessDriver implements HarnessDriver {
   readonly id = "pi";
   readonly name = "Pi";
@@ -79,11 +91,8 @@ export class PiHarnessDriver implements HarnessDriver {
       shellQuote,
     } = context;
 
-    const parts: string[] = ["pi"];
-    parts.push("--session", shellQuote(subagentSessionFile));
-
-    const subagentDonePath = join(subagentsDir, "subagent-done.ts");
-    parts.push("-e", shellQuote(subagentDonePath));
+    const toolAllowlist = buildSubagentToolAllowlist(params.tools ?? agentDefs?.tools);
+    const parts = buildPiSessionArgs(subagentSessionFile, subagentsDir, toolAllowlist, shellQuote);
 
     if (effectiveModel) {
       parts.push("--model", shellQuote(effectiveModel));
@@ -107,12 +116,6 @@ export class PiHarnessDriver implements HarnessDriver {
       parts.push(flag, shellQuote(syspromptPath));
     }
 
-    const effectiveTools = params.tools ?? agentDefs?.tools;
-    const toolAllowlist = buildSubagentToolAllowlist(effectiveTools);
-    if (toolAllowlist) {
-      parts.push("--tools", shellQuote(toolAllowlist));
-    }
-
     const envParts: string[] = [];
     if (localAgentDir && existsSync(localAgentDir)) {
       envParts.push(`PI_CODING_AGENT_DIR=${shellQuote(localAgentDir)}`);
@@ -120,9 +123,7 @@ export class PiHarnessDriver implements HarnessDriver {
       envParts.push(`PI_CODING_AGENT_DIR=${shellQuote(process.env.PI_CODING_AGENT_DIR)}`);
     }
 
-    if (denySet && denySet.size > 0) {
-      envParts.push(`PI_DENY_TOOLS=${shellQuote([...denySet].join(","))}`);
-    }
+    envParts.push(piDenyToolsAssignment(denySet ?? [], shellQuote));
     envParts.push(`PI_SUBAGENT_NAME=${shellQuote(params.name)}`);
     if (params.agent) {
       envParts.push(`PI_SUBAGENT_AGENT=${shellQuote(params.agent)}`);
@@ -173,6 +174,7 @@ export class PiHarnessDriver implements HarnessDriver {
 
     return {
       command,
+      piToolPolicy: { denyTools: [...(denySet ?? [])], toolAllowlist },
       sessionFile: subagentSessionFile,
       cli: "pi",
       launchScriptPreamble: [

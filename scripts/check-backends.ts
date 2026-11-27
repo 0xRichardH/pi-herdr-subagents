@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { getCurrentTools } from "@earendil-works/pi-ai";
 import { createCoreBackend } from "../pi-extension/subagents/herdr-core.ts";
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -11,6 +12,8 @@ const args = process.argv.slice(2);
 const host = args.find((arg) => arg === "herdr-core" || arg === "herdr-tui");
 const transportOnly = args.includes("--transport-only");
 const mixedIdentities = args.includes("--mixed-identities");
+const DENY_MARKER = "policy-probe";
+const EXPECTED_DENY_TOOLS = ["subagent", "subagent_interrupt", "subagents_list", "subagent_resume", DENY_MARKER].sort();
 if (!transportOnly && !process.env.PI_TEST_MODEL) throw new Error("Set PI_TEST_MODEL to an authenticated provider/model for the real Pi checks");
 const evidenceArg = args.find((arg) => arg.startsWith("--evidence="))?.slice(11);
 const evidence = evidenceArg ? resolve(evidenceArg) : mkdtempSync(join(tmpdir(), "pi-backends-"));
@@ -56,6 +59,23 @@ async function checkHost(host: string): Promise<void> {
       await sleep(250);
     }
     throw new Error(`Timed out waiting for ${name}`);
+  }
+  function assertDenyEvidence(label: string, files: { deny: string; session: string; id: string }, expectedSession: string, evidenceFile: string): void {
+    const rawDeny = readFileSync(files.deny, "utf8").trim();
+    const denyTools = rawDeny.split(",").map((value) => value.trim()).filter(Boolean).sort();
+    const sessionPath = readFileSync(files.session, "utf8").trim();
+    const subagentId = readFileSync(files.id, "utf8").trim();
+    writeFileSync(join(evidence, `${label}-deny-tools.txt`), readFileSync(files.deny));
+    writeFileSync(join(evidence, `${label}-session.txt`), readFileSync(files.session));
+    writeFileSync(join(evidence, `${label}-id.txt`), readFileSync(files.id));
+    const messages = readFileSync(expectedSession, "utf8").trimEnd().split("\n")
+      .map(line => JSON.parse(line).message).filter(Boolean);
+    const declaredTools = getCurrentTools(messages).map(tool => tool.name).sort();
+    writeFileSync(join(evidence, evidenceFile), JSON.stringify({ host, label, denyTools, expectedDenyTools: EXPECTED_DENY_TOOLS, sessionPath, expectedSession, subagentId, declaredTools }, null, 2));
+    assert.deepEqual(denyTools, EXPECTED_DENY_TOOLS, `${label} resolved deny set`);
+    assert.deepEqual(declaredTools, ["bash", "caller_ping", "read", "subagent_done", "write"], `${label} native tool allowlist`);
+    assert.equal(sessionPath, expectedSession, `${label} PI_SUBAGENT_SESSION`);
+    assert(subagentId, `${label} PI_SUBAGENT_ID`);
   }
   const state = () => writeFileSync(join(evidence, "ownership.json"), JSON.stringify({ host, mixedIdentities, scratch, workspace, coreSocket, coreAnchor, tuiAnchor, session: process.env.HC_SESSION, owned: [...owned] }, null, 2));
 
@@ -109,7 +129,7 @@ async function checkHost(host: string): Promise<void> {
       return pane;
     }
     const parentPreamble = [
-      "unset PI_SUBAGENT_BACKEND",
+      "unset PI_SUBAGENT_BACKEND PI_SUBAGENT_ID PI_DENY_TOOLS PI_SUBAGENT_NAME PI_SUBAGENT_AGENT PI_SUBAGENT_SESSION PI_SUBAGENT_AUTO_EXIT PI_SUBAGENT_ACTIVITY_FILE",
       ...Object.entries({ HC_SOCKET: coreSocket, ...parentEnv }).map(([key, value]) => `export ${key}=${quote(value)}`),
       ...(host === "herdr-tui" ? [
         "export HERDR_ENV=1",
@@ -210,7 +230,7 @@ console.log("AUTO_SELECTED " + selected);
     if (!transportOnly) {
       const agents = join(scratch, ".pi/agents");
       mkdirSync(agents, { recursive: true });
-      writeFileSync(join(agents, "verify-worker.md"), `---\nname: verify-worker\ndescription: Disposable system verification worker\nmodel: ${model}\ntools: bash, read, write\nspawning: false\nauto-exit: true\n---\nExecute the requested task immediately. Use bash to write requested marker files.\n`);
+      writeFileSync(join(agents, "verify-worker.md"), `---\nname: verify-worker\ndescription: Disposable system verification worker\nmodel: ${model}\ntools: bash, read, write\nspawning: false\ndeny-tools: ${DENY_MARKER}\nauto-exit: true\n---\nExecute the requested task immediately. Use bash to write requested marker files.\n`);
       const session = join(evidence, "parent.jsonl");
       const sessionEntries = (file: string) => existsSync(file) ? readFileSync(file, "utf8").split("\n").flatMap((line) => { try { return [JSON.parse(line)]; } catch { return []; } }) : [];
       const entries = () => sessionEntries(session);
@@ -227,10 +247,15 @@ console.log("AUTO_SELECTED " + selected);
       await until(() => assistantSaid(ready), "authenticated real Pi readiness");
       assert.equal(JSON.parse(readFileSync(parentDetection, "utf8")).surface, parent);
       const marker = join(scratch, "child-marker.txt");
+      const spawnDenyFile = join(scratch, "spawn-deny-tools.txt");
+      const spawnSessionFile = join(scratch, "spawn-session.txt");
+      const spawnIdFile = join(scratch, "spawn-id.txt");
       const token = `CHILD_${label}`;
       const acknowledgment = `ACK_${label}`;
-      terminal.runInPane(parent, `Call subagent once with name "VerifyWorker", agent "verify-worker", task "Run bash: printf '${token}\\n' > '${marker}'". Do not write the file yourself. End your turn after spawning. After the async subagent_result arrives, reply exactly ${acknowledgment}.`);
-      await until(() => existsSync(marker) && readFileSync(marker, "utf8").trim() === token, "real child action");
+      const spawnAction = join(scratch, "spawn-action.sh");
+      writeFileSync(spawnAction, `set -eu\nprintf '%s' ${quote(token)} > ${quote(marker)}\nprintenv PI_DENY_TOOLS > ${quote(spawnDenyFile)}\nprintenv PI_SUBAGENT_SESSION > ${quote(spawnSessionFile)}\nprintenv PI_SUBAGENT_ID > ${quote(spawnIdFile)}\n`);
+      terminal.runInPane(parent, `Call subagent once with name "VerifyWorker", agent "verify-worker", task "Run our local verification script with bash ${spawnAction}". End your turn after spawning. After the async subagent_result arrives, reply exactly ${acknowledgment}.`);
+      await until(() => existsSync(marker) && readFileSync(marker, "utf8").trim() === token && existsSync(spawnDenyFile) && existsSync(spawnSessionFile) && existsSync(spawnIdFile), "real child action and tool policy environment");
       await until(() => entries().some((entry) => entry.customType === "subagent_result") && assistantSaid(acknowledgment), "async completion steering and parent acknowledgment");
       const events = entries();
       const calls = events.flatMap((entry) => entry.message?.role === "assistant" ? entry.message.content || [] : []).filter((content) => content.type === "toolCall" && content.name === "subagent");
@@ -239,21 +264,27 @@ console.log("AUTO_SELECTED " + selected);
       const result = events.find((entry) => entry.customType === "subagent_result");
       assert.equal(result.details?.exitCode, 0);
       assert(!result.details?.error);
+      assertDenyEvidence("spawn", { deny: spawnDenyFile, session: spawnSessionFile, id: spawnIdFile }, result.details.sessionFile, "spawn-tool-policy.json");
       const child = readFileSync(result.details.sessionFile, "utf8");
       const childEntries = child.trim().split("\n").map((line) => JSON.parse(line));
-      assert(childEntries.some((entry) => entry.message?.role === "assistant" && entry.message.content?.some?.((content: any) => content.type === "toolCall" && content.name === "bash" && content.arguments?.command?.includes(marker))));
+      const childBashCommands = childEntries.flatMap((entry) => entry.message?.role === "assistant" ? entry.message.content || [] : []).filter((content: any) => content.type === "toolCall" && content.name === "bash").map((content: any) => String(content.arguments?.command ?? ""));
+      assert(childBashCommands.some(command => command.includes(spawnAction)), "spawned child must run the policy script");
+      writeFileSync(join(evidence, "spawn-action.sh"), readFileSync(spawnAction));
       writeFileSync(join(evidence, "child.jsonl"), child);
       writeFileSync(join(evidence, "parent.txt"), await terminal.readPaneAsync(parent, 200));
-      writeFileSync(join(evidence, "spawn-proof.json"), JSON.stringify({ host, model, toolCall: calls[0], result, parentAcknowledged: true, markerMatched: true }, null, 2));
+      writeFileSync(join(evidence, "spawn-proof.json"), JSON.stringify({ host, model, toolCall: calls[0], result, parentAcknowledged: true, markerMatched: true, toolPolicy: "spawn-tool-policy.json" }, null, 2));
       writeFileSync(join(evidence, "child-marker.txt"), readFileSync(marker));
       const resumeMarker = join(scratch, "resume-marker.txt");
       const resumeSurface = join(scratch, "resume-surface.txt");
+      const resumeDenyFile = join(scratch, "resume-deny-tools.txt");
+      const resumeSessionFile = join(scratch, "resume-session.txt");
+      const resumeIdFile = join(scratch, "resume-id.txt");
       const resumeAction = join(scratch, "resume-action.sh");
-      writeFileSync(resumeAction, `printf '%s' ${quote(token)} > ${quote(resumeMarker)}\nprintf '%s' "$PI_SUBAGENT_SURFACE" > ${quote(resumeSurface)}\n`);
+      writeFileSync(resumeAction, `printf '%s' ${quote(token)} > ${quote(resumeMarker)}\nprintf '%s' "$PI_SUBAGENT_SURFACE" > ${quote(resumeSurface)}\nprintenv PI_DENY_TOOLS > ${quote(resumeDenyFile)}\nprintenv PI_SUBAGENT_SESSION > ${quote(resumeSessionFile)}\nprintenv PI_SUBAGENT_ID > ${quote(resumeIdFile)}\n`);
       const resumeAck = `RESUMED_${label}`;
       const resumeTask = `Run bash ${resumeAction}. Then call subagent_done with close false to keep this session open.`;
       terminal.runInPane(parent, `Call subagent_resume once with sessionPath ${JSON.stringify(result.details.sessionFile)}, name "VerifyResume", autoExit false, and message ${JSON.stringify(resumeTask)}. End your turn after resuming. After its async subagent_result arrives, reply exactly ${resumeAck}.`);
-      await until(() => existsSync(resumeMarker) && existsSync(resumeSurface), "resumed child action and runtime identity");
+      await until(() => existsSync(resumeMarker) && existsSync(resumeSurface) && existsSync(resumeDenyFile) && existsSync(resumeSessionFile) && existsSync(resumeIdFile), "resumed child action, runtime identity, and tool policy environment");
       await until(() => entries().filter((entry) => entry.customType === "subagent_result").length === 2 && assistantSaid(resumeAck), "resumed completion and parent acknowledgment");
       assert.equal(readFileSync(resumeMarker, "utf8"), token);
       const resumed = readFileSync(resumeSurface, "utf8").trim();
@@ -263,6 +294,8 @@ console.log("AUTO_SELECTED " + selected);
       const resumeResult = entries().filter((entry) => entry.customType === "subagent_result")[1];
       assert.equal(resumeResult.details?.exitCode, 0);
       assert.match(resumeResult.content, /pane stayed open/);
+      assert(sessionEntries(result.details.sessionFile).some((entry) => entry.message?.role === "assistant" && entry.message.content?.some?.((content: any) => content.type === "toolCall" && content.name === "bash" && content.arguments?.command?.includes(resumeAction))), "resumed child bash action must run the policy script");
+      assertDenyEvidence("resume", { deny: resumeDenyFile, session: resumeSessionFile, id: resumeIdFile }, result.details.sessionFile, "resume-tool-policy.json");
       assert.equal((await terminal.inspectPane(resumed)).kind, "present");
       const followMarker = join(scratch, "follow-marker.txt");
       terminal.runInPane(resumed, `Use bash to run printf '${token}' > '${followMarker}'. Then confirm completion.`);
@@ -270,7 +303,8 @@ console.log("AUTO_SELECTED " + selected);
       const resumeCalls = entries().flatMap((entry) => entry.message?.role === "assistant" ? entry.message.content || [] : []).filter((content) => content.type === "toolCall" && content.name === "subagent_resume");
       assert.equal(resumeCalls.length, 1);
       assert.equal(resumeCalls[0].arguments.sessionPath, result.details.sessionFile);
-      writeFileSync(join(evidence, "resume-proof.json"), JSON.stringify({ host, toolCall: resumeCalls[0], result: resumeResult, surface: resumed, followUpMatched: true }, null, 2));
+      writeFileSync(join(evidence, "resume-proof.json"), JSON.stringify({ host, toolCall: resumeCalls[0], result: resumeResult, surface: resumed, followUpMatched: true, toolPolicy: "resume-tool-policy.json" }, null, 2));
+      writeFileSync(join(evidence, "resume-action.sh"), readFileSync(resumeAction));
       writeFileSync(join(evidence, "resumed-child.jsonl"), readFileSync(result.details.sessionFile));
       writeFileSync(join(evidence, "resume-marker.txt"), readFileSync(resumeMarker));
       writeFileSync(join(evidence, "follow-marker.txt"), readFileSync(followMarker));
@@ -322,6 +356,6 @@ console.log("AUTO_SELECTED " + selected);
       }
     }
   }
-  writeFileSync(join(evidence, "passed.json"), JSON.stringify({ host, mixedIdentities, automaticSelection: true, transport: true, realPi: !transportOnly, resume: !transportOnly, keepOpenFollowUp: !transportOnly, cleanup: true }, null, 2));
+  writeFileSync(join(evidence, "passed.json"), JSON.stringify({ host, mixedIdentities, automaticSelection: true, transport: true, realPi: !transportOnly, resume: !transportOnly, keepOpenFollowUp: !transportOnly, toolPolicy: !transportOnly, cleanup: true }, null, 2));
   console.log(`${host} passed. Evidence retained at ${evidence}`);
 }

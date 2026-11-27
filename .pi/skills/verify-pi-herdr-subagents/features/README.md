@@ -33,7 +33,7 @@ Record feature ID and entry point, submitted action, visible result, tool result
 - [Spawn and completion](spawn.md): tool and `/subagent` entry points, background execution, parallel children, runtime selection, persisted marker, steering, split layouts, keep-open panes.
 - [Agent discovery](discovery.md): list definitions, local precedence, hidden agents, slash-command resolution.
 - [Interrupt a child turn](interrupt.md): real Pi tool interruption, surviving child process, no false completion.
-- [Resume a child session](resume.md): resume tool, saved history, continuation and auto-exit choice.
+- [Resume a child session](resume.md) covers saved history, continuation, auto-exit, and [tool restrictions](../../verify-pi-resume-tool-policy/SKILL.md).
 - [Fork and plan](fork-plan.md): direct fork, `/iterate`, and `/plan` workflows.
 
 Every feature file uses four H2 sections: sub-features, user entry points, harness recipe, gotchas. Additional terminal transport coverage lives in `test/integration/mux-surface.test.ts` and is not a substitute for these paths.

@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   readdirSync,
+  realpathSync,
   readFileSync,
   writeFileSync,
   existsSync,
@@ -36,11 +37,18 @@ import {
 } from "./runtime-routing.ts";
 import {
   getHarnessDriver,
+  buildPiSessionArgs,
   buildSubagentToolAllowlist,
   buildPiPromptArgs,
 } from "./harness/index.ts";
 import { resolveModelDefault, type ModelConfig } from "./model-config.ts";
 import { getSubagentConfig } from "./config.ts";
+import {
+  piDenyToolsAssignment,
+  type PiToolPolicy,
+  readPiToolPolicy,
+  writePiToolPolicy,
+} from "./tool-policy.ts";
 
 import {
   findLastAssistantMessage,
@@ -234,6 +242,17 @@ function resolveDenyTools(agentDefs: AgentDefaults | null): Set<string> {
   }
 
   return denied;
+}
+
+function childDeniedTools(saved: Iterable<string> = []): Set<string> {
+  const names = new Set(saved);
+  if (process.env.PI_SUBAGENT_ID) {
+    for (const name of (process.env.PI_DENY_TOOLS ?? "").split(",")) {
+      const trimmed = name.trim();
+      if (trimmed) names.add(trimmed);
+    }
+  }
+  return names;
 }
 
 /** Resolve the global agent config directory, respecting PI_CODING_AGENT_DIR. */
@@ -1136,7 +1155,7 @@ async function launchSubagent(
     Math.random().toString(16).slice(2, 10),
     Math.random().toString(16).slice(2, 6),
   ].join("-");
-  const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
+  const subagentSessionFile = join(realpathSync(sessionDir), `${timestamp}_${uuid}.jsonl`);
 
   const cliId = agentDefs?.cli ?? "pi";
   const driver = getHarnessDriver(cliId);
@@ -1168,7 +1187,7 @@ async function launchSubagent(
   const summaryInstruction = effectiveAutoExit
     ? "Your FINAL assistant message should summarize what you accomplished."
     : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
-  const denySet = resolveDenyTools(agentDefs);
+  const denySet = childDeniedTools(resolveDenyTools(agentDefs));
   const identity = agentDefs?.body ?? params.systemPrompt ?? null;
   const systemPromptMode = agentDefs?.systemPromptMode;
   const identityInSystemPrompt = systemPromptMode && identity;
@@ -1201,6 +1220,8 @@ async function launchSubagent(
     subagentsDir: SUBAGENTS_DIR,
     shellQuote,
   });
+
+  if (built.piToolPolicy) writePiToolPolicy(subagentSessionFile, built.piToolPolicy);
 
   const launchScriptName = `${(params.name || "subagent")
     .toLowerCase()
@@ -1449,12 +1470,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   });
 
   // Tools denied via PI_DENY_TOOLS env var (set by parent agent based on frontmatter)
-  const deniedTools = new Set(
-    (process.env.PI_SUBAGENT_ID ? process.env.PI_DENY_TOOLS ?? "" : "")
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean),
-  );
+  const deniedTools = childDeniedTools();
 
   const shouldRegister = (name: string) => !deniedTools.has(name);
 
@@ -1895,15 +1911,23 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
+        let sessionPath: string;
+        let policy: PiToolPolicy;
+        try {
+          sessionPath = realpathSync(params.sessionPath);
+          policy = readPiToolPolicy(sessionPath);
+        } catch (error) {
+          const text = error instanceof Error ? error.message : String(error);
+          return {
+            content: [{ type: "text", text }],
+            details: { error: "tool policy" },
+          };
+        }
+
         // Record entry count before resuming so we can extract new messages
-        const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
+        const entryCountBefore = getNewEntries(sessionPath, 0).length;
 
-        // Build pi resume command
-        const parts = ["pi", "--session", shellQuote(params.sessionPath)];
-
-        // Load subagent-done extension so the agent can self-terminate if needed
-        const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
-        parts.push("-e", shellQuote(subagentDonePath));
+        const parts = buildPiSessionArgs(sessionPath, SUBAGENTS_DIR, policy.toolAllowlist, shellQuote);
 
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
@@ -1933,8 +1957,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (process.env.PI_CODING_AGENT_DIR) {
           resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellQuote(process.env.PI_CODING_AGENT_DIR)}`);
         }
+        resumeEnvParts.push(piDenyToolsAssignment(childDeniedTools(policy.denyTools), shellQuote));
         resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellQuote(name)}`);
-        resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellQuote(params.sessionPath)}`);
+        resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellQuote(sessionPath)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ID=${shellQuote(id)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
         if (autoExit) {
@@ -1969,7 +1994,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           task: params.message ?? "resumed session",
           surface,
           startTime,
-          sessionFile: params.sessionPath,
+          sessionFile: sessionPath,
           launchScriptFile,
           activityFile,
           interactive,
@@ -1998,7 +2023,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             const completionApi = selectCompletionApi(pi, runtime.pi);
 
             if (result.ping) {
-              const sessionRef = `\n\nSession: ${params.sessionPath}\nResume: pi --session ${params.sessionPath}`;
+              const sessionRef = `\n\nSession: ${sessionPath}\nResume: pi --session ${sessionPath}`;
               completionApi.sendMessage(
                 {
                   customType: "subagent_ping",
@@ -2007,7 +2032,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   details: {
                     name: result.ping.name,
                     message: result.ping.message,
-                    sessionFile: params.sessionPath,
+                    sessionFile: sessionPath,
                   },
                 },
                 { triggerTurn: true, deliverAs: "steer" },
@@ -2015,7 +2040,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               return;
             }
 
-            const allEntries = getNewEntries(params.sessionPath, entryCountBefore);
+            const allEntries = getNewEntries(sessionPath, entryCountBefore);
             const summary = findLastAssistantMessage(allEntries) ??
               (result.errorMessage
                 ? `Subagent error: ${result.errorMessage}`
@@ -2023,7 +2048,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   ? `Resumed session exited with code ${result.exitCode}`
                   : "Resumed session exited without new output");
             const basePresentation = resolveResultPresentation(
-              { ...result, summary, sessionFile: params.sessionPath },
+              { ...result, summary, sessionFile: sessionPath },
               name,
             );
             const presentation = running.runtimePlan?.runtimeMismatch
@@ -2040,7 +2065,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   task: params.message ?? "resumed session",
                   exitCode: result.exitCode,
                   elapsed: result.elapsed,
-                  sessionFile: params.sessionPath,
+                  sessionFile: sessionPath,
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
                   ...(running.runtimePlan ? { runtimePlan: running.runtimePlan } : {}),
                 },
@@ -2074,7 +2099,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           details: {
             id,
             name,
-            sessionPath: params.sessionPath,
+            sessionPath,
             launchScriptFile,
             status: "started",
           },
