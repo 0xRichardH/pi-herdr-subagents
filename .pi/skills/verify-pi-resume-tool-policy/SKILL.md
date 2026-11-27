@@ -17,13 +17,13 @@ export EVIDENCE="$(mktemp -d)"
 node scripts/check-backends.ts --evidence="$EVIDENCE"
 ```
 
-The first check needs no model or terminal service. It exercises repeated resumes, a renamed helper, removal of the agent definition, an empty policy, and missing or invalid records.
+The first check needs no model or terminal service. It exercises allowlists from agent definitions and call overrides, repeated resumes through relative and symlinked paths, and empty, missing, or invalid policies.
 
 The second check starts a real Pi parent in an owned Herdr workspace and then in a private Core session. Each parent must answer a readiness prompt. The runner uses the normal `subagent` and `subagent_resume` tools to continue the same session under a different display name. Each child runs a local script that records its session path, child ID, and `PI_DENY_TOOLS`. Both backends make model requests. For the user-facing steps, see the [spawn](../verify-pi-herdr-subagents/features/spawn.md) and [resume](../verify-pi-herdr-subagents/features/resume.md) recipes.
 
 ## Evidence and cleanup
 
-For each backend, the runner checks both policy records against the five expected names: `subagent`, `subagent_interrupt`, `subagents_list`, `subagent_resume`, and the fixture's explicit `policy-probe`. It checks that both processes used the original session path and that the child transcripts contain the script calls. The records measure the policy passed to Pi. The registration tests in `test/test.ts` check how Pi applies it to this extension's tools.
+For each backend, the runner checks the deny list passed to both processes and the native tools declared in the child transcript. `declaredTools` must contain exactly `bash`, `read`, `write`, `caller_ping`, and `subagent_done` before and after resume. It also checks that both processes used the original session and that the child ran each verification script.
 
 The runner closes its terminals and removes its scratch project before writing `passed.json`. Inspect the retained results with:
 

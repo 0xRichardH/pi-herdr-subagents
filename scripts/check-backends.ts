@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { getCurrentTools } from "@earendil-works/pi-ai";
 import { createCoreBackend } from "../pi-extension/subagents/herdr-core.ts";
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -67,8 +68,12 @@ async function checkHost(host: string): Promise<void> {
     writeFileSync(join(evidence, `${label}-deny-tools.txt`), readFileSync(files.deny));
     writeFileSync(join(evidence, `${label}-session.txt`), readFileSync(files.session));
     writeFileSync(join(evidence, `${label}-id.txt`), readFileSync(files.id));
-    writeFileSync(join(evidence, evidenceFile), JSON.stringify({ host, label, denyTools, expectedDenyTools: EXPECTED_DENY_TOOLS, sessionPath, expectedSession, subagentId }, null, 2));
+    const messages = readFileSync(expectedSession, "utf8").trimEnd().split("\n")
+      .map(line => JSON.parse(line).message).filter(Boolean);
+    const declaredTools = getCurrentTools(messages).map(tool => tool.name).sort();
+    writeFileSync(join(evidence, evidenceFile), JSON.stringify({ host, label, denyTools, expectedDenyTools: EXPECTED_DENY_TOOLS, sessionPath, expectedSession, subagentId, declaredTools }, null, 2));
     assert.deepEqual(denyTools, EXPECTED_DENY_TOOLS, `${label} resolved deny set`);
+    assert.deepEqual(declaredTools, ["bash", "caller_ping", "read", "subagent_done", "write"], `${label} native tool allowlist`);
     assert.equal(sessionPath, expectedSession, `${label} PI_SUBAGENT_SESSION`);
     assert(subagentId, `${label} PI_SUBAGENT_ID`);
   }
@@ -124,7 +129,7 @@ async function checkHost(host: string): Promise<void> {
       return pane;
     }
     const parentPreamble = [
-      "unset PI_SUBAGENT_BACKEND",
+      "unset PI_SUBAGENT_BACKEND PI_SUBAGENT_ID PI_DENY_TOOLS PI_SUBAGENT_NAME PI_SUBAGENT_AGENT PI_SUBAGENT_SESSION PI_SUBAGENT_AUTO_EXIT PI_SUBAGENT_ACTIVITY_FILE",
       ...Object.entries({ HC_SOCKET: coreSocket, ...parentEnv }).map(([key, value]) => `export ${key}=${quote(value)}`),
       ...(host === "herdr-tui" ? [
         "export HERDR_ENV=1",
