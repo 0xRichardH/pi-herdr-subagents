@@ -52,6 +52,8 @@ Prove one mapped entry point:
 
 This sends a real user prompt through the Pi PTY, requires one actual `subagent` tool call, confirms a child bash action wrote the exact marker, waits for the async `subagent_result` and parent's acknowledgment, and captures both sessions and terminal state. A timeout or assertion failure captures diagnostics and cleans up. It does not treat a file alone as completion proof.
 
+Check that a resumed child keeps its tool restrictions on both backends with [verify-pi-resume-tool-policy](../verify-pi-resume-tool-policy/SKILL.md).
+
 For the other mapped paths:
 
 ```bash
