@@ -6,7 +6,8 @@
     "allowOutsideHerdr": false
   },
   "behavior": {
-    "closeOnDone": true
+    "closeOnDone": true,
+    "separateChildSessions": false
   },
   "models": {
     "agents": {}

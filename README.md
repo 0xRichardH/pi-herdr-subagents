@@ -240,7 +240,8 @@ cp config.json.example config.json
     "allowOutsideHerdr": false
   },
   "behavior": {
-    "closeOnDone": true
+    "closeOnDone": true,
+    "separateChildSessions": false
   }
 }
 ```
@@ -264,6 +265,8 @@ The copyable example is model-neutral, so it works without requiring credentials
 `environment.allowOutsideHerdr` permits orchestration outside the selected host and defaults to `false`. For TUI, the `herdr` CLI and `herdr workspace list` must respond. Tabs use the first workspace when the current pane cannot be resolved. Splits fall back to a new tab without a parent pane. For core, choose `PI_SUBAGENT_BACKEND=herdr-core`; the extension requires `hc` or `herdr-core` and a reachable core server. An override does not bypass this permission.
 
 `behavior.closeOnDone` sets the default for what happens to a subagent's pane after its result is delivered. `true` closes the pane as before. `false` leaves the pane and its pi session open so you can continue the conversation in place. A subagent can override the default per call with `subagent_done({ close: false })` or `subagent_done({ close: true })`. The parent is told the pane stayed open so it can send a follow-up there instead of calling `subagent_resume`.
+
+`behavior.separateChildSessions` defaults to `false`. Set it to `true` to save new Pi child sessions in `subagents/` inside the workspace's Pi session directory. This keeps standalone, lineage-only, and forked child sessions out of Pi's default resume picker. Existing session files stay where they are.
 
 `config.json` is gitignored so local overrides don't get committed.
 
@@ -289,7 +292,7 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 
 | Parameter              | Type    | Default        | Description                                                                                       |
 | ---------------------- | ------- | -------------- | ------------------------------------------------------------------------------------------------- |
-| `name`                 | string  | required       | Display name (shown in widget and pane title)                                                     |
+| `name`                 | string  | required       | Display name for the widget and pane. Pi also saves the trimmed name in the session, with `subagent` as the fallback for blank names. |
 | `task`                 | string  | required       | Task prompt for the sub-agent                                                                     |
 | `agent`                | string  | —              | Load defaults from agent definition                                                               |
 | `fork`                 | boolean | `false`        | Force the full-context fork mode for this spawn, overriding any agent `session-mode` frontmatter  |
@@ -342,9 +345,11 @@ The `caller_ping` tool lets a subagent request help from its parent agent. When 
 
 **`subagent_resume` parameters:**
 - `sessionPath` (required): Path to the child session `.jsonl` file
-- `name` (optional): Display name for the resumed pane (defaults to `Resume`)
+- `name` (optional): Display name for the resumed pane (defaults to `Resume`). The saved session keeps its name.
 - `message` (optional): Follow-up prompt to send after resuming
 - `autoExit` (optional): Whether the resumed session should auto-exit after its next response. Defaults to `true` for autonomous follow-up work; set `false` when resuming for an interactive handoff.
+
+Resume any Pi child session by its reported `.jsonl` path, including forked sessions and sessions saved under `subagents/`. Pass the path to `subagent_resume` or open it manually with `pi --session "/path/to/child.jsonl"`. The display name is stored in the transcript and the file has a generated name.
 
 `subagent_resume` restores the Pi child's original `tools` allowlist and its `spawning` and `deny-tools` restrictions, even if you rename the pane or edit the agent definition. If an older session lacks a complete policy, start a new helper with the intended restrictions. Opening the transcript manually with `pi --session` does not apply the saved subagent policy.
 
