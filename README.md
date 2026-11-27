@@ -346,6 +346,8 @@ The `caller_ping` tool lets a subagent request help from its parent agent. When 
 - `message` (optional): Follow-up prompt to send after resuming
 - `autoExit` (optional): Whether the resumed session should auto-exit after its next response. Defaults to `true` for autonomous follow-up work; set `false` when resuming for an interactive handoff.
 
+`subagent_resume` restores the Pi child's original `spawning` and `deny-tools` restrictions, even if you rename the pane or edit the agent definition. If an older session has no saved tool policy, start a new helper with the intended restrictions.
+
 **Interaction flow:**
 1. Child calls `caller_ping({ message: "Not sure which schema to use" })`
 2. Child session exits (like `subagent_done`)
