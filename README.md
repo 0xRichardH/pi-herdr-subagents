@@ -31,15 +31,17 @@ pi install git:github.com/HazAT/pi-interactive-subagents
 
 Supported multiplexers:
 
+- [Herdr](https://herdr.dev)
 - [cmux](https://github.com/manaflow-ai/cmux)
 - [tmux](https://github.com/tmux/tmux)
 - [zellij](https://zellij.dev)
 - [WezTerm](https://wezfurlong.org/wezterm/) (terminal emulator with built-in multiplexing)
-- [herdr](https://herdr.dev)
 
 Start pi inside one of them:
 
 ```bash
+herdr                 # then run: pi
+# or
 cmux pi
 # or
 tmux new -A -s pi 'pi'
@@ -47,11 +49,11 @@ tmux new -A -s pi 'pi'
 zellij --session pi   # then run: pi
 # or
 # just run pi inside WezTerm — no wrapper needed
-# or
-herdr                 # then run: pi
 ```
 
-Optional: set `PI_SUBAGENT_MUX=cmux|tmux|zellij|wezterm|herdr` to force a specific backend.
+Herdr takes precedence when an outer terminal or multiplexer leaves its environment variables in the Herdr pane. Optional: set `PI_SUBAGENT_MUX=herdr|cmux|tmux|zellij|wezterm` to force a specific backend.
+
+Herdr subagent tabs stay in the caller's workspace. New subagent shells receive `DISABLE_AUTO_UPDATE=true` so Oh My Zsh's update prompt does not consume their launch command; normal user shells are unchanged.
 
 If your shell startup is slow and subagent commands sometimes get dropped before the prompt is ready, set `PI_SUBAGENT_SHELL_READY_DELAY_MS` to a higher value (defaults to `500`):
 
@@ -471,12 +473,15 @@ Every sub-agent session displays a compact tools widget showing available and de
 
 - [pi](https://github.com/badlogic/pi-mono) — the coding agent
 - One supported multiplexer:
+  - [Herdr](https://herdr.dev)
   - [cmux](https://github.com/manaflow-ai/cmux)
   - [tmux](https://github.com/tmux/tmux)
   - [zellij](https://zellij.dev)
   - [WezTerm](https://wezfurlong.org/wezterm/)
 
 ```bash
+herdr                 # then run: pi
+# or
 cmux pi
 # or
 tmux new -A -s pi 'pi'
@@ -489,7 +494,7 @@ zellij --session pi   # then run: pi
 Optional backend override:
 
 ```bash
-export PI_SUBAGENT_MUX=cmux   # or tmux, zellij, wezterm
+export PI_SUBAGENT_MUX=herdr   # or cmux, tmux, zellij, wezterm
 ```
 
 ---
