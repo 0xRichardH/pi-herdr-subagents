@@ -103,7 +103,7 @@ Create todos tagged with: <name>`,
 
 **The user works with the planner.** It will clarify requirements lightly (1-2 rounds of questions, not a deep spec session), propose approaches, validate the design, run a premortem, write the plan, and create todos with mandatory code examples.
 
-When done, the user presses Ctrl+D and the plan + todos are returned to the main session.
+When the planner is done, it returns a result with `subagent_done({})`. The parent receives the summary even when the pane stays open for follow-up.
 
 ### The planner may spawn its own specialists
 
@@ -131,7 +131,7 @@ Fold the new context into the worker tasks.
 
 ## Phase 4: Review Plan & Todos
 
-Once the planner closes, read the plan and list todos:
+Once the planner's result arrives, read the plan and list todos:
 
 ```typescript
 todo({ action: "list" });

@@ -7,6 +7,7 @@ A user carries parent context into a focused child session or starts the bundled
 - `fork-tool`: explicit full-context fork with parent linkage.
 - `fork-iterate`: `/iterate` starts an interactive full-context child.
 - `plan-command`: `/plan` starts the repository's planning workflow for a concrete request.
+- `plan-completion`: the finished planner returns its summary to the parent without another user turn.
 
 ## How to get to it (user POV)
 
@@ -23,6 +24,12 @@ Preconditions: healthy baseline. For fork verification, first establish parent c
 - **Bare iterate (separate run).** Submit `"$CONTROL" send "$EVIDENCE" '/iterate'`. Require the same interactive full-context fork contract and a child ready for hands-on instructions. Send it a benign request and capture the response.
 - **Planning request (separate fresh run).** Run `"$CONTROL" send "$EVIDENCE" '/plan Add a local greeting CLI to this disposable project; clarify requirements and propose a plan, but do not implement it.'`. Inspect the actual injected planning workflow and ensuing tools/child conversation. Require a planning response tied to the request, questions or an explicit scoped plan, and no unrequested implementation files. Capture parent and any child sessions plus a scratch file inventory.
 - **Planning usage (separate run).** Submit `"$CONTROL" send "$EVIDENCE" '/plan'` and capture. Require the usage notification `Usage: /plan <what to build>` and no planner child created.
+
+### Finished planner
+
+In the disposable project, seed an approved plan with a known path and todo ID. Ask the parent to spawn the bundled `planner` with phases 1–9 already complete and request its final handoff. Do not tell the child which tool to use or exit its pane.
+
+Capture the child transcript. Require the plan path and todo ID in the assistant text before the `subagent_done` call in the same message. Require one successful `subagent_result` in the parent with that summary. With the default configuration the child pane closes. Repeat with `behavior.closeOnDone: false` in a disposable checkout: the result must arrive while the pane stays open. A manual exit does not prove completion.
 
 ## Gotchas
 
