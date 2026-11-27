@@ -46,6 +46,17 @@ export function buildPiPromptArgs(params: {
   ];
 }
 
+export function buildPiSessionArgs(
+  sessionPath: string,
+  subagentsDir: string,
+  toolAllowlist: string | null,
+  shellQuote: (s: string) => string,
+): string[] {
+  const parts = ["pi", "--session", shellQuote(sessionPath), "-e", shellQuote(join(subagentsDir, "subagent-done.ts"))];
+  if (toolAllowlist !== null) parts.push("--tools", shellQuote(toolAllowlist));
+  return parts;
+}
+
 export class PiHarnessDriver implements HarnessDriver {
   readonly id = "pi";
   readonly name = "Pi";
@@ -80,11 +91,8 @@ export class PiHarnessDriver implements HarnessDriver {
       shellQuote,
     } = context;
 
-    const parts: string[] = ["pi"];
-    parts.push("--session", shellQuote(subagentSessionFile));
-
-    const subagentDonePath = join(subagentsDir, "subagent-done.ts");
-    parts.push("-e", shellQuote(subagentDonePath));
+    const toolAllowlist = buildSubagentToolAllowlist(params.tools ?? agentDefs?.tools);
+    const parts = buildPiSessionArgs(subagentSessionFile, subagentsDir, toolAllowlist, shellQuote);
 
     if (effectiveModel) {
       parts.push("--model", shellQuote(effectiveModel));
@@ -106,12 +114,6 @@ export class PiHarnessDriver implements HarnessDriver {
       mkdirSync(dirname(syspromptPath), { recursive: true });
       writeFileSync(syspromptPath, identity, "utf8");
       parts.push(flag, shellQuote(syspromptPath));
-    }
-
-    const effectiveTools = params.tools ?? agentDefs?.tools;
-    const toolAllowlist = buildSubagentToolAllowlist(effectiveTools);
-    if (toolAllowlist) {
-      parts.push("--tools", shellQuote(toolAllowlist));
     }
 
     const envParts: string[] = [];
@@ -172,6 +174,7 @@ export class PiHarnessDriver implements HarnessDriver {
 
     return {
       command,
+      piToolPolicy: { denyTools: [...(denySet ?? [])], toolAllowlist },
       sessionFile: subagentSessionFile,
       cli: "pi",
       launchScriptPreamble: [

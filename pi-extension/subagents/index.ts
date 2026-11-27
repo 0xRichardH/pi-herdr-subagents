@@ -2,10 +2,11 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { keyHint } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   readdirSync,
+  realpathSync,
   readFileSync,
   writeFileSync,
   existsSync,
@@ -36,6 +37,7 @@ import {
 } from "./runtime-routing.ts";
 import {
   getHarnessDriver,
+  buildPiSessionArgs,
   buildSubagentToolAllowlist,
   buildPiPromptArgs,
 } from "./harness/index.ts";
@@ -43,6 +45,7 @@ import { resolveModelDefault, type ModelConfig } from "./model-config.ts";
 import { getSubagentConfig } from "./config.ts";
 import {
   piDenyToolsAssignment,
+  type PiToolPolicy,
   readPiToolPolicy,
   writePiToolPolicy,
 } from "./tool-policy.ts";
@@ -1152,7 +1155,7 @@ async function launchSubagent(
     Math.random().toString(16).slice(2, 10),
     Math.random().toString(16).slice(2, 6),
   ].join("-");
-  const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
+  const subagentSessionFile = join(realpathSync(sessionDir), `${timestamp}_${uuid}.jsonl`);
 
   const cliId = agentDefs?.cli ?? "pi";
   const driver = getHarnessDriver(cliId);
@@ -1218,7 +1221,7 @@ async function launchSubagent(
     shellQuote,
   });
 
-  if (driver.id === "pi") writePiToolPolicy(resolve(subagentSessionFile), denySet);
+  if (built.piToolPolicy) writePiToolPolicy(subagentSessionFile, built.piToolPolicy);
 
   const launchScriptName = `${(params.name || "subagent")
     .toLowerCase()
@@ -1891,7 +1894,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         const name = params.name ?? "Resume";
-        const sessionPath = resolve(params.sessionPath);
         const { autoExit, interactive } = resolveResumeLaunchBehavior(params);
         const startTime = Date.now();
         const id = Math.random().toString(16).slice(2, 10);
@@ -1900,18 +1902,20 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return muxUnavailableResult();
         }
 
-        if (!existsSync(sessionPath)) {
+        if (!existsSync(params.sessionPath)) {
           return {
             content: [
-              { type: "text", text: `Error: session file not found: ${sessionPath}` },
+              { type: "text", text: `Error: session file not found: ${params.sessionPath}` },
             ],
             details: { error: "session not found" },
           };
         }
 
-        let resumeDenyTools: Set<string>;
+        let sessionPath: string;
+        let policy: PiToolPolicy;
         try {
-          resumeDenyTools = childDeniedTools(readPiToolPolicy(sessionPath));
+          sessionPath = realpathSync(params.sessionPath);
+          policy = readPiToolPolicy(sessionPath);
         } catch (error) {
           const text = error instanceof Error ? error.message : String(error);
           return {
@@ -1923,12 +1927,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Record entry count before resuming so we can extract new messages
         const entryCountBefore = getNewEntries(sessionPath, 0).length;
 
-        // Build pi resume command
-        const parts = ["pi", "--session", shellQuote(sessionPath)];
-
-        // Load subagent-done extension so the agent can self-terminate if needed
-        const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
-        parts.push("-e", shellQuote(subagentDonePath));
+        const parts = buildPiSessionArgs(sessionPath, SUBAGENTS_DIR, policy.toolAllowlist, shellQuote);
 
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
@@ -1958,7 +1957,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (process.env.PI_CODING_AGENT_DIR) {
           resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellQuote(process.env.PI_CODING_AGENT_DIR)}`);
         }
-        resumeEnvParts.push(piDenyToolsAssignment(resumeDenyTools, shellQuote));
+        resumeEnvParts.push(piDenyToolsAssignment(childDeniedTools(policy.denyTools), shellQuote));
         resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellQuote(name)}`);
         resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellQuote(sessionPath)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ID=${shellQuote(id)}`);

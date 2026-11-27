@@ -21,13 +21,13 @@ Preconditions: healthy owned run after successful `drive-spawn`, **before cleanu
 - **Tool restrictions.** Compare the policy the child receives on spawn and resume using [verify-pi-resume-tool-policy](../../verify-pi-resume-tool-policy/SKILL.md).
 - **History.** Inspect the resumed conversation through the real Pi UI/session transcript: require the earlier marker-writing turn as well as the new continuation. A fresh worker creating the same file is not resume proof.
 - **Interactive variant.** Repeat tool resume on a fresh prepared run with `autoExit false`. Observe the child accepting another real prompt after its first response. Capture the surviving Pi process and response. No sidecar or sentinel is written, so the watcher stays pending and a later pane close produces an error steer `Subagent pane disappeared before completion evidence was recorded.` Record that as expected for this mode.
-- **Manual session entry.** In a newly created tab inside the owned workspace, run `pi --session "$SESSION"` using the extracted path (the completion output prints this same command). Ask it to recall the marker task and create `manual-resume.txt` with `MANUAL_RESUME_PASS`. Capture the child conversation and persisted file. Only target the owned workspace, never a user's open tab. This command omits `-e subagent-done.ts`, so the manual session has no `subagent_done` or `caller_ping`.
+- **Manual session entry.** For the history check, open `pi --session "$SESSION"` in a new tab in the owned workspace. Ask it to recall the marker task and create `manual-resume.txt` with `MANUAL_RESUME_PASS`. Capture the conversation and file. This starts an ordinary Pi process: it does not read the saved subagent policy or load the child completion extension. Use `subagent_resume` when the original tool restrictions must apply.
 
 ## Gotchas
 
 - The displayed session path is a file, not a guessed agent ID. Copy it from the successful spawn result.
 - With `behavior.closeOnDone: false` in the package-root `config.json`, a resumed completion still arrives but the pane stays open and the result ends with `The pane stayed open for follow-up conversation.` Do not assert that the resumed pane closed under that setting.
-- Tool resume restores the saved extension deny list. The model, thinking level, native `tools` allowlist, and agent body have separate launch settings.
+- Tool resume restores both the saved extension deny list and the Pi `tools` allowlist. The model, thinking level, and agent body have separate launch settings.
 - Cleanup removes the working directory, so continuing after cleanup changes the preconditions even if Pi retains the session file.
 - Report tool resume and manual `pi --session` separately. The automated spawn proof does not cover either resume path.
 - Keep copied child session proof before teardown; Pi-managed originals also remain at the paths recorded in completion details.

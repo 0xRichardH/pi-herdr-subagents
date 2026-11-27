@@ -1,5 +1,6 @@
 import type { ResolvedRuntimePlan, ThinkingLevel } from "../runtime-routing.ts";
 import type { CompletionResult } from "../completion.ts";
+import type { PiToolPolicy } from "../tool-policy.ts";
 
 export interface SubagentLaunchParams {
   id: string;
@@ -60,6 +61,7 @@ export interface SubagentLaunchContext {
 export interface BuiltHarnessCommand {
   /** The full shell command line to run in the pane (including cd and sentinel trailer) */
   command: string;
+  piToolPolicy?: PiToolPolicy;
   sentinelFile?: string;
   sessionFile?: string;
   launchScriptPreamble?: string[];
